@@ -145,3 +145,26 @@ S2 的"uniform 37.3"实为 all-pp-then-burst（四流 `prefill_seconds=606.837` 
 
 **Wave16（挂账中）**：S4 = staging on + `long-batch 2048/micro 1024`（探"大步→小步时 pp_rate 斜率是否被 staging_reuse 保住"）；S5 = S4 + `prefill-keep-cache 4096 --prefill-keep-spread`（lend 期保留每层 cache，"smaller micro chunks stop waiting on them"——上游为此形状留的正解）。
 **Wave17（挂账中）**：S6 = X4 + `prefix-cache-states 8 --prefix-cache-interval 4096`；S7 = states 4 + interval 8192 + `long-batch 16384`。判据改双口径：reburst C4@123K（agg，对齐 3.7/15.3 历史线）+ fw4k 谱形/墙钟。VRAM 哨兵：`saved_states_mib` boot 行 + 卡3 空闲（484 MiB 旧账，8×50MB 若挤先降 states=4）。质量门：S6/S7 若采纳，acc+逐题 sha+needle 120K（冷 vs 缓同答性）。
+
+## 11. Wave16/17 终局：生产形状改判（2026-11-25 01:5x CST，全部实测）
+
+**Wave16 判负（rider 环彻底坐实）**：S4/S5（`long-batch 2048` + micro 1024 ± `prefill-keep-cache 4096/spread`）谱仍阶梯 `[1.8,3.4,5.9,35.4]`/`[1.6,3.0,5.4,35.2]`，wall 164/188（劣于 S0 的 102）。缩步不换来公平——rider 每引擎步只推进一次采样，步小了 pp 反噬。配置层对"冷算异源同刻并发"宣告终结。
+
+**Wave17 翻案（prefix cache = 生产正解）**：S6/S7（X4 + `--prefix-cache-states 4/8 --prefix-cache-interval 8192/4096`，S7 另加 `--long-batch-tokens 16384`；注意必须去掉 `--prefix-cache-states 0`——那是当年评测对齐用的，见 §10 考古）：
+
+| 臂 | 123K C4 reburst(agg/wall) | 满窗262K C4(agg/wall/tg_med) | 62K fw4k | poison55 混合流 |
+|---|---|---|---|---|
+| Z0/X4（缓关） | **3.7** / 555.1 | 不可达（500） | [3.3,4.7,8.4,35.3] | 42.6 阶梯 |
+| S6 | **129.9** / 15.8 | — | [1.7,2.2,4.5,34.4] | — |
+| S7 | **129.4** / 15.8 | **86.2** / 19.0 / 26.5 | [2.0,2.6,4.9,33.9] wall 162 | **87.3 / [12.0→30.5] 均匀** |
+| Strata 参照 | 15.3（当年对齐冷算） | 3.4（墙钟口径） | fw4same 1.2/1.7/3.5/36.5 | — |
+
+**质量门（S7 boot，全绿）**：needle 123K ×3 PASS（含缓存恢复路径）、acc 6/6、det 双跑 `det_same=true` 且逐题 sha 全等、VRAM 每卡剩 1121-1139 MiB。
+
+**诚实口径**（引用前必读）：reburst C4 同 prompt = 共享前缀最好情况；poison55（共享底+分叉尾）才是生产代表形——S7 在它上面拿到均匀满速，这是改判的真正依据。**冷算异源同刻**（四条互不相干的 123K 同秒进入）仍是阶梯（≈X4），属二开 rider 环未解项，与生产主场景解耦。
+
+**定档建议（S7 为 Legion 生产形状）**：X4 全基形 − `--prefix-cache-states 0` + `--prefix-cache-states 4 --prefix-cache-interval 8192 --long-batch-tokens 16384`。
+
+**二开路线（冷算异源档，挂账不变）**：rider 环三约束（§10）→ 刀口按性价比序：①`--itl-target` 解除 groups>1 禁令（slo.rs:72 的测量语义换成"组内 token 间隔"）；②lend 态 chunk 自适应（decode 在飞时 `min(long_batch, rate·itl_budget)`）；③riders 每 micro-chunk 推进（采样下推到 device rounds，重）。
+
+**运维注意**：boot 命令行以 `pgrep -af legion` 为准固化进 `legion-lane.sh`；8080 转发与鉴权（Legion 线无 `--api-key`，公网面必须走反代/防火墙，勿直绑）。
