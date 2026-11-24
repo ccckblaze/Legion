@@ -102,3 +102,27 @@
 **与 Strata 对照的机制翻译**：Strata 满窗并发 106.9 的本钱 = prefill 每 chunk 的 GDN 态**就地物化** + 入组 = 槽位指针交换（O(1)）。Legion 把该物化推迟到首 verify 整段重放。这不是 Volta 算力问题，是**状态生命周期设计**问题。
 
 **二开第一刀（P2 定案）**：`src/engine/lm.rs` 步循环 join 路径——prefill 收尾时按 chunk 提交 GDN 态（或让 prompt 末态即入组态，免全槽重放图）；验收线 = 62K×4 的 tg_list 从 [3,5,8,33] 收敛到 [≥25×4]，sum_tg 47.6→**≥100**；123K C4 3.7→**≥15**（Strata 追平线）；chat/8K 王座档不回退。补丁点候选：`replay commits` 发布方（model/core/spec 层）与 `mtp take-in pieces` 调用侧（engine/lm 层）的时序交界。
+
+## 9. 终修与解药（2026-11-24 23:5x CST，Wave14/K7 判后定稿）
+
+**§8 修正**：巨步不是"join 后的额外重放"——K7（NOSPEC）四条巨步（`steps=1 exec_us≈23.4/23.7/23.5/23.2s`，间距=pp 墙钟、`seqs_per_step` 1→4 递增）与 request-done 的 `prefill_seconds=23.6/23.7/47.2/70.3` 完全对账。巨步**就是 prefill 本身**：Legion 的长 prompt 在 lend 态按 `LongPrompts` 大步设计"整段吞"（见下），`mtp take-in`/`replay commits` 只是巨步收尾时的顺带标记。§8 的二开方向据此作废，替换为本节。
+
+**机制（代码位钉死）**：
+1. `src/engine/lm.rs:1343-1390` `LongPrompts` 默认：`min_tokens=2048`（触发 lend）、`batch_tokens=65536`、`alone_tokens=262144`——注释原文自证："a 123K prompt in two 64K steps costs 37 rounds instead of 34: +9% prefill"（有意设计，买 pp 速度）。
+2. `src/engine/lm.rs:8440-8449` lend 态 `big=true` 时 chunk 选择："A borrowed cache stages every expert per step: the longer the better" → chunk=`long_batch`（无 decode 在飞=整段 262144；有则 65536）→ 62K 一步吞完。
+3. 同窗 decode 行只在步首"ride ahead … as one micro-chunk"（`riders` 逻辑，lm.rs:8398-8402 区）——即**每条巨步期间，在飞流每步只得 ~1 token**。四条流的 62K 谱 `[3.3,4.8,8.4,35.1]` = 前流被后流巨步冻结、末流独走尾窗的算术指纹（尾窗 7.3s×35=256 ✓）。
+4. chat/8K 免疫的原因：prompt 剩余 < `min_tokens=2048` 不触发 lend，走常规 512-chunk。
+
+**内置解药（从未启用）**：
+- `--itl-target/--ttft-target`（`src/engine/lm/slo.rs`，完整步时模型）按 ITL 目标收缩每步 prompt 预算——但 `slo.rs:72` 硬性要求 `--pipeline-groups 1`；X4 形状 groups=4 ⇒ **解药被形状封锁**（判据："decoding groups in flight … no step time measures a decoding stream's inter-token latency"）。
+- `--long-batch-tokens/--long-alone-tokens` 直接封顶巨步（serve.rs:1363-1369），保留 lend 的专家 staging；`--prefill-staging false`（serve.rs:379，默认 true）彻底回到 512-chunk 交错档。
+
+**Wave15 判别臂（全配置级）**：S0=CTL；S1=`--long-batch-tokens 8192 --long-alone-tokens 8192`；S2=`--prefill-staging false`；S3=`--pipeline-groups 1 --itl-target 500 --ttft-target 120000`。每臂测 62K×4（fw4k 2600）、123K×4（fw4k 5120）、8K×4（fw4k 340）+ 日志摘要（巨步计数、prefill_seconds 阶梯）。验收线不变：62K sum≥100、123K C4≥15、8K/chat 不回退。
+
+**二开刀口（按 Wave15 结果取一或组合）**：
+- 若 S1/S2 净正但 pp 代价超标：**自适应 `long_batch = min(batch_tokens, f(在飞 decode 数))`**（Rust 侧小补丁，`plan_step` chunk 选择点 lm.rs:8440 区）——decode 在飞时按 ITL 预算切步，空窗时恢复大步。
+- 若 S3 最优：**放宽 `slo.rs:72` 的 groups>1 禁令**（用"组内最近 token 间隔"替代整步时测量），把 SLO 与 pipelined groups 同时拿到。
+- 结构性选项：**riders 每 micro-chunk 一次**（而非每步一次）——步不变、冻结消除；改动在 `Executor::set_pipeline_riders` 消费侧。
+- 用户 P3 项归档：热专家已有（`--expert-heat-pass-cap`，X4 在用）；"总上下文+最大并发调度"≈ `--kv-admission`+`max_seqs` 语义，Wave15 后评估。
+
+**预测（待 Wave15 证伪）**：S2 的 123K C4 sum_tg 0.6-2 → **8-20**（rider 步时 ≈0.2s 档）；S1 → 5-12（3.3s 档）；两者 pp 阶梯（prefill_seconds 尾差）分别 +10-30% / +2-3×。若 S2 兑现且 pp 代价 ≤30%，4 卡深窗并发从"塌方"改判为"可用"，定档形状随之更新。
