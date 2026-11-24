@@ -126,3 +126,22 @@
 - 用户 P3 项归档：热专家已有（`--expert-heat-pass-cap`，X4 在用）；"总上下文+最大并发调度"≈ `--kv-admission`+`max_seqs` 语义，Wave15 后评估。
 
 **预测（待 Wave15 证伪）**：S2 的 123K C4 sum_tg 0.6-2 → **8-20**（rider 步时 ≈0.2s 档）；S1 → 5-12（3.3s 档）；两者 pp 阶梯（prefill_seconds 尾差）分别 +10-30% / +2-3×。若 S2 兑现且 pp 代价 ≤30%，4 卡深窗并发从"塌方"改判为"可用"，定档形状随之更新。
+
+## 10. Wave15 判负表与 Wave16/17 计划（2026-11-25 00:5x CST）
+
+**Wave15（X4 基形，spec 默认 on；fw4k = 4×C 同上下文并发，256 tok/流）**
+
+| 臂 | 配置增量 | 8K 谱 | 62K 谱 | 62K wall | 123K 谱 | 123K wall | 判 |
+|---|---|---|---|--:|---|--:|---|
+| S0 | — | [13.5,17.5,25.3,39.0] | [3.3,4.7,8.4,35.3] | 102.0 | [1.2,1.5,2.8,29.9] | 261.6 | 基线（阶梯毒） |
+| S1 | `long-batch/alone 8192` | [13.7,17.5,24.9,39.5] | [2.8,4.0,7.3,35.7] | 124.1 | [1.0,1.3,2.3,30.2] | 315.3 | **FAIL**：谱不变，pp −22% |
+| S2 | `prefill-staging false` | [35.8,39.5,39.6,39.6] | [37.2,37.3,37.3,37.3] | 613.8 | [27.5,31.9,31.9,32.0] | 1251.6 | 公平但 pp 4.8-6× FAIL |
+| S3 | `groups1 + itl 500 + ttft 120s` | [1.0,1.3,2.1,42.3] | [1.1,1.1,1.1,42.5] | 754.2 | 进行中 | — | **FAIL**：双输（pp 330 t/s + rider 1.1） |
+
+**机制定案（四臂合读）**：rider 推进 = 每引擎步 1 次采样（+spec 行）；步时长 ≈ chunk/pp_rate；而 pp_rate ∝ chunk（staging 摊销：S2 实测 412 t/s@512 vs S0 2657@65536，S1 2020@8192）。三约束成环——**公平要小步、快 pp 要大步、SLO 小步毁 pp**。配置层无解，判负终结黑盒扫参。
+S2 的"uniform 37.3"实为 all-pp-then-burst（四流 `prefill_seconds=606.837` 逐位相同、解码集中在尾 6.9s）——不是窗内交错，reburst agg 口径下反而崩（1024/1251=0.8）。
+
+**Prefix cache 真相（§355 考古）**：X4 的 `--prefix-cache-states 0` 是当年**为冷算口径对齐刻意关的**（runbook:10506 "measurement only"），非机制不可用。`--prefix-cache-interval N`（serve.rs:1478-1488）在 Flash-Next 单机上"prefill 顺带存中间态、不加步"，让重复前缀请求从分支点续读——**评测用关、生产用开，两套口径分开记账**。基准对照（15.3 vs 3.7）本身同条件冷算，结论不受影响。
+
+**Wave16（挂账中）**：S4 = staging on + `long-batch 2048/micro 1024`（探"大步→小步时 pp_rate 斜率是否被 staging_reuse 保住"）；S5 = S4 + `prefill-keep-cache 4096 --prefill-keep-spread`（lend 期保留每层 cache，"smaller micro chunks stop waiting on them"——上游为此形状留的正解）。
+**Wave17（挂账中）**：S6 = X4 + `prefix-cache-states 8 --prefix-cache-interval 4096`；S7 = states 4 + interval 8192 + `long-batch 16384`。判据改双口径：reburst C4@123K（agg，对齐 3.7/15.3 历史线）+ fw4k 谱形/墙钟。VRAM 哨兵：`saved_states_mib` boot 行 + 卡3 空闲（484 MiB 旧账，8×50MB 若挤先降 states=4）。质量门：S6/S7 若采纳，acc+逐题 sha+needle 120K（冷 vs 缓同答性）。
