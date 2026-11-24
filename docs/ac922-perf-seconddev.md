@@ -168,3 +168,53 @@ S2 的"uniform 37.3"实为 all-pp-then-burst（四流 `prefill_seconds=606.837` 
 **二开路线（冷算异源档，挂账不变）**：rider 环三约束（§10）→ 刀口按性价比序：①`--itl-target` 解除 groups>1 禁令（slo.rs:72 的测量语义换成"组内 token 间隔"）；②lend 态 chunk 自适应（decode 在飞时 `min(long_batch, rate·itl_budget)`）；③riders 每 micro-chunk 推进（采样下推到 device rounds，重）。
 
 **运维注意**：boot 命令行以 `pgrep -af legion` 为准固化进 `legion-lane.sh`；8080 转发与鉴权（Legion 线无 `--api-key`，公网面必须走反代/防火墙，勿直绑）。
+
+## 12. Wave18：冷算异源 storm 配置层终扫 + 管理 boot 复验（2026-11-25 02:00-06:00 CST）
+
+**夹具口径修正（先记账，防后人再踩）**：
+
+- `fw4diff.py` 把 body 截到 `24R` 字符（≈4.77R token），`fw4k.py` 不截（≈24R token）。同名 reps 在两个夹具里差 5×：wave18 用 fw4diff 13000/25600 才是真 62K/123K。首轮小尺寸（fw4diff 2600/5120 = 12.4K/24.4K）实测全均匀（[7.0×4]/[4.1×4]）——池 cliff 以下无阶梯。
+- `fullwindow.py` 校准只用 FILL 单位收敛，err 落在 ±(5..23) 时 `int(err/24)=0` 死循环 14 次 → `CALIB-FAILED`（wave17 当时是探针恰好落进 ±4 才过的，非协议保证）。已修：|err|≤20 改用单 token filler（" 1"）微调收敛。修后 262K C1 校准精确落位（ptok=261900, gen 重调 244，不变式 prompt+gen==262144 成立）。
+- **reburst 快线需要 C=1 顺序 priming**：`reburst.py W 4` 直接开火时，四条同秒 lend 步会把 state 池打脏、首轮不存态 → 二三轮仍全冷（实测 run2/3/4 全 ~400s）。正确协议 = 先 `W 1`（2 请求顺序，天然 priming）再 `W 4`。wave17 的 129.4/15.8 就是这么来的；本次管理 boot 复现 **113.1/18.1**（tg_med 32.2，boot 间热态噪声内）。
+
+**Wave18b 三臂（真尺寸，异源冷算 storm）**
+
+| 臂 | 配置增量 | 62K [tg谱]/wall | 123K [tg谱]/wall | 判 |
+|---|---|---|---|---|
+| W0 | S7 原样 | [1.2×4]/221（复测 222、221） | [0.7×4]/352 | 基线：**均匀但慢**（pp-bound 墙钟） |
+| W1 | `long-batch 512 micro 512` | [0.5,0.5,0.5,0.7]/474 | [0.2,0.2,0.3,0.5]/1213 | **FAIL**：ride 频率不是瓶颈，pp 崩 3.4× |
+| W2 | S7 + `--spec mtp --spec-k 4`（shared-Q8_0 草稿） | **[1.9×4]/134（−39%）** | [0.6×4]/444（+26%） | 62K 赚深窗亏，见 gate4 canonical 复验 |
+
+**机制再钉（代码级，供二开）**：`step_piped` 的 `can = prefilling.is_empty() && !self.lent`（pipe.rs:144）⇒ 冷 storm 全程无批式 decode 窗；lend 步里 decode 行每步一次采样（exec.rs:3712 riders 前置单 micro-chunk），ride 速率 = 1/步时 × (1+N·acc)。配置臂只能在「pp 率 ∝ chunk」与「ride 频率 ∝ 1/chunk」之间换轨（W1 证死）；W2 是唯一抬乘子不缩步的形态，但 verify 行在 123K 深窗上有 +26% pp 代价（62K 无）。破环仍归 §11 二开刀口序（①slo groups 解禁 ②lend chunk 自适应 ③riders device-round）。
+
+**管理 boot 生产复验（lane 脚本 = 定档形状，服务器 `/data/work/legion/legion-lane.sh`，仓库 `scripts/legion-lane.sh`）**：canonical 123K reburst 113.1/18.1 ✓；262K fullwindow C1→C4 与 poison55、det/needle 门 = gate3（数字见下表，boot=lane 04:53）。lane 脚本本轮修三处：`--max-seqs` 对齐定档 16、node meminfo 字段位（$4）、`--spec-k` 去重 + `SPEC_MODE` 透传。
+
+**管理 boot 终局 gate 表（boot=lane 04:53，UTC+8 减 8 即日志时间）**
+
+| 件 | 结果 | 对照 |
+|---|---|---|
+| fullwindow C1（2×262K） | PASS 2/2 held edge=262144，span 223.17 | wave17 235.1，同形 ✓ |
+| fullwindow n=8（历史口径） | 截断于 warm 4（引擎无恙） | **口径废弃**：8×262K 超 池262144+host 786432=恰好 4×262K 的预算，n=8 本质超配；正装验收形改为 **n=4**（见下行） |
+| fullwindow n=4（验收线） | 见 §12 补录（w18-fw4n4.log） | — |
+| poison55 base | agg 83.3，tg 谱 [12.1→30.1]，8 流同刻收尾 | wave17 87.3 同谱 ✓（boot 噪声内） |
+| poison55 poison 臂 | agg 26.1，八流均匀压至 [3.4-4.1]，intruder 自身 tg 22.3/pp 1184.9 | 首采。lend 税 −69%，rider 每步一采样的直接显形（见 ac922-decode-window-anatomy.md §2） |
+| throne 8K C4 | 44.9 / tg_med 32.0 | wave17 44.4 ✓ |
+| throne 8K C16 | 213.3 / tg_med 19.2 | ≠ wave17 chat-C16 294.6（不同夹具，不可直接比） |
+| throne 32K C4 | 18.3（**含冷 priming 段**） | burst 段实测 4 流并行 ~32-35，真实 burst agg ≈120；harness 口径注记 |
+| det ×1 | det_same=true，acc 6/6，sha 六枚与 wave17 全等 | 定档数值路径未变 ✓ |
+| needle 123K | PASS units 5001 span 105.5 | wave17 106.3-107.7 ✓ |
+
+**poison 臂机制注**：base 谱的阶梯（12→30）来自「准入排队 + 末个 prefill 后组轮转均分」；poison 臂把全谱压平到 3.4-4.1 是 lend rider 的均分形态——两组签名分别钉住 `prefilling` 门与 `lent` 门（pipe.rs:145），解剖见 `docs/ac922-decode-window-anatomy.md`。
+
+**gate4 终判（W2 canonical，boot 07:06 spec-mtp-k4，同电池）**
+
+| 件 | S7（管理 boot） | W2（gate4 boot） | Δ |
+|---|---|---|---|
+| throne 8K C4 | 44.9 / tg_med 32.0 | **108.7 / tg_med 41.9** | **+142%** |
+| reburst 123K C1 wall | 101.0 | 75.3 | −25% |
+| reburst 123K C4 | 113.1 / tg_med 32.2 | 91.3 / tg_med 28.4 | **−19%** |
+| 62K 异源冷 storm wall | 221 | **177.6** | **−20%** |
+| 123K 异源冷 storm wall | 352 | 460.3 | **+31%** |
+| det | sha 六枚基线全等 | **与 S7 逐位全等**（acc 6/6, det_same=true） | 0（T=0 spec-verify 无损实证） |
+
+**判词**：W2 = **情景限定正**。浅窗（8K）与浅冷风暴大赚，深窗暖并发与深冷风暴亏——MTP 宽草稿把 verify 行带进每步，浅窗步时便宜赚乘子、深窗 QSA 行贵付学费。**生产默认维持 S7**；W2 以 env preset 收录（`LEGION_USE_DRAFTER=1 LEGION_SPEC_MODE=mtp LEGION_SPEC_K=4`），按语料窗深切档是二开的自然下一步（serve 层路由，零数值风险——det 全等已证）。W2 boot 后已恢复 S7（boot 07:24:32，smoke 8K C4=59.1 ✓）。
