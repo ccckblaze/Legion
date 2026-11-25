@@ -31,7 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// The tier's own layout version; a manifest of another format is ignored, not merged.
-pub const FORMAT: u32 = 2;
+/// FORMAT 3: state snapshots carry the slot's token history window (and hydrate is
+/// keyed by chains, C3).
+pub const FORMAT: u32 = 3;
 
 /// `--conv-disk`: the tier's directory, global size cap and retention. `None` (unset) is
 /// the whole feature off; every other default matches the design doc.
@@ -745,6 +747,51 @@ pub fn chain_of(tokens: &[u32]) -> String {
     sha256_hex(&le)
 }
 
+/// The count of leading whole blocks whose chains `accept` takes, with the same
+/// streaming hash as [`Self::block_chains`]: the hydrate walk stops at the first
+/// block the tier does not have, so an unknown prompt costs one hash update per
+/// block only while the run holds.
+pub fn chain_run(tokens: &[u32], block: usize, mut accept: impl FnMut(&str) -> bool) -> usize {
+    let mut h = Sha256::new();
+    let mut n = 0usize;
+    for chunk in tokens.chunks(block) {
+        if chunk.len() != block {
+            break;
+        }
+        let mut le = Vec::with_capacity(chunk.len() * 4);
+        for t in chunk {
+            le.extend_from_slice(&t.to_le_bytes());
+        }
+        h.update(&le);
+        let chain = sha256_hex_fin(&h);
+        if !accept(&chain) {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// A blob's bytes, only if they hash to `key`: the chain is the *address*, and the
+/// key check is what makes a stale, corrupted or other-model blob a miss rather
+/// than poisoned KV. Reads on the engine thread during placement.
+pub fn read_verified(dir: &Path, chain: &str, key: &str, want_bytes: u64) -> Option<Vec<u8>> {
+    let bytes = fs::read(blob_path(dir, chain)).ok()?;
+    if bytes.len() as u64 != want_bytes || sha256_hex(&bytes) != key {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// The same check for a state sidecar.
+pub fn read_state_verified(dir: &Path, chain: &str, key: &str, want_bytes: u64) -> Option<Vec<u8>> {
+    let bytes = fs::read(state_path(dir, chain)).ok()?;
+    if bytes.len() as u64 != want_bytes || sha256_hex(&bytes) != key {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// SHA-256, self-contained (FIPS 180-4): the tier's only hash, for addresses and integrity.
 #[derive(Clone)]
 pub struct Sha256 {
@@ -958,5 +1005,19 @@ mod tests {
         assert!(map.contains_key(chain));
         assert_eq!((st.blocks, st.missing, st.foreign), (1, 1, 1));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_run_agrees_and_stops() {
+        let toks: Vec<u32> = (0..200).collect();
+        let all = block_chains(&toks, 64);
+        assert_eq!(all.len(), 3);
+        // All present: the run counts every whole block.
+        assert_eq!(chain_run(&toks, 64, |c| all.iter().any(|x| x == c)), 3);
+        // The second chain missing: the run stops at one, with identical strings.
+        assert_eq!(chain_run(&toks, 64, |c| c != all[1] && all.contains(&c.to_string())), 1);
+        // A short tail chunk never joins the run.
+        assert_eq!(chain_run(&toks[..192], 64, |_| true), 3);
+        assert_eq!(chain_run(&toks[..192], 64, |_| false), 0);
     }
 }

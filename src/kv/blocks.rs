@@ -282,6 +282,13 @@ impl BlockTable {
         }
     }
 
+    /// Adds freshly allocated blocks that one reference each, all full: the cold
+    /// tier hands back the blocks it filled from disk as if they had been computed.
+    pub fn extend_owned(&mut self, blocks: &[BlockId], block_size: u32) {
+        self.blocks.extend(blocks.iter().copied());
+        self.num_tokens += blocks.len() as u32 * block_size;
+    }
+
     pub fn blocks(&self) -> &[BlockId] {
         &self.blocks
     }

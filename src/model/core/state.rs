@@ -763,13 +763,7 @@ impl KvPool {
     /// this order: do not reorder without a format bump.
     pub fn block_template(&self, device: u32) -> Vec<ConvBlockBase> {
         let mut out: Vec<ConvBlockBase> = Vec::new();
-        for il in 0..self.dims.len() {
-            if self.dims[il].is_none() || self.ring_layers[il] || self.source[il] != il {
-                continue;
-            }
-            // A compact or K-only cache holds both in one granule tensor; its `cache_v`
-            // alias is the same bytes, so it never appears here.
-            let one_granule = self.compact[il] > 0 || self.k_only[il];
+        for (il, one_granule) in self.block_walk() {
             for kind in if one_granule { ["k"].as_slice() } else { ["k", "v"].as_slice() } {
                 let name = format!("cache_{kind}-{il}");
                 if let Some(t) = self.ctx.tensor(&name) {
@@ -807,6 +801,52 @@ impl KvPool {
             );
         }
         out
+    }
+
+    /// The dump order of the cold tier's block layout: the pool's own non-ring source
+    /// layers, ascending, each with whether its cache is one granule tensor (compact
+    /// or K-only, whose `cache_v` alias is the same bytes). [`Self::block_template`]
+    /// and [`Self::set_block`] both walk exactly this: the blob layout.
+    fn block_walk(&self) -> Vec<(usize, bool)> {
+        (0..self.dims.len())
+            .filter(|&il| {
+                self.dims[il].is_some() && !self.ring_layers[il] && self.source.get(il) == Some(&il)
+            })
+            .map(|il| (il, self.compact[il] > 0 || self.k_only[il]))
+            .collect()
+    }
+
+    /// Writes block `b` back into the pool's tensors in [`Self::block_walk`]'s order:
+    /// the cold tier's hydrate mirror of the dump. Each buffer routes its own VRAM or
+    /// pinned-host part, so tiered tensors need no address math here.
+    pub fn set_block(&self, b: usize, bytes: &[u8]) {
+        assert_eq!(
+            bytes.len(),
+            self.bytes_per_block(),
+            "a hydrated block must carry all its bytes"
+        );
+        let mut at = 0usize;
+        for (il, one_granule) in self.block_walk() {
+            for kind in if one_granule { ["k"].as_slice() } else { ["k", "v"].as_slice() } {
+                let name = format!("cache_{kind}-{il}");
+                let Some(t) = self
+                    .ctx
+                    .tensor(&name)
+                    .or_else(|| self.tiers.iter().find_map(|c| c.tensor(&name)))
+                else {
+                    continue;
+                };
+                let cellb = KV_BLOCK * t.nb()[1];
+                t.set_bytes_at(b * cellb, &bytes[at..at + cellb]);
+                at += cellb;
+            }
+            if let Some(t) = self.ctx.tensor(&format!("cache_idx-{il}")) {
+                let cellb = KV_BLOCK * t.nb()[1];
+                t.set_bytes_at(b * cellb, &bytes[at..at + cellb]);
+                at += cellb;
+            }
+        }
+        debug_assert_eq!(at, bytes.len(), "the dump and hydrate walks must agree");
     }
 
     /// One [`Self::block_template`] entry for a pool-context tensor: never host unless

@@ -1202,6 +1202,50 @@ impl Executor {
         out
     }
 
+    /// The cold tier's hydrate of one block: verified blob bytes into pool block `b`
+    /// of every stage's pool and the MTP head's own, [`Self::kv_block_bytes`]'s order.
+    /// A size mismatch is a foreign layout: refuse, do not write.
+    pub fn conv_hydrate_block(&self, b: usize, bytes: &[u8]) -> Result<(), String> {
+        let want = self.kv_block_bytes();
+        if bytes.len() != want {
+            return Err(format!("block of {} bytes, pool wants {want}", bytes.len()));
+        }
+        let mut at = 0usize;
+        for s in &self.stages {
+            let per = s.kv.bytes_per_block();
+            s.kv.set_block(b, &bytes[at..at + per]);
+            at += per;
+        }
+        if let Some(m) = self.mtp_kv.as_ref() {
+            let per = m.bytes_per_block();
+            m.set_block(b, &bytes[at..at + per]);
+            at += per;
+        }
+        debug_assert_eq!(at, want, "the pools must cover the block exactly");
+        Ok(())
+    }
+
+    /// Bytes one state snapshot takes ([`Self::conv_state_snapshot`]).
+    pub fn conv_state_size(&self) -> usize {
+        self.stages.iter().map(|s| s.saved.slot_region_bytes()).sum()
+    }
+
+    /// The cold tier's hydrate of a saved state into a sequence's live slot, every
+    /// stage's recurrent pool in the snapshot's order.
+    pub fn conv_state_restore(&self, slot: usize, bytes: &[u8]) -> Result<(), String> {
+        let want = self.conv_state_size();
+        if bytes.len() != want {
+            return Err(format!("state of {} bytes, pools want {want}", bytes.len()));
+        }
+        let mut at = 0usize;
+        for s in &self.stages {
+            let per = s.saved.slot_region_bytes();
+            s.rec.restore_slot_bytes(slot, &bytes[at..at + per]);
+            at += per;
+        }
+        Ok(())
+    }
+
     /// Whether the cold tier can address every pool's host tier: a tensor-parallel
     /// tier's host part lives in per-GPU meta slices the dump cannot name, so the
     /// tier stays off there.

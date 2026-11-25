@@ -7403,9 +7403,47 @@ impl Worker {
         } else if self.warm_on && !self.warm.is_empty() && self.ring_ckpts_log {
             self.log_warm_miss(prompt);
         }
-        let fresh = take.saturating_sub(resumed / KV_BLOCK);
+        // The cold tier's hydrate: past what memory holds, up the chain run on disk,
+        // cut back to the furthest boundary whose saved state the tier has (stateless
+        // models need none). Only from a block-aligned resume, and under the radix's
+        // own rule: leave one prompt token to compute.
+        let mut conv_run: Vec<String> = Vec::new();
+        let mut conv_state: Option<String> = None;
+        if let Some(tier) = &self.conv {
+            let start = resumed / KV_BLOCK;
+            let cap = (len - 1) / KV_BLOCK;
+            if resumed % KV_BLOCK == 0 && start < cap {
+                let m = conv_tier::chain_run(prompt, KV_BLOCK, |c| tier.block(c).is_some())
+                    .min(cap)
+                    .max(start);
+                if m > start {
+                    let chains = conv_tier::block_chains(&prompt[..m * KV_BLOCK], KV_BLOCK);
+                    let j = if self.stateless() {
+                        m
+                    } else {
+                        let size = self.exec.conv_state_size() as u64;
+                        (start + 1..=m)
+                            .rev()
+                            .find(|&i| {
+                                tier.state(&chains[i - 1]).is_some_and(|e| e.bytes == size)
+                            })
+                            .unwrap_or(start)
+                    };
+                    if j > start {
+                        conv_run = chains[start..j].to_vec();
+                        conv_state = if self.stateless() {
+                            None
+                        } else {
+                            Some(chains[j - 1].clone())
+                        };
+                    }
+                }
+            }
+        }
+        let ext = conv_run.len();
+        let fresh = take.saturating_sub(resumed / KV_BLOCK + ext);
         // `on-demand` leaves the decoding sequences room to grow (0 under `reserve`).
-        let want = fresh + self.kv_keep;
+        let want = fresh + self.kv_keep + ext;
         let available = |w: &Self| (w.pool.free_blocks() as usize).saturating_sub(w.reserved);
         if want > available(self) {
             let short = want - available(self);
@@ -7428,6 +7466,60 @@ impl Worker {
                     None => table.release(&mut self.pool),
                 }
                 return Placement::Wait;
+            }
+        }
+        // Fill the run. The state first (the smaller read, and its absence aborts
+        // before any block lands in the pool); then verified blobs. A race with the
+        // writer's trim aborts the extension rather than poisoning it: the blocks go
+        // back and memory's resume stands alone.
+        let mut conv_state_bytes: Option<Vec<u8>> = None;
+        if ext > 0 {
+            let tier = self.conv.clone().expect("the walk ran with a tier");
+            let dir = tier.cfg().dir.clone();
+            let mut ok = true;
+            let mut state_bytes: Option<Vec<u8>> = None;
+            if let Some(chain) = conv_state.as_ref() {
+                match tier.state(chain) {
+                    Some(e) => {
+                        state_bytes = conv_tier::read_state_verified(&dir, chain, &e.key, e.bytes);
+                        ok = state_bytes.is_some();
+                    }
+                    None => ok = false,
+                }
+            }
+            let mut ids: Vec<BlockId> = Vec::new();
+            if ok {
+                for chain in conv_run.iter() {
+                    let Some(e) = tier.block(chain) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(bytes) = conv_tier::read_verified(&dir, chain, &e.key, e.bytes) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(b) = self.pool.allocate() else {
+                        ok = false;
+                        break;
+                    };
+                    if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
+                        tracing::warn!("conv tier: hydrate block {chain}: {err}");
+                        self.pool.decref(b);
+                        ok = false;
+                        break;
+                    }
+                    ids.push(b);
+                }
+            }
+            if ok {
+                table.extend_owned(&ids, KV_BLOCK as u32);
+                resumed = (resumed / KV_BLOCK + ext) * KV_BLOCK;
+                conv_state_bytes = state_bytes;
+                tracing::info!(blocks = ext, tokens = resumed, "conv tier: hydrated");
+            } else {
+                for b in ids {
+                    self.pool.decref(b);
+                }
             }
         }
         self.reserved += fresh;
@@ -7458,6 +7550,14 @@ impl Worker {
                 Ok(())
             }
         };
+        // The cold tier's state, if the run carried one, lands after the saved-slot
+        // copy (it overwrites the whole region either way).
+        let copied: Result<(), String> = copied.map_err(|e| e.to_string()).and_then(|()| {
+            match &conv_state_bytes {
+                Some(bytes) => self.exec.conv_state_restore(slot, bytes),
+                None => Ok(()),
+            }
+        });
         if let Err(e) = copied {
             table.release(&mut self.pool);
             self.free_ring_and_slot(ring, kv_slot);
