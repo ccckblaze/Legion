@@ -14,5 +14,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "git": env!("LEGION_GIT_HASH"),
         "models": models,
+        "conv_tier": state.engine.conv_stats(),
     }))
 }

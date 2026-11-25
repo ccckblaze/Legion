@@ -1813,6 +1813,8 @@ pub struct LmEngine {
     load_report: report::LoadReport,
     /// `--pipeline-mtp-split`'s measurements, shared with the worker (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
+    /// The conversation cold tier's handle, shared with the worker: `/health`'s counters.
+    conv_tier: Option<conv_tier::ConvTier>,
     /// An automatic KV host tier's place in the process's plan (#1163): dropped after the
     /// worker (and the tier with it).
     _tier_plan: Option<host_tier::Reservation>,
@@ -6253,6 +6255,7 @@ impl LmEngine {
                 Some(conv_tier::ConvTier::start(disk, blocks, sig))
             }
         };
+        let conv_handle = conv.clone();
         let conv_tmpl = if conv.is_some() {
             exec.conv_block_template()
         } else {
@@ -6423,6 +6426,7 @@ impl LmEngine {
             worker: Some(worker),
             load_report,
             split_probe,
+            conv_tier: conv_handle,
             _tier_plan: tier_plan,
             warming,
         })
@@ -6663,6 +6667,10 @@ impl super::replicas::Replica for LmEngine {
 impl Engine for LmEngine {
     fn models(&self) -> Vec<ModelInfo> {
         vec![self.info.clone()]
+    }
+
+    fn conv_stats(&self) -> Option<conv_tier::StatsSnapshot> {
+        self.conv_tier.as_ref().map(|t| t.stats_snapshot())
     }
 
     fn check_response_format(
@@ -7427,6 +7435,7 @@ impl Worker {
                 let m = conv_tier::chain_run(prompt, KV_BLOCK, |c| tier.block(c).is_some())
                     .min(cap)
                     .max(start);
+                tier.stats().note_walk(m as u64);
                 if m > start {
                     let chains = conv_tier::block_chains(&prompt[..m * KV_BLOCK], KV_BLOCK);
                     let j = if self.stateless() {
@@ -7492,6 +7501,11 @@ impl Worker {
                     Some(e) => {
                         state_bytes = conv_tier::read_state_verified(&dir, chain, &e.key, e.bytes);
                         ok = state_bytes.is_some();
+                        if ok {
+                            tier.stats().states_ok.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            tier.stats().states_bad.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     None => ok = false,
                 }
@@ -7520,16 +7534,22 @@ impl Worker {
                         conv_tier::read_verified_window(&dir, &items, tier.cfg().verify_threads);
                     for (chain, bytes) in window.iter().zip(verified) {
                         let Some(bytes) = bytes else {
+                            tier.stats().blobs_mismatch.fetch_add(1, Ordering::Relaxed);
                             ok = false;
                             break;
                         };
+                        let st = tier.stats();
+                        st.blobs_ok.fetch_add(1, Ordering::Relaxed);
+                        st.bytes_hydrated.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         let Some(b) = self.pool.allocate() else {
+                            tier.stats().alloc_fails.fetch_add(1, Ordering::Relaxed);
                             ok = false;
                             break;
                         };
                         if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
                             tracing::warn!("conv tier: hydrate block {chain}: {err}");
                             self.pool.decref(b);
+                            tier.stats().upload_fails.fetch_add(1, Ordering::Relaxed);
                             ok = false;
                             break;
                         }
@@ -7544,8 +7564,10 @@ impl Worker {
                 table.extend_owned(&ids, KV_BLOCK as u32);
                 resumed = (resumed / KV_BLOCK + ext) * KV_BLOCK;
                 conv_state_bytes = state_bytes;
+                tier.stats().tokens_hydrated.fetch_add(ext as u64 * KV_BLOCK as u64, Ordering::Relaxed);
                 tracing::info!(blocks = ext, tokens = resumed, "conv tier: hydrated");
             } else {
+                tier.stats().revive_aborts.fetch_add(1, Ordering::Relaxed);
                 for b in ids {
                     self.pool.decref(b);
                 }

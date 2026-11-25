@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -110,6 +111,63 @@ pub struct Scanned {
     pub bytes: u64,
     pub missing: usize,
     pub foreign: usize,
+}
+
+/// What the tier actually gave back, the oMLX `cache/stats.py` counterpart: realized reuse
+/// must be a number, not an impression. Relaxed adds, all of them on the engine thread.
+#[derive(Default)]
+pub struct ConvStats {
+    pub walks: AtomicU64,
+    pub chains_present: AtomicU64,
+    pub blobs_ok: AtomicU64,
+    pub blobs_mismatch: AtomicU64,
+    pub states_ok: AtomicU64,
+    pub states_bad: AtomicU64,
+    pub alloc_fails: AtomicU64,
+    pub upload_fails: AtomicU64,
+    pub revive_aborts: AtomicU64,
+    pub tokens_hydrated: AtomicU64,
+    pub bytes_hydrated: AtomicU64,
+}
+
+impl ConvStats {
+    /// One hydrate walk over the chain: `present` block chains the tier had.
+    pub fn note_walk(&self, present: u64) {
+        self.walks.fetch_add(1, Ordering::Relaxed);
+        self.chains_present.fetch_add(present, Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> StatsSnapshot {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        StatsSnapshot {
+            walks: g(&self.walks),
+            chains_present: g(&self.chains_present),
+            blobs_ok: g(&self.blobs_ok),
+            blobs_mismatch: g(&self.blobs_mismatch),
+            states_ok: g(&self.states_ok),
+            states_bad: g(&self.states_bad),
+            alloc_fails: g(&self.alloc_fails),
+            upload_fails: g(&self.upload_fails),
+            revive_aborts: g(&self.revive_aborts),
+            tokens_hydrated: g(&self.tokens_hydrated),
+            bytes_hydrated: g(&self.bytes_hydrated),
+        }
+    }
+}
+
+/// `/health`'s view of [`ConvStats`].
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct StatsSnapshot {
+    pub walks: u64,
+    pub chains_present: u64,
+    pub blobs_ok: u64,
+    pub blobs_mismatch: u64,
+    pub states_ok: u64,
+    pub states_bad: u64,
+    pub alloc_fails: u64,
+    pub upload_fails: u64,
+    pub revive_aborts: u64,
+    pub tokens_hydrated: u64,
+    pub bytes_hydrated: u64,
 }
 
 /// Hash-keyed blobs shard by the chain's first byte: one flat directory of tens of
@@ -286,6 +344,7 @@ struct Inner {
     /// Blocks whose files are on disk: the engine gives their pool references back.
     acks: Mutex<Vec<u32>>,
     bytes: Mutex<u64>,
+    stats: ConvStats,
 }
 
 fn now_ms() -> u64 {
@@ -326,6 +385,7 @@ impl ConvTier {
             states: Mutex::new(states),
             acks: Mutex::new(Vec::new()),
             bytes: Mutex::new(total),
+            stats: ConvStats::default(),
         });
         let me = inner.clone();
         std::thread::Builder::new()
@@ -341,6 +401,14 @@ impl ConvTier {
 
     pub fn cfg(&self) -> &ConvDiskCfg {
         &self.inner.cfg
+    }
+
+    pub fn stats(&self) -> &ConvStats {
+        &self.inner.stats
+    }
+
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        self.inner.stats.snapshot()
     }
 
     /// Queue a prompt's finished blocks. Chains already stored or queued are skipped (the

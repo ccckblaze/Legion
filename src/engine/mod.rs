@@ -338,6 +338,11 @@ impl EngineStats {
 pub trait Engine: Send + Sync + 'static {
     fn models(&self) -> Vec<ModelInfo>;
 
+    /// The conversation cold tier's counters; `None` where there is no tier.
+    fn conv_stats(&self) -> Option<crate::engine::lm::conv_tier::StatsSnapshot> {
+        None
+    }
+
     /// Validate/compile a format before generation, so HTTP errors retain their field name.
     fn check_response_format(
         &self,
