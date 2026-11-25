@@ -66,6 +66,8 @@ Eviction: LRU over entries by `last_used`, `--conv-disk-ttl-min` (0: keep), and 
 - `--conv-disk <dir>` (off unless set), `--conv-disk-gib <n>` (default 100),
   `--conv-disk-ttl-min <n>` (default 0), `--conv-disk-restore` (on: hydrate at load;
   off: index only, dump-only mode for bisection).
+  `--conv-disk-verify-threads <n>` (default 8): workers that read and sha256-verify blobs
+  during hydrate; 1 reproduces the serial wall of the first production measurement.
 
 ## Verification gates
 
@@ -150,8 +152,20 @@ and the answer sha must equal the cold-computed sha.
     [ac922-perf-seconddev.md](ac922-perf-seconddev.md). Greedy answers are not repeatable
     between two identical C=4 bursts (3 of 4 shas moved), while every C=1 answer was
     bit-identical to its cold reference: cite the C=1 numbers as the correctness gate.
+  - **C5 (same evening, `8a32935`, the cut the paragraph above asked for)**: hydrate now
+    verifies in windows of at most 512 blobs with `--conv-disk-verify-threads` (default 8)
+    workers - the reads and the hashing move off the engine thread, uploads stay strictly
+    in order, and the verdict of any blob is unchanged (a `None` still aborts the extension
+    at the same place). Measured on the production shape, restart between rounds, same four
+    sessions C=1: spans 51.2-53.2 s became 14.9-16.9 s (round wall 209.6 s -> 64.9/65.2 s),
+    engine `queue_ms` ~46 s -> 9.1-10.4 s, `vs.cold` bit-identical [true x 4] in both rounds,
+    one of them with the page cache dropped first. The state sidecar read stays single-thread
+    (~110 MB, ~1 s, not the wall). Full-window revive is in single-digit-to-low-teens seconds.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
   hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
   tag (verification is the ~112 MB/s floor above, reads are not); the ~45 s wait a
   full-window session pays before its first window even when nothing is being hydrated.
+  Post-C5 re-arms this last one: a RAM-resident full-window follow-up should be timed again
+  - if its first-window wait is still ~45 s with no hydration involved, it is a separate
+  scheduler issue and the C5 thread count is not its lever.
