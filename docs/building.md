@@ -48,6 +48,12 @@ The full machine setup (RHEL 8, kernel, driver, NVLink) is in [ac922.md](ac922.m
   also leave each V100 about 0.75 GiB more usable VRAM than RHEL 8's 4.18 kernel.
 - The system gcc is too old. Install `gcc-toolset-12` and enable it in every shell that builds:
   `source /opt/rh/gcc-toolset-12/enable`.
+- The distro's Rust is too old too, and not just failing to compile: RHEL 8's module rustc 1.97
+  builds Legion but its CUDA graph capture trips `ggml-cuda.cu`'s buffer-type assertion at boot
+  on this box (observed 2026-11-25, at every upstream commit, including ones that boot fine when
+  built on 1.99.1). Build on the same `rustc 1.99.1` the numbers were made with: on the AC922 it
+  lives in `/opt/rust/bin` (from the official powerpc64le tarball), so `PATH=/opt/rust/bin:...`
+  and check `rustc --version` before trusting a rebuilt binary.
 - ggml's CPU backend on POWER uses the VSX `vector` keyword, which needs GNU C++ (`gnu++17`).
   ggml sets `CMAKE_CXX_STANDARD 17` with cmake's default GNU extensions, so nothing extra is
   needed, but do not force `CMAKE_CXX_EXTENSIONS=OFF`.
@@ -59,6 +65,7 @@ The full machine setup (RHEL 8, kernel, driver, NVLink) is in [ac922.md](ac922.m
 scripts/build.sh ac922
 # equivalent:
 source /opt/rh/gcc-toolset-12/enable
+export PATH=/opt/rust/bin:/usr/local/cuda/bin:$PATH   # rustc 1.99.1, not the distro's 1.97
 CC=gcc CXX=g++ CUDAHOSTCXX=g++ CMAKE_CUDA_ARCHITECTURES=70 cargo build --release --features cuda
 ```
 

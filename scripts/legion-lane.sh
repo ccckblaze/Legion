@@ -31,10 +31,11 @@ MAX_SEQS=${LEGION_MAX_SEQS:-16}
 MAXB=${LEGION_MAX_BATCH:-4096}
 EXTRA=${LEGION_EXTRA:-}
 STATE=${LEGION_STATE:-/tmp/legion-lane.state}
-PIDF=${LEGION_PIDF:-/tmp/legion-lane.pid}
+PIDF=${LEGION_PIDF:-/tmp/legion-lane-PLACE.pid}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-3600}
 
 CARDS=${1:-}; ACTION=${2:-start}
+[ -n "$CARDS" ] && PIDF=${PIDF/PLACE/$CARDS}
 [ -n "$CARDS" ] || { echo "usage: $0 <2|4|6> <start|stop|restart|status>" >&2; exit 2; }
 mkdir -p "$LOGD"
 
