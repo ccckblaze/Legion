@@ -101,6 +101,16 @@ impl Waiting<'_> {
             }
         }
     }
+
+    /// True while a cold-tier hydration (D1) is in flight for this item: its progress is
+    /// made by retrying `place()` at the step head, so it must not park the idle engine on
+    /// a request that may never come (the boot warmup's first revive, a lone deep revive).
+    pub(super) fn awaits_hydrate(&self) -> bool {
+        match self {
+            Waiting::New(job) => job.hydrate.is_some(),
+            Waiting::Preempted(seq) => seq.hydrate.is_some(),
+        }
+    }
 }
 
 /// What [`Worker::resume`] decided.

@@ -7250,14 +7250,28 @@ impl Worker {
                 prefilling.sort_by_key(|s| s.ticket.order());
             }
             if decoding.is_empty() && prefilling.is_empty() && !pipe.is_active() {
-                // Nothing admissible: only possible while the KV pool is short, which an idle
-                // engine never is. Wait for the next request rather than spin.
+                // Nothing admissible: the KV pool is short (which an idle engine never is)
+                // or a D1 hydration waits on its producer. Spin-free sleep in both cases:
+                // the second wakes on a short timeout, the first on the next request.
                 if !waiting.is_empty() {
                     self.outbox.flush();
-                    match rx.recv() {
-                        Ok(job) if self.gather.is_some() => held.push(job),
-                        Ok(job) => queue(&mut waiting, job),
-                        Err(_) => open = false,
+                    if waiting.any(|w| w.awaits_hydrate()) {
+                        // D1: a hydration in flight advances between steps (the producer has
+                        // or has not delivered a window), not when a new request arrives.
+                        // Retry admission shortly instead of sleeping on `rx` forever - the
+                        // boot warmup's first revive has no next request to wake this up.
+                        match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                            Ok(job) if self.gather.is_some() => held.push(job),
+                            Ok(job) => queue(&mut waiting, job),
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open = false,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(job) if self.gather.is_some() => held.push(job),
+                            Ok(job) => queue(&mut waiting, job),
+                            Err(_) => open = false,
+                        }
                     }
                 }
                 continue;

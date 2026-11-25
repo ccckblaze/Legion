@@ -257,6 +257,13 @@ impl<J> WaitQueue<J> {
         );
     }
 
+    /// True when any queued item satisfies `f`. A read-only scan (D1: the idle-wait branch
+    /// asks whether anything is parked behind a hydration in flight, which retries at the
+    /// step head rather than on a new request arriving).
+    pub fn any(&self, mut f: impl FnMut(&J) -> bool) -> bool {
+        self.entries.iter().any(|e| f(&e.job))
+    }
+
     /// Keeps only the jobs `keep` accepts (drops cancelled ones).
     pub fn retain(&mut self, mut keep: impl FnMut(&mut J) -> bool) {
         let mut dropped = Vec::new();
