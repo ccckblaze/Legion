@@ -131,14 +131,18 @@ and the answer sha must equal the cold-computed sha.
     to the cold reference - revive-det passes on the production geometry. Engine-side
     `prefill_seconds` 0.3-0.5 s and 5.4-6.2 s of decode at 35.6-40.4 tok/s, but 51-53 s
     of end-to-end span, because each request waits ~46 s in `queue_ms`.
-  - that ~46 s is the per-blob sha256 verification of the chain, not the read: 5.05 GiB
-    per session at ~112 MB/s single-threaded. Dropping the page cache beforehand changed
+  - that ~46 s is the per-blob sha256 verification of the chain, not the read: about
+    4.1 GiB hydrated per session (3,254 blocks of 1,228,800 B plus one 112.6 MiB state)
+    in ~46 s, i.e. ~90 MB/s single-threaded. Dropping the page cache beforehand changed
     nothing measurable (54.6 s vs 52.7 s, `prefill_seconds` 0.361 both times), so the NVMe
     is not the wall. Parallel or cheaper verification is the next cut and would take a
     full-window revive from ~46 s to single-digit seconds.
-  - capacity price per parked full-window session: ~5.05 GiB of blocks plus ~3.6 GiB of
-    state checkpoints, so the 200 GiB cap holds about 23 of them (/data free went
-    620 to 576 GiB over four sessions).
+  - measured footprint per parked full-window session: 13,014 new block files over four
+    sessions (3,254 each, 3.72 GiB) plus 128 state files (32 each at
+    `--prefix-cache-interval 8192`, 3.53 GiB) = ~7.2 GiB, so the 200 GiB cap holds roughly
+    27 full-window sessions. Two notes: the boot INFO line's GiB figure counts blocks only,
+    and 3,254 is fewer than the naive 261,917/64 = 4,092 - unexplained, worth a look
+    because it could be dedupe across head-salted chains or an unfilled tail.
   - C=4 revival burst: 267.6 s wall, 3.3 tok/s aggregate, per stream 1.8-40.5 tok/s.
     Repeating that burst with everything already RAM-resident reproduced it (264.5 s,
     3.3 tok/s, same collapse), and only one of four streams kept single-stream speed -
