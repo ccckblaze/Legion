@@ -177,6 +177,17 @@ and the answer sha must equal the cold-computed sha.
     never a walk stop. The true parked cost is 4,092 blocks (5.03 GiB) + 32 states
     (3.53 GiB) = ~8.6 GiB per full-window session, ~23 of them inside the 200 GiB cap;
     the earlier 3.72 GiB / 27-session numbers in this doc's footprint notes are superseded.
+  - **the delta-encoding study (offline, `/tmp/delta_probe.py`, 231 consecutive-boundary
+    pairs from the live tier): storage-only state deltas are DEAD on this model.** Adjacent
+    boundary states share 11.4% of bytes (the GDN cumulative state updates densely every
+    window), zeroing the equal bytes and lzma-ing the rest saves 1.6% - and full-file lzma
+    on these blobs saves only ~6%, so the 3.53 GiB state column is incompressible, not
+    unencoded. oMLX's `deepseek_v41_delta` wins where that state is sparse-delta-friendly;
+    here it does not apply. The surviving capacity lever is POLICY, not format: hydrate only
+    ever needs the deepest boundary at or below the walk end, so dump-time downsampling of
+    older state snapshots (keep the last few, thin the ancient ones) cuts the parked cost
+    toward the ~5.5 GiB the blocks alone cost, with zero numeric risk (a missing state
+    already falls back to a shallower boundary) and no format change. Tracked as C6.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
   hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
