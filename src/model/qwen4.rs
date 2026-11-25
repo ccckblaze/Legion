@@ -51,9 +51,12 @@ pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
 mod mtp;
+pub(crate) mod mtp_in;
 mod ple_ahead;
 pub(crate) use ple_ahead::PleAhead;
 mod ple_fused;
+pub(crate) use ple_fused::is_ple_conv;
+pub(crate) use ple_fused::rewrite as ple_rewrite;
 pub use ple_fused::set_fused_ple;
 mod ple_late;
 pub(crate) use ple_late::LateRows;
@@ -69,7 +72,7 @@ pub mod tiny;
 mod tp_overlap;
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{Context, Graph, Tensor, types};
 use crate::gguf::GgufFile;
@@ -468,6 +471,48 @@ pub(crate) fn qsa_share_cut(n_tok: usize, n_pool: usize, kpool: usize) -> usize 
     crate::tp_net::seq_par::cost_cut(n_tok, first, last.max(first), QSA_SHARE_MIN)
 }
 
+/// Most tokens of a prompt step whose indexer scores one graph computes at once (#1183): a
+/// step of more scores, picks and selects its tokens in chunks of at most this many, one after
+/// the other in the graph, so one chunk's scores (F32 `[n_pool, tokens]`, a byte per token of
+/// context per token at a pool size of 4: 1 GiB for 4,096 tokens at 262K) are what the compute
+/// buffer holds instead of the whole step's. The default step on a GPU sharing the host's
+/// memory: steps of up to it keep the graph they had.
+pub(crate) const QSA_SCORE_CHUNK: usize = 4096;
+
+/// Tokens a [`QSA_SCORE_CHUNK`] chunk starts on a multiple of: the scores kernel's tile of
+/// tokens ([`qsa_attn::scores_exact`]), so every chunk's tiles hold the same tokens as the
+/// whole step's would.
+pub(crate) const QSA_SCORE_ALIGN: usize = 64;
+
+/// The chunks `(first, count)` a group of `n_tok` tokens scores its pools in
+/// ([`QSA_SCORE_CHUNK`]), in order: one chunk up to it, else `ceil(n_tok / QSA_SCORE_CHUNK)`
+/// chunks of the same multiple of [`QSA_SCORE_ALIGN`] tokens but the last, which is no bigger
+/// (so the later chunks' scores fit in the first's memory). Up to 64K-token steps every chunk
+/// holds over 1,000 tokens.
+pub(crate) fn qsa_score_chunks(n_tok: usize) -> Vec<(usize, usize)> {
+    if n_tok <= QSA_SCORE_CHUNK {
+        return vec![(0, n_tok)];
+    }
+    let n = n_tok.div_ceil(QSA_SCORE_CHUNK);
+    let size = n_tok.div_ceil(n).next_multiple_of(QSA_SCORE_ALIGN);
+    if size * (n - 1) >= n_tok {
+        // Too many chunks for the alignment to leave the last any tokens (not at any step
+        // size a load allows): even chunks, the first ones a token bigger.
+        let (size, more) = (n_tok / n, n_tok % n);
+        let mut first = 0;
+        return (0..n)
+            .map(|i| {
+                let count = size + usize::from(i < more);
+                first += count;
+                (first - count, count)
+            })
+            .collect();
+    }
+    (0..n)
+        .map(|i| (i * size, size.min(n_tok - i * size)))
+        .collect()
+}
+
 /// `legion serve --qsa-pool-pad-steps` (#858; 0, the default: off): decode and verify steps of
 /// several sequences pad their listed pools to cover at least this many steps' growth. A step
 /// of `t` tokens completes up to `t / kpool` pools, so at 64 pools a 16-sequence verify step
@@ -627,8 +672,34 @@ fn ple_conv_time_major<'a>(
 }
 
 /// Tap `k` of the per-layer embedding's depthwise conv weight `w` as an F32 row of `width`.
+/// Whether [`Model::ple_ops`] said why it does not take a prompt step (once per process).
+static PLE_OPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the MTP head said why its prompt take-ins keep ggml's input chain
+/// ([`mtp_in`]; once per process).
+static MTP_IN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Logs once (per `flag`) that `what` is off for prompt steps, and `why`.
+fn off_once(flag: &AtomicBool, what: &str, why: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::info!("{what} off for prompt steps, ggml's chain instead: {why}");
+    }
+}
+
 fn ple_conv_tap<'a>(ctx: &'a Context, w: Tensor<'a>, k: i64, width: i64) -> Tensor<'a> {
+    ple_conv_tap_named(ctx, w, k, width, None)
+}
+
+/// [`ple_conv_tap`], its view of `w` named `name`.
+fn ple_conv_tap_named<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    k: i64,
+    width: i64,
+    name: Option<&str>,
+) -> Tensor<'a> {
     let wk = ctx.view_2d(w, [1, width], w.nb()[1], k as usize * w.nb()[0]);
+    let wk = name.map_or(wk, |name| wk.named(name));
     let wk = ctx.cont_2d(wk, width, 1);
     if wk.ty() != types::F32 {
         ctx.cast(wk, types::F32)
@@ -644,7 +715,8 @@ fn ple_conv_tap<'a>(ctx: &'a Context, w: Tensor<'a>, k: i64, width: i64) -> Tens
 /// [`ple_conv_time_major`]'s, in the same order: only the copies differ. The token-major
 /// window copies the chunk transposed into it and back once per tap, for a 4,096-token chunk
 /// five copies of 160 MiB on qwen4exp's first pipeline stage, the slowest stage of a long
-/// prompt (#462).
+/// prompt (#462). `mark`: the history's copy and the first tap's view are named for the PLE
+/// ops' rewrite ([`ple_fused::rewrite`]).
 fn ple_conv_rows<'a>(
     ctx: &'a Context,
     graph: &std::cell::RefCell<Graph<'a>>,
@@ -652,6 +724,7 @@ fn ple_conv_rows<'a>(
     state: Tensor<'a>,
     x: Tensor<'a>,
     ple: &PleParams,
+    mark: bool,
 ) -> Tensor<'a> {
     let (kern, dil, hist) = (ple.conv_kernel, ple.ngram as i64, ple.history());
     let [width, nt, ns, _] = x.ne();
@@ -666,13 +739,21 @@ fn ple_conv_rows<'a>(
             start as usize * nb[1],
         )
     };
-    graph
-        .borrow_mut()
-        .expand(ctx.cpy(ctx.transpose(window(nt, hist)), state));
+    let keep = ctx.cpy(ctx.transpose(window(nt, hist)), state);
+    let keep = if mark {
+        keep.named(ple_fused::rewrite::KEEP)
+    } else {
+        keep
+    };
+    graph.borrow_mut().expand(keep);
     let mut conv: Option<Tensor<'a>> = None;
     for k in 0..kern {
         let start = hist - (kern - 1 - k) * dil;
-        let term = ctx.mul(window(start, nt), ple_conv_tap(ctx, w, k, width));
+        let name = (mark && k == 0).then_some(ple_fused::rewrite::TAP);
+        let term = ctx.mul(
+            window(start, nt),
+            ple_conv_tap_named(ctx, w, k, width, name),
+        );
         conv = Some(match conv {
             Some(c) => ctx.add(c, term),
             None => term,
@@ -1521,19 +1602,24 @@ impl Model {
 
         let key = ctx.mul_mat(self.lw(il, "ple_key.weight")?, emb);
         let value = ctx.mul_mat(self.lw(il, "ple_value.weight")?, emb);
-        if let Some(out) = self.ple_ops(pass, il, res, key, value)? {
-            return Ok(out);
-        }
+        // Marked: the chain's nodes become the PLE ops once the graph is allocated as built.
+        let mark = self.ple_ops(pass, il, res, key, value)?;
+        let named = |t: Tensor<'a>, name: &str| if mark { t.named(name) } else { t };
+        let (key, value) = (
+            named(key, ple_fused::rewrite::KEY),
+            named(value, ple_fused::rewrite::VALUE),
+        );
+        let gamma_names = ple_fused::rewrite::GAMMAS;
         // RMS norm per stream, one gamma per stream.
-        let grouped_norm = |x: Tensor<'a>, w: &str| -> Result<Tensor<'a>, ModelError> {
+        let grouped_norm = |x: Tensor<'a>, w: &str, g: usize| -> Result<Tensor<'a>, ModelError> {
             let x = ctx.reshape_3d(x, e, hc, n);
             Ok(ctx.mul(
                 ctx.rms_norm(x, hp.rms_eps),
-                ctx.reshape_2d(self.lw(il, w)?, e, hc),
+                named(ctx.reshape_2d(self.lw(il, w)?, e, hc), gamma_names[g]),
             ))
         };
-        let key = grouped_norm(key, "ple_norm_key.weight")?;
-        let query = grouped_norm(res, "ple_norm_query.weight")?;
+        let key = grouped_norm(key, "ple_norm_key.weight", 0)?;
+        let query = grouped_norm(res, "ple_norm_query.weight", 1)?;
         // Per-stream dot product, signed square root, sigmoid.
         let s = ctx.sum_rows(ctx.mul(key, query));
         let s = ctx.scale(s, 1.0 / (e as f32).sqrt());
@@ -1542,8 +1628,8 @@ impl Model {
         tap.tap("ple_gate", il, gate);
         let v3 = ctx.repeat_4d(ctx.reshape_3d(value, e, 1, n), [e, hc, n, 1]);
         let gated = ctx.mul(v3, gate);
-        let normalized = grouped_norm(ctx.reshape_2d(gated, hc_dim, n), "ple_norm_conv.weight")?;
-        let normalized = ctx.reshape_2d(normalized, hc_dim, n);
+        let normalized = grouped_norm(ctx.reshape_2d(gated, hc_dim, n), "ple_norm_conv.weight", 2)?;
+        let normalized = ctx.reshape_2d(named(normalized, ple_fused::rewrite::XN), hc_dim, n);
 
         // Depthwise causal conv dilated by the n-gram size, as a sum of shifted copies over
         // [history | this chunk]; tap k reads (kernel - 1 - k) × n-gram positions back.
@@ -1552,10 +1638,11 @@ impl Model {
         for (off, sh) in pass.groups() {
             let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
             let x = ctx.reshape_3d(cols(ctx, normalized, off, nt * ns), hc_dim, nt, ns);
+            let x = named(x, ple_fused::rewrite::X);
             let state = pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs);
             ple_captures(pass, il, sh, x, ple.history());
             if !sh.verify && nt > 1 {
-                outs.push(ple_conv_rows(ctx, &pass.graph, w, state, x, ple));
+                outs.push(ple_conv_rows(ctx, &pass.graph, w, state, x, ple, mark));
                 continue;
             }
             let padded = ctx.concat(state, ctx.transpose(x), 0);
@@ -1571,14 +1658,20 @@ impl Model {
         let conv = ctx.silu(concat_cols(ctx, outs));
         let conv = ctx.reshape_3d(ctx.cont(conv), e, hc, n);
         tap.tap("ple_conv_out", il, conv);
-        Ok(ctx.add(res, ctx.add(gated, conv)))
+        Ok(named(
+            ctx.add(res, ctx.add(gated, conv)),
+            ple_fused::rewrite::OUT,
+        ))
     }
 
-    /// [`Self::ple`] after its two matmuls as Legion's two ops ([`ple_fused`]: ggml-cuda's bits
-    /// in two launches per group instead of about thirty nodes), for prompt steps on a GPU:
-    /// every group a prompt chunk (more than one token, not a verify), the weights and the
-    /// histories in GPU memory, no tensors tapped. `None` where they do not fit or are off
-    /// (`--ple-ops`; ggml's chain).
+    /// Whether [`Self::ple`]'s chain after its two matmuls is marked to run as Legion's two ops
+    /// ([`ple_fused`]: ggml-cuda's bits in two launches instead of about thirty nodes), for
+    /// prompt steps on a GPU: one group, a prompt chunk (more than one token, not a verify),
+    /// the weights and the history in GPU memory, no tensors tapped. On with `--ple-ops`, and
+    /// with `--dense-fp8-prompt` (#1183: ~85 ms of ggml's chain per 12,288-token step on a
+    /// GB10). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
+    /// it fuses without the ops; the ops take the chain's nodes after that
+    /// ([`ple_fused::rewrite`]). The first prompt step that keeps the chain logs why, once.
     fn ple_ops<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -1586,13 +1679,17 @@ impl Model {
         res: Tensor<'a>,
         key: Tensor<'a>,
         value: Tensor<'a>,
-    ) -> Result<Option<Tensor<'a>>, ModelError> {
-        if !ple_fused::fused_ple() {
-            return Ok(None);
+    ) -> Result<bool, ModelError> {
+        // Decode and verify steps keep ggml's chain by design (not logged).
+        if !pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1) {
+            return Ok(false);
+        }
+        // Not asked for (not logged: the reasons logged are of steps that asked).
+        if !(ple_fused::fused_ple() || self.dense_fp8_mode() == 3) {
+            return Ok(false);
         }
         let ctx = pass.ctx;
-        let hp = &self.hp;
-        let (e, n) = (hp.n_embd, pass.n);
+        let e = self.hp.n_embd;
         let hc = self.qwen4().hc.n;
         let ple = self.qwen4().ple.as_ref().expect("per-layer embedding");
         let gammas = [
@@ -1603,61 +1700,65 @@ impl Model {
         let w = self.lw(il, "ple_conv1d.weight")?;
         let on_gpu = |t: Tensor<'_>| !t.is_host() && !t.is_meta();
         let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
-        let groups_fit = pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1);
-        let states: Vec<_> = if groups_fit {
-            pass.groups()
-                .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
-                .collect()
-        } else {
-            Vec::new()
+        let states: Vec<_> = pass
+            .groups()
+            .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
+            .collect();
+        let weight_ok = |g: Tensor<'_>, bf16: bool| {
+            (g.ty() == types::F32 || (bf16 && g.ty() == types::BF16))
+                && g.is_contiguous()
+                && on_gpu(g)
         };
-        let fits = cfg!(feature = "cuda")
-            && !pass.tap.on
-            && hc == ple_fused::PLE_HC
-            && e >= ple_fused::PLE_MIN_E
-            && gammas
-                .iter()
-                .chain([&w])
-                .all(|&g| g.ty() == types::F32 && g.is_contiguous() && on_gpu(g))
-            && w.ne()[0] == ple.conv_kernel
-            && f32_rows(res)
-            && res.nb()[1] == e as usize * 4
-            && f32_rows(key)
-            && f32_rows(value)
-            && groups_fit
-            && states.iter().all(|&s| on_gpu(s));
-        if !fits {
-            return Ok(None);
+        // Why the ops do not take this step, the first reason found.
+        let why = if !cfg!(feature = "cuda") {
+            Some("not a CUDA build".to_string())
+        } else if states.len() != 1 {
+            Some(format!(
+                "{} groups in the step (the ops take one)",
+                states.len()
+            ))
+        } else if pass.tap.on {
+            Some("tensors are tapped".to_string())
+        } else if hc != ple_fused::PLE_HC || e < ple_fused::PLE_MIN_E {
+            Some(format!(
+                "{hc} streams of {e} (the kernels take 4 of 1,024 or more)"
+            ))
+        } else if let Some(g) = gammas.iter().find(|&&g| !weight_ok(g, false)) {
+            Some(format!(
+                "{} is {} (contiguous F32 in GPU memory wanted)",
+                g.name(),
+                crate::ggml::type_name(g.ty())
+            ))
+        } else if !weight_ok(w, true) || w.ne()[0] != ple.conv_kernel {
+            Some(format!(
+                "{} is {} {:?} (contiguous F32 or BF16 [{}, e * hc] in GPU memory wanted)",
+                w.name(),
+                crate::ggml::type_name(w.ty()),
+                w.ne(),
+                ple.conv_kernel
+            ))
+        } else if !(f32_rows(res) && res.nb()[1] == e as usize * 4) {
+            Some(format!(
+                "the streams are {} with strides {:?}",
+                crate::ggml::type_name(res.ty()),
+                res.nb()
+            ))
+        } else if !(f32_rows(key) && f32_rows(value)) {
+            Some(format!(
+                "the key and value are {} and {}",
+                crate::ggml::type_name(key.ty()),
+                crate::ggml::type_name(value.ty())
+            ))
+        } else if !states.iter().all(|&s| on_gpu(s)) {
+            Some("the conv histories are not in GPU memory".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            off_once(&PLE_OPS_OFF, "PLE ops", &why);
+            return Ok(false);
         }
-        let (xn, gate) = ple_fused::gate_norm(
-            ctx,
-            key,
-            res,
-            value,
-            gammas,
-            hp.rms_eps,
-            1.0 / (e as f32).sqrt(),
-            1e-6,
-        );
-        let streams = ctx.view_2d(res, [e * hc, n], res.nb()[2], 0);
-        let mut outs = Vec::new();
-        for ((off, sh), state) in pass.groups().zip(states) {
-            let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
-            let m = nt * ns;
-            ple_captures(pass, il, sh, cols(ctx, xn, off, m), ple.history());
-            outs.push(ple_fused::conv_out(
-                ctx,
-                cols(ctx, xn, off, m),
-                state,
-                w,
-                cols(ctx, value, off, m),
-                cols(ctx, gate, off, m),
-                cols(ctx, streams, off, m),
-                nt,
-                ple.ngram as i64,
-            ));
-        }
-        Ok(Some(ctx.reshape_3d(concat_cols(ctx, outs), e, hc, n)))
+        Ok(true)
     }
 
     /// Where the per-layer n-gram table is in the model file (`(tensor, type, row elements)`),
@@ -2215,6 +2316,16 @@ impl Model {
                 pos,
             ));
         }
+        let chunks = qsa_score_chunks(ng);
+        let smallest = chunks.iter().map(|c| c.1).min().unwrap_or(0);
+        if chunks.len() > 1
+            && chunks.iter().all(|c| c.0 % QSA_SCORE_ALIGN == 0)
+            && !pass.tap.on
+            && self.qsa_takes_own(ng, sh.n_pool)
+            && self.qsa_takes_own(smallest, sh.n_pool)
+        {
+            return self.qsa_select_chunked(pass, il, gi, iq, &chunks);
+        }
         let (score, top) = self.qsa_top(pass, il, gi, iq, true, None)?;
         Ok(qsa_attn::select(
             pass.ctx,
@@ -2224,6 +2335,86 @@ impl Model {
             inp.tail_idxs,
             pos,
         ))
+    }
+
+    /// Whether a group of `tokens` tokens listing `n_pool` pools takes
+    /// [`qsa_attn::scores_exact`] and [`qsa_attn::top_k`] in [`Self::qsa_top`] on the CUDA
+    /// paged path: no tensor-core scores, at least the exact scores' tokens, the own `top_k`
+    /// and more rows than the cluster `top_k` takes. Those ops give each token the same bits
+    /// whatever tokens share its graph (its scores one FMA chain over the dims and heads in
+    /// order, its picks one CTA's), which [`Self::qsa_share`] and [`Self::qsa_select_chunked`]
+    /// rely on.
+    fn qsa_takes_own(&self, tokens: usize, n_pool: usize) -> bool {
+        let Some(q) = self.qwen4().qsa.as_ref() else {
+            return false;
+        };
+        let (ng, np) = (tokens as i64, n_pool as i64);
+        let n_top = np.min(q.top_k as i64 / q.kpool as i64);
+        let row = 4 * n_pool;
+        let nb = [4, row, row * tokens, row * tokens];
+        !qsa_attn::scores_fit(q.n_head, q.head_dim, ng)
+            && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, ng)
+            && qsa_attn::own_top_k()
+            && !crate::model::cluster_select::topk_fits(types::F32, [np, ng, 1, 1], nb, n_top)
+    }
+
+    /// [`Self::qsa_select`] of a prompt group of more than [`QSA_SCORE_CHUNK`] tokens, chunk by
+    /// chunk (#1183): each chunk of [`qsa_score_chunks`] scores the pools for its tokens, picks
+    /// the best and selects into its tokens' rows of the group's selection
+    /// ([`qsa_attn::select_rows`], then [`qsa_attn::select_into`] in place). The scores (F32 `[n_pool,
+    /// tokens]`, the step's one buffer that grows with tokens times context) are freed after
+    /// their chunk's select, so the chunks reuse one chunk's memory: the step's compute buffer
+    /// grows about linearly in its tokens instead of with tokens times context.
+    ///
+    /// The same rows, bit for bit, as the whole group's [`qsa_attn::scores_exact`],
+    /// [`qsa_attn::top_k`] and [`qsa_attn::select`] ([`Self::qsa_takes_own`] holds for the
+    /// group and every chunk): a token's scores are one FMA chain of its own query over the
+    /// dims and heads in order plus its mask and the pool's bias, in a tile of the same 64
+    /// tokens (chunks start on multiples of [`QSA_SCORE_ALIGN`]); its picks are one CTA's
+    /// over its row; its selection reads only its own picks, scores, tail and position. The
+    /// pooled keys, bias and pool members are the group's, shared by every chunk.
+    fn qsa_select_chunked<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        gi: usize,
+        iq: Tensor<'a>,
+        chunks: &[(usize, usize)],
+    ) -> Result<Tensor<'a>, ModelError> {
+        let (off, sh) = pass.groups().nth(gi).expect("group index");
+        let q = self.qwen4().qsa.as_ref().expect("sparse attention");
+        let ctx = pass.ctx;
+        let inp = QsaInputs::from_slice(&pass.group[gi]);
+        let (d, kpool) = (q.head_dim, q.kpool as i64);
+        let n_pool = sh.n_pool as i64;
+        let n_top = n_pool.min(q.top_k as i64 / kpool);
+        let pooled = self.qsa_pool_keys(pass, il, gi)?;
+        let keys = ctx.reshape_3d(ctx.get_rows(pooled, inp.pool_cells), d, 1, n_pool);
+        let (qnb, es) = (iq.nb(), pass.pos.element_size());
+        let ng = chunks.iter().map(|c| c.0 + c.1).max().unwrap_or(0) as i64;
+        // The first chunk's select makes the group's rows, each later one writes its rows over
+        // them in place (no concat: the rows are written once).
+        let mut rows: Option<Tensor<'a>> = None;
+        for &(a, m) in chunks {
+            let (a, m) = (a as i64, m as i64);
+            let first = off as usize + a as usize;
+            let qg = ctx.view_3d(iq, [d, q.n_head, m], [qnb[1], qnb[2]], first * qnb[2]);
+            let w = ctx.fill(
+                ctx.new_tensor(types::F32, &[q.n_head, m]),
+                1.0 / (d as f32).sqrt(),
+            );
+            let vis = crate::model::core::cols(ctx, inp.pool_vis, a, m);
+            let score = qsa_attn::scores_exact(ctx, qg, keys, w, vis, inp.pool_bias);
+            let top = qsa_attn::top_k(ctx, score, n_top);
+            let tail = crate::model::core::cols(ctx, inp.tail_idxs, a, m);
+            let pos = ctx.view_2d(pass.pos, [m, 1], m as usize * es, first * es);
+            let pidx = inp.pool_idxs;
+            rows = Some(match rows {
+                None => qsa_attn::select_rows(ctx, top, score, pidx, tail, pos, ng),
+                Some(r) => qsa_attn::select_into(ctx, r, a, top, score, pidx, tail, pos),
+            });
+        }
+        Ok(rows.expect("no chunks"))
     }
 
     /// Where group `gi` of sparse-attention layer `il` runs its indexer on this rank's share of
@@ -2255,20 +2446,9 @@ impl Model {
             .map(|r| crate::tp_net::seq_par::share_cut(ng, r, ranks, cut).1)
             .min()
             .unwrap_or(0) as i64;
-        let n_pool = sh.n_pool as i64;
-        let n_top = n_pool.min(q.top_k as i64 / q.kpool as i64);
-        let row = 4 * sh.n_pool;
-        let nb = [4, row, row * ng, row * ng];
-        let whole_takes_own = !qsa_attn::scores_fit(q.n_head, q.head_dim, ng as i64)
-            && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, ng as i64)
-            && qsa_attn::own_top_k()
-            && !crate::model::cluster_select::topk_fits(
-                types::F32,
-                [n_pool, ng as i64, 1, 1],
-                nb,
-                n_top,
-            );
-        if !whole_takes_own || !qsa_attn::scores_exact_fit(q.n_head, q.head_dim, fewest) {
+        if !self.qsa_takes_own(ng, sh.n_pool)
+            || !qsa_attn::scores_exact_fit(q.n_head, q.head_dim, fewest)
+        {
             return None;
         }
         let (a, m) = crate::tp_net::seq_par::share_cut(ng, rank, ranks, cut);
@@ -2495,6 +2675,22 @@ impl Arch for Qwen4Params {
 
     fn indexed(&self, il: usize) -> bool {
         self.qsa.as_ref().is_some_and(|q| q.layer(il))
+    }
+
+    fn chunks_step_scores(&self, hp: &Hparams, tokens: usize) -> bool {
+        // `qsa_select`'s chunks (#1183) on the CUDA paged path: [`QSA_SCORE_CHUNK`] tokens at
+        // most, with the exact scores and the own `top_k` (not ggml's, nor Volta's
+        // tensor-core scores).
+        let chunk = QSA_SCORE_CHUNK as i64;
+        tokens >= QSA_SCORE_CHUNK
+            && self.qsa.as_ref().is_some_and(|q| {
+                // The sparse layers take the paged op at all ([`Self::paged_for`]'s Auto rule).
+                qsa_attn::supported(hp.head_dim, hp.n_head, hp.n_head_kv)
+                    && q.top_k / q.kpool <= qsa_attn::CUDA_MAX_TOP
+                    && !qsa_attn::scores_fit(q.n_head, q.head_dim, chunk)
+                    && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, chunk)
+                    && qsa_attn::own_top_k()
+            })
     }
 
     /// The sparse attention kernels read F16, or q8_0 / q4_0 K and V (#263); dense attention

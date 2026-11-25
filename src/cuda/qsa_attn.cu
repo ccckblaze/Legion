@@ -24,9 +24,12 @@
 
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
+#include "fp8_act_row.cuh"
 
 extern "C" {
 
@@ -102,6 +105,33 @@ struct legion_qsa_attn {
     // attn_gw_kernel copies K and V with cp.async.cg (L2 only) instead of cp.async.ca (through
     // L1, the default): LEGION_DEBUG_QSA_GW_L1=0, for A/B runs.
     int32_t gw_cg;
+    // Prompt steps under --dense-fp8-prompt (#1183; null: off): the output gated by the sigmoid
+    // of `gate` (head h of token t at gate + t * gate_ld + h * gate_hd, F32) and quantized per
+    // token as fp8_act.cu's gate kind does it, written as `codes` (E4M3 [d * n_head, tokens])
+    // and `scales` (F32 [tokens]) instead of the output. attn_gw_kernel does that where the
+    // launcher runs it (then 0); every other kernel writes the output to `dst` as without
+    // codes (then 3: the caller quantizes it). `sync`: 3 * tokens zeroed words (attn_gw_kernel's
+    // per-token counters and amax); `dst` then holds the gated rows of the CTAs that finish a
+    // token first.
+    const float * gate;
+    int64_t gate_ld, gate_hd;  // floats
+    uint8_t * codes;
+    float * scales;
+    uint32_t * sync;
+    // With codes on a GB10 (#1183; null: off): q is the query before its head norm and RoPE
+    // (ggml's rms_norm, mul by qn_w and rope_multi, folded into attn_gw_kernel's q load by
+    // node_fuse), and the kernel makes each value as ggml-cuda's rms_norm_f32<256, true> and
+    // rope_multi make it. Only attn_gw_kernel's codes path at head size 256 takes it; every
+    // other launch returns 1.
+    const float * qn_w;      // [head_dim]: the norm's weight
+    const int32_t * qn_pos;  // section s of token t at qn_pos[t + s * qn_pos_n]
+    int32_t qn_pos_n;
+    float qn_eps;
+    int32_t qn_rot;          // rotated columns (ggml's n_dims), even
+    int32_t qn_sections[4];  // ggml's mrope sections
+    int32_t qn_imrope;       // 1: GGML_ROPE_TYPE_IMROPE, 0: MROPE
+    float qn_freq_base, qn_freq_scale, qn_attn_factor;
+    float qn_theta_scale;    // set by the launcher (as ggml-cuda's host code computes it)
 };
 
 int legion_qsa_pool_mask_launch(const legion_qsa_pool_mask * p, void * stream);
@@ -186,6 +216,8 @@ int legion_qsa_scores_sm7x(void);
 namespace {
 
 constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
+// launch_attn's result where attn_gw_kernel wrote the FP8 codes (legion_qsa_attn::codes).
+constexpr int CODES_WRITTEN = 16;
 
 __global__ void pool_mask_kernel(legion_qsa_pool_mask p) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1440,9 +1472,9 @@ __global__ void __launch_bounds__(128) qsa_scores_kernel(const legion_qsa_scores
 
 // attn_gw_kernel<HD, VAR> (sm80/qsa_attn_gb10.cuh): ~39 KB at HD 256, under the 48 KB default,
 // two CTAs per SM with the largest shared-memory carveout (GW_ONE: 64 KB, one CTA per SM).
-template <int HD, int VAR>
+template <int HD, int VAR, bool CODES = false, bool QN = false>
 int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
-    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR>;
+    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR, CODES, QN>;
     int bytes = (int) sizeof(GbSmem<HD>);
     if constexpr ((VAR & GW_ONE) != 0) {
         bytes = 64 * 1024;  // over half of the SM's shared memory
@@ -1461,6 +1493,24 @@ int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
 
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
+    // q before its norm and RoPE (qn_w): attn_gw_kernel's codes path only, where node_fuse
+    // folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size 256). With a
+    // kernel forced since, nothing runs (1; the caller refuses that first): the other kernels
+    // read the RoPE's output, which the fold left unwritten.
+    if (p.qn_w != nullptr) {
+        if constexpr (HD == 256) {
+            if (p.k_type == 0 && p.v_type == 0 && p.codes != nullptr && use_mma<HD>() &&
+                p.mma_kernel == 0 && p.gw_cg == 0 &&
+                p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
+                legion_qsa_attn q = p;
+                // As ggml-cuda's rope_multi_cuda (host side).
+                q.qn_theta_scale = powf(p.qn_freq_base, -2.0f / p.qn_rot);
+                const int r = launch_gw_variant<HD, GW_CA, true, true>(q, st);
+                return r == 0 ? CODES_WRITTEN : r;
+            }
+        }
+        return 1;
+    }
     // A quantized cache: the m8n8k4 kernel on every device (attn_mma_kernel reads F16).
     if (p.k_type != 0) {
         switch (p.k_type * 4 + p.v_type) {
@@ -1492,6 +1542,12 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb == 3) {
+            // Codes only on the auto pick: a forced kernel (--qsa-mma-kernel) keeps the
+            // standalone gate, so A/B runs of the variants compare like with like.
+            if (p.codes != nullptr && !p.gw_cg && p.mma_kernel == 0) {
+                const int r = launch_gw_variant<HD, GW_CA, true>(p, st);
+                return r == 0 ? CODES_WRITTEN : r;
+            }
             return p.gw_cg ? launch_gw_variant<HD, 0>(p, st) : launch_gw_variant<HD, GW_CA>(p, st);
         }
         if (gb != 0) {
@@ -1865,7 +1921,7 @@ int legion_qsa_attn_launch(const legion_qsa_attn * p, void * stream) {
         }
     }
     if (p->part) {
-        if (p->n_head / p->n_head_kv > DMAXG || p->splits < 1) {
+        if (p->n_head / p->n_head_kv > DMAXG || p->splits < 1 || p->qn_w != nullptr) {
             return 1;
         }
         switch (p->head_dim) {
@@ -1874,11 +1930,18 @@ int legion_qsa_attn_launch(const legion_qsa_attn * p, void * stream) {
             default: return 1;
         }
     }
+    int r = 1;
     switch (p->head_dim) {
-        case 128: return launch_attn<128>(*p, (cudaStream_t) stream);
-        case 256: return launch_attn<256>(*p, (cudaStream_t) stream);
-        default: return 1;
+        case 128: r = launch_attn<128>(*p, (cudaStream_t) stream); break;
+        case 256: r = launch_attn<256>(*p, (cudaStream_t) stream); break;
+        default: break;
     }
+    // With codes asked for: 0 where attn_gw_kernel wrote them, 3 where a kernel wrote the
+    // output instead.
+    if (r == CODES_WRITTEN) {
+        return 0;
+    }
+    return r == 0 && p->codes != nullptr ? 3 : r;
 }
 
 int legion_qsa_topk_launch(const legion_qsa_topk * p, void * stream) {

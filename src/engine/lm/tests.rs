@@ -1152,3 +1152,175 @@ fn groups_in_flight_over_two_nodes_draft_nothing() {
     assert!(groups_drafts(false), "whole steps and one machine draft");
     assert!(!groups_drafts(true));
 }
+
+#[test]
+fn fewer_kept_prompt_graphs_leave_less_step_room() {
+    use crate::ggml::DeviceKind;
+    let gib = 1usize << 30;
+    let mib = 1usize << 20;
+    // Three kept graphs: the 1.5 GiB per 1K as before (#1183 splits it, same sum).
+    assert_eq!(UMA_STEP_BYTES_PER_1K, 3 * gib / 2);
+    for t in [1024, 4096, 8192, 16384] {
+        assert_eq!(
+            kv_headroom_kept(DeviceKind::IntegratedGpu, t, UMA_HEADROOM, PROMPT_GRAPHS),
+            kv_headroom(DeviceKind::IntegratedGpu, t, UMA_HEADROOM)
+        );
+    }
+    // 8K steps: 12 GiB of step room with three kept graphs, 8 x (2 x 434 + 234) MiB with two,
+    // 8 x (434 + 234) MiB with one.
+    assert_eq!(
+        kv_headroom(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM),
+        (2 + 16 + 2 + 12) * gib
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 2),
+        (2 + 16 + 2) * gib + 8 * 1102 * mib
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 1),
+        (2 + 16 + 2) * gib + 8 * 668 * mib
+    );
+    // Out of range counts clamp; other devices keep the compute headroom only.
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 0),
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 1)
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 9),
+        kv_headroom(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM)
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::Gpu, 8192, UMA_HEADROOM, 1),
+        COMPUTE_HEADROOM
+    );
+}
+
+#[test]
+fn chunked_charge_only_on_the_paged_path() {
+    // `paged` is the load's resolved path (`auto` that falls back to gather passes false).
+    assert!(paged_step_scores(1, true));
+    assert!(!paged_step_scores(1, false));
+    assert!(!paged_step_scores(2, true));
+    assert!(!paged_step_scores(2, false));
+}
+
+#[test]
+fn chunked_scores_charge_less_only_past_a_chunk() {
+    use crate::ggml::DeviceKind;
+    let gib = 1usize << 30;
+    let mib = 1usize << 20;
+    let igpu = DeviceKind::IntegratedGpu;
+    // Up to 4,096 tokens the same bytes, chunked or not, for every kept count (#1183).
+    for t in [1, 1024, 3000, LEAN_STEP_TOKENS] {
+        for kept in 0..=PROMPT_GRAPHS + 1 {
+            assert_eq!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, true),
+                kv_headroom_kept(igpu, t, UMA_HEADROOM, kept),
+                "{t} tokens, {kept} kept"
+            );
+        }
+        assert_eq!(
+            uma_step_graph_bytes(t, true),
+            uma_step_graph_bytes(t, false)
+        );
+    }
+    // Not chunked: the charge as before at any step.
+    for t in [8192, 12288, 16384] {
+        for kept in 1..=PROMPT_GRAPHS {
+            assert_eq!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, false),
+                kv_headroom_kept(igpu, t, UMA_HEADROOM, kept)
+            );
+        }
+        assert_eq!(uma_step_graph_bytes(t, false), t / 1024 * 434 * mib);
+    }
+    // Chunked: a 4K step's graph plus 394 MiB per 1K past it, the once part as before.
+    assert_eq!(uma_step_graph_bytes(8192, true), (4 * 434 + 4 * 394) * mib);
+    assert_eq!(uma_step_graph_bytes(12288, true), (4 * 434 + 8 * 394) * mib);
+    assert_eq!(
+        uma_step_graph_bytes(16384, true),
+        (4 * 434 + 12 * 394) * mib
+    );
+    // A partial 1K counts whole, as the unchunked charge does.
+    assert_eq!(uma_step_graph_bytes(4097, true), (4 * 434 + 394) * mib);
+    assert_eq!(
+        kv_headroom_step(igpu, 16384, UMA_HEADROOM, 1, true),
+        (2 + 16 + 2) * gib + (4 * 434 + 12 * 394 + 16 * 234) * mib
+    );
+    assert_eq!(
+        kv_headroom_step(igpu, 8192, UMA_HEADROOM, 2, true),
+        (2 + 16 + 2) * gib + (2 * (4 * 434 + 4 * 394) + 8 * 234) * mib
+    );
+    assert_eq!(
+        kv_headroom_step(igpu, 8192, UMA_HEADROOM, 3, true),
+        (2 + 16 + 2) * gib + (3 * (4 * 434 + 4 * 394) + 8 * 234) * mib
+    );
+    for t in [8192, 12288, 16384] {
+        for kept in 1..=PROMPT_GRAPHS {
+            assert!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, true)
+                    < kv_headroom_kept(igpu, t, UMA_HEADROOM, kept)
+            );
+        }
+    }
+    // Other devices keep the compute headroom only.
+    assert_eq!(
+        kv_headroom_step(DeviceKind::Gpu, 16384, UMA_HEADROOM, 1, true),
+        COMPUTE_HEADROOM
+    );
+}
+
+#[test]
+fn big_steps_keep_the_most_prompt_graphs_that_fit() {
+    // Not big (4K steps, a discrete GPU, ...): three, fitting or not.
+    assert_eq!(lean_prompt_graphs(false, |_| false), PROMPT_GRAPHS);
+    assert_eq!(lean_prompt_graphs(false, |k| k == 1), PROMPT_GRAPHS);
+    // Big steps that fit with three keep three.
+    assert_eq!(lean_prompt_graphs(true, |_| true), PROMPT_GRAPHS);
+    // Else the most that fit: two, else one.
+    assert_eq!(lean_prompt_graphs(true, |k| k <= 2), 2);
+    assert_eq!(lean_prompt_graphs(true, |k| k <= 1), 1);
+    // None fits: three, and the load fails as before.
+    assert_eq!(lean_prompt_graphs(true, |_| false), PROMPT_GRAPHS);
+}
+
+#[test]
+fn only_big_steps_on_one_shared_memory_gpu_are_lean() {
+    assert!(!lean_steps(true, 1, 1, MAX_BATCH_TOKENS_INTEGRATED));
+    assert!(lean_steps(true, 1, 1, 8192));
+    assert!(lean_steps(true, 1, 0, 16384));
+    assert!(!lean_steps(false, 1, 1, 8192));
+    assert!(!lean_steps(true, 2, 1, 8192));
+    assert!(!lean_steps(true, 1, 2, 8192));
+}
+
+/// `--dense-fp8` runs under tensor parallelism over machines (#1183: each rank copies its
+/// share), not under `--tp` on one machine.
+#[test]
+fn dense_fp8_runs_over_machines_not_one_machines_tp() {
+    let base = || LmConfig {
+        dense_fp8: true,
+        ..LmConfig::new("model.gguf", DeviceChoice::Cuda)
+    };
+    assert!(check_dense_fp8(&base()).is_ok());
+    let net = LmConfig {
+        tp_net: Some(crate::tp_net::TpNetConfig {
+            rank: 1,
+            peers: vec!["192.0.2.1:7619".into(), "192.0.2.2:7619".into()],
+            ..Default::default()
+        }),
+        dense_fp8_prompt: true,
+        ..base()
+    };
+    assert!(check_dense_fp8(&net).is_ok());
+    let e = check_dense_fp8(&LmConfig { tp: 2, ..base() }).unwrap_err();
+    assert!(e.contains("--tp"), "{e}");
+    // Without the flag nothing is checked.
+    assert!(
+        check_dense_fp8(&LmConfig {
+            tp: 2,
+            ..LmConfig::new("model.gguf", DeviceChoice::Cuda)
+        })
+        .is_ok()
+    );
+}

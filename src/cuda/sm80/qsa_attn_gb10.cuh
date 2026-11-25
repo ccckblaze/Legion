@@ -373,8 +373,121 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 #endif
 }
 
-template <int HD, int VAR>
+// CODES (--dense-fp8-prompt, #1183): the output gated and quantized to the attn_output GEMM's
+// FP8 codes in the epilogue (legion_qsa_attn's gate / codes / scales / sync), with the bits of
+// the output written, gated by fp8_act.cu's gate kind and quantized there: each value is
+// fp8_gated(gate, o) with o the value written otherwise, a token's amax the max of its CTAs'
+// (an atomicMax of the bits of non-negative floats: exact in any order), and the scale and the
+// codes fp8_act_row.cuh's expressions. The CTA of a token that arrives last (its ticket) writes
+// the token's codes: its own values from registers, the other kv heads' from `dst`, where
+// their CTAs write them after their ticket and then count themselves done. The last CTA waits
+// only for CTAs that took a ticket before it, so are running: no deadlock in any launch order.
+// The launch order is the plain kernel's (all tokens of kv head 0, then kv head 1, ...): a
+// token-major order (#1183 round 2, clusters of a token's kv heads) cost 15% more in the main
+// loop, its K/V reads sharing less of L2. The gate rows and the other heads' rows come into L2
+// a few chunks before the epilogue reads them.
+//
+// QN (with CODES, #1183): q is the query before its head norm and RoPE (legion_qsa_attn's
+// qn_*), and the CTA makes each of its heads' values as ggml-cuda makes them in the nodes
+// node_fuse turned off: rms_norm_f32<256, true> (a row's squares summed per 32 columns by a
+// warp's butterfly, the 8 sums by a second butterfly with ggml's zero lanes dropped: x + 0 is
+// x; mean = sum / ncols, rsqrtf(mean + eps), scale * x * w) and rope_multi (qn_rope_cs and
+// qn_column: the pair (i, i + n_dims / 2) rotated by the cos and sin of the position of i's
+// section, the columns past n_dims as the norm left them). The tables live in S.s and the
+// values, made once each into a q tile, in S.v until the first chunk (whose V is issued after
+// the fragments are built: still before its scores).
+
+// warp_reduce_sum's butterfly over `width` lanes (offsets width / 2 down to 1).
+template <int WIDTH>
+__device__ __forceinline__ float qn_butterfly(float x) {
+#pragma unroll
+    for (int o = WIDTH / 2; o > 0; o >>= 1) {
+        x += __shfl_xor_sync(0xffffffffu, x, o, 32);
+    }
+    return x;
+}
+
+// rope_multi's cos and sin of pair i (thread i0 = 2 i) of token `tok` (attn_factor applied),
+// as rope.cu computes them: theta_base / freq_factor (1), then rope_yarn with ext_factor 0.
+__device__ __forceinline__ void qn_rope_cs(const legion_qsa_attn & p, int tok, int i, float & c,
+                                           float & s) {
+    const int iw = 2 * i;
+    const int * sections = p.qn_sections;
+    const int32_t * pos = p.qn_pos + tok;
+    const int ne02 = p.qn_pos_n;
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int sec_w = sections[1] + sections[0];
+    const int sector = (iw / 2) % sect_dims;
+    float theta_base = 0.0;
+    if (p.qn_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections[1]) {
+            theta_base = pos[ne02 * 1] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+            theta_base = pos[ne02 * 2] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+            theta_base = pos[0] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else {
+            theta_base = pos[ne02 * 3] * powf(p.qn_theta_scale, iw / 2.0f);
+        }
+    } else {
+        if (sector < sections[0]) {
+            theta_base = pos[0] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sections[0] && sector < sec_w) {
+            theta_base = pos[ne02 * 1] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + sections[2]) {
+            theta_base = pos[ne02 * 2] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w + sections[2]) {
+            theta_base = pos[ne02 * 3] * powf(p.qn_theta_scale, iw / 2.0f);
+        }
+    }
+    const float freq_factor = 1.0f;
+    const float theta_extrap = theta_base / freq_factor;
+    const float theta = p.qn_freq_scale * theta_extrap;
+    c = cosf(theta) * p.qn_attn_factor;
+    s = sinf(theta) * p.qn_attn_factor;
+}
+
+// Column d of every head (x: the raw values, in place; heads at or past g untouched) after the
+// norm (scales sc, weight w) and the RoPE (cos / sin of pair i at cs[i] / cs[HD / 2 + i]; the
+// pair's other raw column read from the tile qt, rows of QT floats), qm their largest |value|.
+// rope_multi's pair (i, i + n_dims / 2): x0 = norm(i), x1 = norm(i + n_dims / 2), column i is
+// x0 cos - x1 sin and column i + n_dims / 2 is x0 sin + x1 cos; past n_dims, the norm's value.
+template <int HD, int ROWS_, int QT>
+__device__ __forceinline__ void qn_column(float (&x)[ROWS_], int g, const float * w,
+                                          const float * sc, const float * cs, const float * qt,
+                                          int n_dims, int d, float & qm) {
+    const int half = n_dims / 2;
+    const bool rot = d < n_dims, lo = d < half;
+    const int dp = lo ? d + half : d - half;  // the pair's other column (rot)
+    const int i = lo ? d : dp;
+    const float wd = w[d];
+    const float wp = rot ? w[dp] : 0.0f;
+    const float cos_theta = rot ? cs[i] : 0.0f;
+    const float sin_theta = rot ? cs[HD / 2 + i] : 0.0f;
+#pragma unroll
+    for (int h = 0; h < ROWS_; ++h) {
+        if (h < g) {
+            float v;
+            if (!rot) {
+                v = sc[h] * x[h] * wd;
+            } else if (lo) {
+                const float x0 = sc[h] * x[h] * wd;
+                const float x1 = sc[h] * qt[h * QT + dp] * wp;
+                v = x0 * cos_theta - x1 * sin_theta;
+            } else {
+                const float x0 = sc[h] * qt[h * QT + dp] * wp;
+                const float x1 = sc[h] * x[h] * wd;
+                v = x0 * sin_theta + x1 * cos_theta;
+            }
+            x[h] = v;
+            qm = fmaxf(qm, fabsf(v));
+        }
+    }
+}
+
+template <int HD, int VAR, bool CODES = false, bool QN = false>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
+    static_assert(!QN || CODES, "the fold is the codes path's");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
     constexpr int NW = THREADS / 32;          // warps
@@ -442,17 +555,93 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         cp_async_commit();
     };
     int pos_n = -1;  // the next chunk's positions
+    [[maybe_unused]] int cell_0 = -1;  // QN: the first chunk's V comes after the q tile
     if (n > 0) {
         const int cell0 = cell_of(pos_at(0));
         issue_k(cell0);
-        issue_v(cell0);
+        if constexpr (QN) {
+            cell_0 = cell0;
+        } else {
+            issue_v(cell0);
+        }
         pos_n = pos_at(MCH);
     }
 
-    // q: as attn_gb_kernel.
+    // QN: the norm's scale per head and the RoPE's cos / sin per pair in S.s (no chunk's scores
+    // are written before the barrier after the fragments), the q tile in S.v (the first chunk's
+    // V is issued after that barrier). Each value is made once: thread t takes columns t and
+    // t + HD / 2 of every head (so warp w the 32-column segments w and w + NW, as ggml's warps).
+    constexpr int QSEG = HD / 32;                  // a row's 32-column segments (ggml's warps)
+    constexpr int QT = GbSmem<HD>::R;              // floats per q tile row: conflict-free float2s
+    [[maybe_unused]] float * const qn_seg = &S.s[0][0];              // [ROWS][QSEG]: the sums
+    [[maybe_unused]] float * const qn_scale = qn_seg + ROWS * QSEG;  // [ROWS]
+    [[maybe_unused]] float * const qn_cs = qn_scale + ROWS;  // [HD]: pair i's cos at i, sin at HD/2+i
+    [[maybe_unused]] float * const qn_t = reinterpret_cast<float *>(&S.v[0][0]);  // [ROWS][QT]
     float qm = 0.0f;
-    for (int i = t; i < G * HD; i += THREADS) {
-        qm = fmaxf(qm, fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
+    if constexpr (QN) {
+        static_assert(HD == 256, "ggml's rms_norm block of 256 threads: one column each");
+        static_assert(ROWS * QSEG + ROWS + HD <= ROWS * (MCH + 4), "the tables fit in S.s");
+        static_assert(ROWS == 4 * NW && QSEG == 2 * NW, "4 heads of 8 lanes per warp, 2 segments");
+        static_assert(2 * THREADS == HD, "two columns per thread");
+        static_assert(ROWS * QT * sizeof(float) <= sizeof(S.v), "the q tile fits in S.v");
+        if (t < p.qn_rot / 2) {
+            float c, sn;
+            qn_rope_cs(p, tok, t, c, sn);
+            qn_cs[t] = c;
+            qn_cs[HD / 2 + t] = sn;
+        }
+        float xa[ROWS], xb[ROWS];  // columns t and t + HD / 2
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            const float * xr = (const float *) (qb + (size_t) h * p.q_nb1);
+            xa[h] = h < G ? xr[t] : 0.0f;
+            xb[h] = h < G ? xr[t + HD / 2] : 0.0f;
+        }
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            if (h < G) {
+                qn_t[h * QT + t] = xa[h];
+                qn_t[h * QT + t + HD / 2] = xb[h];
+                float ta = 0.0f, tb = 0.0f;
+                ta += xa[h] * xa[h];
+                tb += xb[h] * xb[h];
+                ta = qn_butterfly<32>(ta);
+                tb = qn_butterfly<32>(tb);
+                if (lane == 0) {
+                    qn_seg[h * QSEG + warp] = ta;
+                    qn_seg[h * QSEG + warp + NW] = tb;
+                }
+            }
+        }
+        __syncthreads();
+        // block_reduce's second butterfly: lanes 8-31 hold zeros there, so offsets 16 and 8
+        // add +0 to lanes 0-7 (the sums are not -0), and 4, 2, 1 are these.
+        {
+            const int h = warp * 4 + lane / 8;
+            float v = h < G ? qn_seg[h * QSEG + lane % 8] : 0.0f;
+            v = qn_butterfly<8>(v);
+            if (lane % 8 == 0 && h < G) {
+                const float mean = v / p.head_dim;
+                qn_scale[h] = rsqrtf(mean + p.qn_eps);
+            }
+        }
+        __syncthreads();
+        qn_column<HD, ROWS, QT>(xa, G, p.qn_w, qn_scale, qn_cs, qn_t, p.qn_rot, t, qm);
+        qn_column<HD, ROWS, QT>(xb, G, p.qn_w, qn_scale, qn_cs, qn_t, p.qn_rot, t + HD / 2, qm);
+        __syncthreads();  // every raw value read: the tile takes the final ones
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            if (h < G) {
+                qn_t[h * QT + t] = xa[h];
+                qn_t[h * QT + t + HD / 2] = xb[h];
+            }
+        }
+    } else {
+        // q: as attn_gb_kernel.
+        for (int i = t; i < G * HD; i += THREADS) {
+            qm = fmaxf(qm,
+                       fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
+        }
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -478,15 +667,30 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int h = gid + 8 * (i & 1), d = ks * 16 + 2 * tig + 8 * (i >> 1);
-            const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
-            const float x0 = h < G ? qr[0] * qup : 0.0f;
-            const float x1 = h < G ? qr[1] * qup : 0.0f;
+            float x0, x1;
+            if constexpr (QN) {
+                // The tile's rows past G are not written.
+                const float2 q2 = h < G ? *reinterpret_cast<const float2 *>(&qn_t[h * QT + d])
+                                        : make_float2(0.0f, 0.0f);
+                x0 = h < G ? q2.x * qup : 0.0f;
+                x1 = h < G ? q2.y * qup : 0.0f;
+            } else {
+                const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
+                x0 = h < G ? qr[0] * qup : 0.0f;
+                x1 = h < G ? qr[1] * qup : 0.0f;
+            }
             const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
             const __half2 hi = __halves2half2(h0, h1);
             const __half2 lo = __halves2half2(__float2half_rn(x0 - __half2float(h0)),
                                               __float2half_rn(x1 - __half2float(h1)));
             qh[ks][i] = *reinterpret_cast<const uint32_t *>(&hi);
             ql[ks][i] = *reinterpret_cast<const uint32_t *>(&lo);
+        }
+    }
+    if constexpr (QN) {
+        __syncthreads();  // every warp's fragments built: the scores may write S.s, V S.v
+        if (n > 0) {
+            issue_v(cell_0);
         }
     }
 
@@ -503,6 +707,27 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         // the one after.
         const int cell_n = cell_of(pos_n);
         pos_n = pos_at(c0 + 2 * MCH);
+        if constexpr (CODES) {
+            // What the epilogue reads into L2 three chunks before the end (the first chunk of a
+            // shorter selection), so it does not wait on DRAM with the CTA's compute done: its
+            // gate rows and, in the last kv head's CTA (CTAs launch kv head by kv head, so
+            // nearly always its token's last), the other kv heads' gated rows in `dst`. A line
+            // written after its prefetch is still read right: L2 holds the write.
+            if (c0 + 3 * MCH >= n && (c0 == 0 || c0 + 2 * MCH < n)) {
+                constexpr int LINES = HD * 4 / 128;  // 128-byte lines per row
+                const float * gt = p.gate + (size_t) tok * p.gate_ld + (size_t) kvh * G * p.gate_hd;
+                for (int i = t; i < G * LINES; i += THREADS) {
+                    const float * a = gt + (size_t) (i / LINES) * p.gate_hd + (i % LINES) * 32;
+                    asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
+                }
+                if (kvh == p.n_head_kv - 1) {
+                    const float * rows = p.dst + (size_t) tok * p.n_head * HD;
+                    for (int i = t; i < kvh * G * LINES; i += THREADS) {
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(rows + (size_t) i * 32));
+                    }
+                }
+            }
+        }
         // This warp's K rows (its V dims may still be on their way).
         cp_async_wait<1>();
         __syncwarp();
@@ -626,16 +851,130 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
     }
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
     const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    if constexpr (!CODES) {
 #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        const int d = warp * DW + j * 8 + 2 * tig;
-        if (gid < G) {
-            *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
-                make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                    make_float2(acc[j][0] * i0, acc[j][1] * i0);
+            }
+            if (gid + 8 < G) {
+                *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                    make_float2(acc[j][2] * i1, acc[j][3] * i1);
+            }
         }
-        if (gid + 8 < G) {
-            *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
-                make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    } else {
+        __shared__ float s_max[NW];
+        __shared__ float s_amax;
+        __shared__ int s_last;
+        // The gated values (fp8_act.cu's gate kind: gate of this head's gate value times the
+        // output value), in place of acc, and their amax.
+        const float * gt = p.gate + (size_t) tok * p.gate_ld + (size_t) kvh * G * p.gate_hd;
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                const float * g = gt + (size_t) gid * p.gate_hd + d;
+                acc[j][0] = fp8_gated(g[0], acc[j][0] * i0, 0);
+                acc[j][1] = fp8_gated(g[1], acc[j][1] * i0, 0);
+                amax = fmaxf(amax, fabsf(acc[j][0]));
+                amax = fmaxf(amax, fabsf(acc[j][1]));
+            }
+            if (gid + 8 < G) {
+                const float * g = gt + (size_t) (gid + 8) * p.gate_hd + d;
+                acc[j][2] = fp8_gated(g[0], acc[j][2] * i1, 0);
+                acc[j][3] = fp8_gated(g[1], acc[j][3] * i1, 0);
+                amax = fmaxf(amax, fabsf(acc[j][2]));
+                amax = fmaxf(amax, fabsf(acc[j][3]));
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        if (lane == 0) {
+            s_max[warp] = amax;
+        }
+        __syncthreads();
+        const unsigned n_tok = gridDim.x;
+        unsigned * ticket = p.sync + tok;
+        unsigned * done = p.sync + n_tok + tok;
+        unsigned * amx = p.sync + 2 * n_tok + tok;
+        if (t == 0) {
+            float m = s_max[0];
+#pragma unroll
+            for (int w = 1; w < NW; ++w) {
+                m = fmaxf(m, s_max[w]);
+            }
+            // Non-negative floats order as their bits.
+            atomicMax(amx, __float_as_uint(m));
+            __threadfence();
+            s_last = atomicAdd(ticket, 1u) == (unsigned) p.n_head_kv - 1;
+        }
+        __syncthreads();
+        if (!s_last) {
+            // The gated values for the token's last CTA, in the output's layout.
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const int d = warp * DW + j * 8 + 2 * tig;
+                if (gid < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                        make_float2(acc[j][0], acc[j][1]);
+                }
+                if (gid + 8 < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                        make_float2(acc[j][2], acc[j][3]);
+                }
+            }
+            __threadfence();
+            __syncthreads();
+            if (t == 0) {
+                atomicAdd(done, 1u);
+            }
+            return;
+        }
+        if (t == 0) {
+            // Every other CTA of the token took its ticket (so is running): wait for its rows.
+            while (atomicAdd(done, 0u) < (unsigned) p.n_head_kv - 1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif
+            }
+            __threadfence();
+            s_amax = __uint_as_float(atomicAdd(amx, 0u));
+        }
+        __syncthreads();
+        const float s = fp8_row_scale(s_amax);
+        const float inv = fp8_row_inv(s);
+        const int k = p.n_head * HD;
+        uint8_t * codes = p.codes + (size_t) tok * k;
+        uint8_t * own = codes + (size_t) kvh * G * HD;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                *reinterpret_cast<uchar2 *>(own + (size_t) gid * HD + d) =
+                    make_uchar2(fp8_code(acc[j][0], inv), fp8_code(acc[j][1], inv));
+            }
+            if (gid + 8 < G) {
+                *reinterpret_cast<uchar2 *>(own + (size_t) (gid + 8) * HD + d) =
+                    make_uchar2(fp8_code(acc[j][2], inv), fp8_code(acc[j][3], inv));
+            }
+        }
+        // The other kv heads' values (G * HD of them each, a multiple of 4), through L2.
+        const float * rows = p.dst + (size_t) tok * k;
+        for (int i = 4 * t; i < k; i += 4 * THREADS) {
+            if (i / (G * HD) == kvh) {
+                continue;
+            }
+            const float4 x = __ldcg(reinterpret_cast<const float4 *>(rows + i));
+            *reinterpret_cast<uchar4 *>(codes + i) = make_uchar4(
+                fp8_code(x.x, inv), fp8_code(x.y, inv), fp8_code(x.z, inv), fp8_code(x.w, inv));
+        }
+        if (t == 0) {
+            p.scales[tok] = s;
         }
     }
 }

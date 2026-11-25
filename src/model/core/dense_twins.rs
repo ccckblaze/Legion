@@ -1,20 +1,29 @@
-//! `--dense-fp8` (#1183): decode-sized steps read the FP8 copies of a Qwen3.8-Flash-Next
+//! `--dense-fp8` (#1183): decode and verify steps read the FP8 copies of a Qwen3.8-Flash-Next
 //! checkpoint's dense projections ([`crate::hf::dense_fp8`]) in place of their BF16 weights.
 //!
 //! [`super::Model::w`] gives the copy's codes for the weight's name, and its row scales for
-//! the weight's `.scale` (which a BF16 weight has none of), while a graph of at most
-//! [`STEP_MAX_TOKENS`] tokens is built ([`DenseTwins::step`]). Every path that reads a weight
-//! by name then sees an FP8 weight with a per-row scale, as for a channel-wise FP8 checkpoint:
-//! the BF16 paths step aside and the FP8 matmul's W8A16 route runs it
-//! ([`super::linear::Linear::mul_mat`]). Larger steps (prompt steps) and everything outside a
-//! graph build read the BF16 weights, so they keep every kernel, joined run and fusion they
-//! take without the flag. Without copies in the file nothing changes.
+//! the weight's `.scale` (which a BF16 weight has none of), while the graph of a step without
+//! prompt rows and of at most [`STEP_MAX_TOKENS`] tokens is built ([`DenseTwins::step`]).
+//! Every path that reads a weight by name then sees an FP8 weight with a per-row scale, as for
+//! a channel-wise FP8 checkpoint: the BF16 paths step aside and the FP8 matmul's W8A16 route
+//! runs it ([`super::linear::Linear::mul_mat`]). Steps with prompt rows (any length, alone or
+//! batched with decode rows, which then read BF16 too: a weight is one matrix per graph), larger
+//! steps and everything outside a graph build read the BF16 weights, so they keep every kernel,
+//! joined run and fusion they take without the flag. Without copies in the file nothing
+//! changes.
+//!
+//! Prompt rows: a group of more than one token per sequence that is not a verify group
+//! ([`prompt_rows`]). A prompt chunk of one token per sequence has a decode step's shape, whose
+//! graph it shares (graphs are reused by shape), and reads the copies.
 //!
 //! `--dense-fp8-prompt` ([`DenseTwins::set_prompt`]): prompt steps read the copies too, as
 //! W8A8 GEMMs on E4M3 tensor cores with per-token activation scales (twice BF16's rate on a
 //! GB10). The activations' codes come from BF16 rows the step's ops write already where it has
 //! them ([`super::linear::Linear::mul_mat`]), and a joined run's copies, stored back to back
-//! ([`dense_fp8::RUNS`]), are one GEMM as the BF16 run is ([`Runs`]).
+//! ([`dense_fp8::RUNS`]), are one GEMM as the BF16 run is ([`Runs`]). The BF16 weights then
+//! stay out of the load ([`dense_fp8::left_out`]), and every read of them by name, in a graph
+//! build or not, gives the copy ([`DenseTwins::from_gguf`]): the graphs are the ones
+//! the flag builds with the originals loaded, which no step read.
 
 use std::cell::Cell;
 
@@ -34,15 +43,23 @@ pub(crate) struct DenseTwins {
     on: bool,
     /// Prompt steps read the copies too ([`Self::set_prompt`]).
     prompt: bool,
+    /// The weights with copies were left out of the load (`--dense-fp8-prompt`,
+    /// [`dense_fp8::left_out`]): every read gives the copy, in a graph build or not.
+    bare: bool,
     /// A graph of a step that reads the copies is being built.
     active: Cell<bool>,
 }
 
 impl DenseTwins {
-    pub(crate) fn from_gguf(g: &GgufFile) -> Self {
+    /// The state for a model loaded from `g`, whose weights `loaded` tells by name: bare (every
+    /// read gives the copy) when `g` lists weights with copies and none of them loaded
+    /// ([`originals_left_out`]).
+    pub(crate) fn from_gguf(g: &GgufFile, loaded: impl Fn(&str) -> bool) -> Self {
+        let on = g.get(dense_fp8::KEY).is_some();
         Self {
-            on: g.get(dense_fp8::KEY).is_some(),
+            on,
             prompt: false,
+            bare: on && originals_left_out(&dense_fp8::listed(g), loaded),
             active: Cell::new(false),
         }
     }
@@ -54,13 +71,25 @@ impl DenseTwins {
         self.on && on
     }
 
-    /// While the guard lives, weights of a step of `n` tokens: the copies where
-    /// [`takes_step`] (or [`Self::set_prompt`]) and the file has them. The guard puts back the
-    /// previous state.
-    pub(crate) fn step(&self, n: i64) -> StepGuard<'_> {
+    /// Which steps read the copies, which every rank of tensor parallelism over machines must
+    /// agree on (#1183): 0 none (no copies), 1 decode and verify steps ([`takes_step`]), 3
+    /// prompt steps too ([`Self::set_prompt`]).
+    pub(crate) fn mode(&self) -> u32 {
+        match (self.on, self.prompt) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 3,
+        }
+    }
+
+    /// While the guard lives, weights of a step of `n` tokens, with prompt rows or not
+    /// ([`prompt_rows`]): the copies where the file has them and the step is a decode or verify
+    /// step that [`takes_step`], or any step under [`Self::set_prompt`]. The guard puts back
+    /// the previous state.
+    pub(crate) fn step(&self, n: i64, prompt_rows: bool) -> StepGuard<'_> {
         let prev = self
             .active
-            .replace(self.on && (self.prompt || takes_step(n)));
+            .replace(self.on && (self.prompt || (!prompt_rows && takes_step(n))));
         StepGuard {
             active: &self.active,
             prev,
@@ -68,9 +97,11 @@ impl DenseTwins {
     }
 
     /// The tensor to read for `name` now: its copy's ([`copy_name`]) in the graph of a step
-    /// that reads them, else `None` (the tensor itself).
+    /// that reads them, or always where the originals were left out ([`Self::from_gguf`]), else
+    /// `None` (the tensor itself). A name the file has no copy of (the MTP layer's) is then
+    /// looked up as itself.
     pub(crate) fn copy_of(&self, name: &str) -> Option<String> {
-        if !self.active.get() {
+        if !(self.active.get() || self.bare) {
             return None;
         }
         copy_name(name)
@@ -211,9 +242,25 @@ fn joined_name(first: &str) -> String {
     format!("{first}+")
 }
 
-/// Whether a step of `n` tokens reads the copies ([`STEP_MAX_TOKENS`]).
+/// Whether a step of groups of `(tokens per sequence, verify)` has prompt rows: a group of
+/// several tokens per sequence that is not a verify group (a decode step's groups have one
+/// token per sequence, a verify step's are marked).
+pub(crate) fn prompt_rows(groups: impl IntoIterator<Item = (usize, bool)>) -> bool {
+    groups
+        .into_iter()
+        .any(|(n_tok, verify)| n_tok > 1 && !verify)
+}
+
+/// Whether a decode or verify step of `n` tokens reads the copies ([`STEP_MAX_TOKENS`]).
 pub(crate) fn takes_step(n: i64) -> bool {
     n <= STEP_MAX_TOKENS
+}
+
+/// Whether the weights of `listed` (those with copies, [`dense_fp8::KEY`]) were left out of
+/// the load: there are some and `loaded` finds none of them. A load that dropped only some of
+/// them (another machine's layers) keeps reading the rest as the steps choose.
+pub(crate) fn originals_left_out(listed: &[String], loaded: impl Fn(&str) -> bool) -> bool {
+    !listed.is_empty() && !listed.iter().any(|n| loaded(n.as_str()))
 }
 
 /// The copy's tensor for `name`: the codes for a copied weight `<base>.weight`, the row scales

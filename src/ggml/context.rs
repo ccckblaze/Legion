@@ -523,8 +523,9 @@ impl Context {
 
     /// [`Self::alloc_graph`] from an allocator other graphs share: their intermediates
     /// overlap in its one buffer, so only one of them may run at a time, each with its inputs
-    /// set again first. Returns whether the buffer grew: it then moved, and the graphs
-    /// allocated from it before must not run again.
+    /// set again first. Returns whether the buffer moved (it grew, or a plan that failed since
+    /// the last call that said so freed it): the graphs allocated from it before must then not
+    /// run again.
     pub fn alloc_graph_shared(
         &self,
         graph: &Graph<'_>,
@@ -544,12 +545,16 @@ impl Context {
         // the same size did not move. (Were ggml to grow it by adding a chunk instead, the
         // size would grow too, and the earlier graphs would be dropped needlessly, not kept
         // pointing at freed memory.)
+        // A failed plan may have freed the buffer, and the next one allocated it again, no
+        // bigger (`ComputeAllocator::moved`): it moved all the same. Told once, by the first
+        // allocation that succeeds.
         let grew = a.buffer_size() > before;
+        let moved = ok && a.moved.replace(false);
         let buffer = a.buft.name();
         drop(a);
         *slot = Some(Alloc::Shared(allocator.clone()));
         if ok {
-            Ok(grew)
+            Ok(grew || moved)
         } else {
             Err(GgmlError::Alloc { bytes: 0, buffer })
         }
@@ -623,6 +628,47 @@ impl Context {
         }
         t
     }
+}
+
+/// [`Tensor::cuda_device`] of a raw tensor (a graph's node, after allocation).
+///
+/// # Safety
+/// `t` is a live tensor; its `view_src` is null or a live tensor.
+pub(crate) unsafe fn cuda_device_of(t: *const ffi::ggml_tensor) -> Option<usize> {
+    // SAFETY: the caller's.
+    let buffer = unsafe {
+        let t = &*t;
+        if t.buffer.is_null() && !t.view_src.is_null() {
+            (*t.view_src).buffer
+        } else {
+            t.buffer
+        }
+    };
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `buffer` is a live buffer; its type and device are static
+    // descriptors and the device name a NUL-terminated string they own.
+    let name = unsafe {
+        let buft = ffi::ggml_backend_buffer_get_type(buffer);
+        if buft.is_null() {
+            return None;
+        }
+        let dev = ffi::ggml_backend_buft_get_device(buft);
+        if dev.is_null() {
+            return None;
+        }
+        let name = ffi::ggml_backend_dev_name(dev);
+        if name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(name)
+    };
+    let digits = name.to_bytes().strip_prefix(b"CUDA")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// A tensor (metadata in a [`Context`]; data in a buffer that context owns).
@@ -803,40 +849,8 @@ impl<'a> Tensor<'a> {
     /// not placed yet answers for the tensor it views (its memory is that tensor's). No driver
     /// call: three ggml queries and the name.
     pub fn cuda_device(self) -> Option<usize> {
-        // SAFETY: a live tensor; `view_src` is null or a live tensor of the same context.
-        let buffer = unsafe {
-            let t = &*self.raw();
-            if t.buffer.is_null() && !t.view_src.is_null() {
-                (*t.view_src).buffer
-            } else {
-                t.buffer
-            }
-        };
-        if buffer.is_null() {
-            return None;
-        }
-        // SAFETY: a non-null `buffer` is a live buffer; its type and device are static
-        // descriptors and the device name a NUL-terminated string they own.
-        let name = unsafe {
-            let buft = ffi::ggml_backend_buffer_get_type(buffer);
-            if buft.is_null() {
-                return None;
-            }
-            let dev = ffi::ggml_backend_buft_get_device(buft);
-            if dev.is_null() {
-                return None;
-            }
-            let name = ffi::ggml_backend_dev_name(dev);
-            if name.is_null() {
-                return None;
-            }
-            std::ffi::CStr::from_ptr(name)
-        };
-        let digits = name.to_bytes().strip_prefix(b"CUDA")?;
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(digits).ok()?.parse().ok()
+        // SAFETY: a live tensor.
+        unsafe { cuda_device_of(self.raw()) }
     }
 
     /// The tensor's memory as a mutable byte slice, or `None` if it has no memory yet or lives
@@ -1659,6 +1673,13 @@ pub struct ComputeAllocator {
     fresh: bool,
     /// A relayout taken on every graph (tests); `None`: `post_alloc`'s, on CUDA graphs.
     relayout: Option<super::post_alloc::Relayout>,
+    /// A plan failed since [`Context::alloc_graph_shared`] last said the buffer moved: ggml
+    /// frees the buffer it could not grow, so the next plan allocates another, which may be
+    /// no bigger than the old one.
+    moved: std::cell::Cell<bool>,
+    /// The last plan failed: ggml keeps that plan but not its buffer, so the next graph is
+    /// planned afresh ([`Self::plan`]).
+    failed: std::cell::Cell<bool>,
 }
 
 /// The tensors of `graph` an allocation gives memory: its nodes, their sources and its leafs
@@ -1685,6 +1706,198 @@ unsafe fn unplanned(graph: *mut ffi::ggml_cgraph) -> Vec<*mut ffi::ggml_tensor> 
             );
         }
         out
+    }
+}
+
+/// Where an allocation put a graph's tensors ([`unplanned`]), to give them that memory again
+/// ([`ComputeAllocator::as_built`]).
+struct Placement {
+    /// Each tensor and where it was (a tensor may be listed more than once).
+    at: Vec<(*mut ffi::ggml_tensor, Placed)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Placed {
+    /// At this offset into this buffer.
+    At(ffi::ggml_backend_buffer_t, usize),
+    /// A view of memory placed so (its source's, at its offset).
+    View,
+    /// No memory (a view of a tensor ggml's backends did not allocate).
+    Bare,
+}
+
+impl Placement {
+    /// Where `tensors` are now.
+    ///
+    /// # Safety
+    /// Valid tensors.
+    unsafe fn of(tensors: &[*mut ffi::ggml_tensor]) -> Self {
+        let mut base = (std::ptr::null_mut(), 0usize);
+        let at = tensors
+            .iter()
+            .map(|&t| {
+                // SAFETY: the caller's; a tensor with a buffer is in its memory.
+                unsafe { (t, Self::placed(t, &mut base)) }
+            })
+            .collect();
+        Self { at }
+    }
+
+    /// Where `t` is; `base`: the last buffer looked at and its base address.
+    ///
+    /// # Safety
+    /// A valid tensor.
+    unsafe fn placed(
+        t: *mut ffi::ggml_tensor,
+        base: &mut (ffi::ggml_backend_buffer_t, usize),
+    ) -> Placed {
+        // SAFETY: the caller's.
+        unsafe {
+            let b = (*t).buffer;
+            if b.is_null() {
+                Placed::Bare
+            } else if !(*t).view_src.is_null() {
+                Placed::View
+            } else {
+                if base.0 != b {
+                    *base = (b, ffi::ggml_backend_buffer_get_base(b) as usize);
+                }
+                Placed::At(b, (*t).data as usize - base.1)
+            }
+        }
+    }
+
+    /// Whether the tensors are where they were: each at its offset, the tensors of one buffer
+    /// then in one buffer, and those of different buffers in different ones.
+    ///
+    /// # Safety
+    /// The tensors are valid.
+    unsafe fn is_current(&self) -> bool {
+        let mut base = (std::ptr::null_mut(), 0usize);
+        let mut buffers: Vec<(ffi::ggml_backend_buffer_t, ffi::ggml_backend_buffer_t)> = Vec::new();
+        self.at.iter().all(|&(t, was)| {
+            // SAFETY: the caller's.
+            let now = unsafe { Self::placed(t, &mut base) };
+            match (was, now) {
+                (Placed::At(b0, o0), Placed::At(b1, o1)) => {
+                    o0 == o1
+                        && match buffers.iter().find(|&&(x, _)| x == b0) {
+                            Some(&(_, y)) => y == b1,
+                            // Another buffer's tensors are in that one.
+                            None if buffers.iter().any(|&(_, y)| y == b1) => false,
+                            None => {
+                                buffers.push((b0, b1));
+                                true
+                            }
+                        }
+                }
+                _ => was == now,
+            }
+        })
+    }
+
+    /// Where the tensors were in one buffer (of type `buft`): the bytes they took from its
+    /// start; `None` where they were in more than one.
+    ///
+    /// # Safety
+    /// The tensors are valid.
+    unsafe fn one_buffer(&self, buft: ffi::ggml_backend_buffer_type_t) -> Option<usize> {
+        let mut one = None;
+        let mut end = 0usize;
+        for &(t, was) in &self.at {
+            if let Placed::At(b, o) = was {
+                if one.is_some_and(|x| x != b) {
+                    return None;
+                }
+                one = Some(b);
+                // SAFETY: the caller's; the buffer type tells a tensor's size without the
+                // buffer (which a failed plan may have freed).
+                end = end.max(o + unsafe { ffi::ggml_backend_buft_get_alloc_size(buft, t) });
+            }
+        }
+        Some(end)
+    }
+
+    /// The buffer a tensor placed in one ([`Placed::At`]) is in now, if any.
+    ///
+    /// # Safety
+    /// The tensors are valid.
+    unsafe fn buffer_now(&self) -> Option<ffi::ggml_backend_buffer_t> {
+        self.at.iter().find_map(|&(t, was)| {
+            // SAFETY: the caller's.
+            let b = unsafe { (*t).buffer };
+            (matches!(was, Placed::At(..)) && !b.is_null()).then_some(b)
+        })
+    }
+
+    /// The bytes the tensors take from the start of `buffer`, placed in it as they were.
+    ///
+    /// # Safety
+    /// The tensors are valid; `buffer` is of their buffer type.
+    unsafe fn end(&self, buffer: ffi::ggml_backend_buffer_t) -> usize {
+        let mut end = 0usize;
+        for &(t, was) in &self.at {
+            if let Placed::At(_, o) = was {
+                // SAFETY: the caller's.
+                end = end.max(o + unsafe { ffi::ggml_backend_buffer_get_alloc_size(buffer, t) });
+            }
+        }
+        end
+    }
+
+    /// Gives the tensors (all without memory, all of one buffer before: [`Self::one_buffer`])
+    /// their memory again, at their offsets in `buffer`, and their views theirs. Whether all
+    /// did.
+    ///
+    /// # Safety
+    /// The tensors are valid and have no memory; `buffer` is of their buffer type and holds
+    /// [`Self::end`] bytes.
+    unsafe fn place(&self, buffer: ffi::ggml_backend_buffer_t) -> bool {
+        // SAFETY: the caller's.
+        unsafe {
+            if ffi::ggml_backend_buffer_get_size(buffer) < self.end(buffer) {
+                return false;
+            }
+            let base = ffi::ggml_backend_buffer_get_base(buffer) as *mut u8;
+            for &(t, was) in &self.at {
+                if let Placed::At(_, o) = was
+                    && (*t).buffer.is_null()
+                    && ffi::ggml_backend_tensor_alloc(buffer, t, base.add(o).cast())
+                        != ffi::ggml_status_GGML_STATUS_SUCCESS
+                {
+                    return false;
+                }
+            }
+            // Views once their sources have memory (a view's source may be a view).
+            let mut left: Vec<_> = self
+                .at
+                .iter()
+                .filter(|&&(_, was)| was == Placed::View)
+                .map(|&(t, _)| t)
+                .collect();
+            while !left.is_empty() {
+                let before = left.len();
+                // A view whose initialization failed has its buffer set all the same: failed
+                // here, not taken for placed in the next pass.
+                let mut failed = false;
+                left.retain(|&t| {
+                    if !(*t).buffer.is_null() {
+                        return false;
+                    }
+                    let src = (*t).view_src;
+                    if src.is_null() || (*src).buffer.is_null() {
+                        return true;
+                    }
+                    failed |=
+                        ffi::ggml_backend_view_init(t) != ffi::ggml_status_GGML_STATUS_SUCCESS;
+                    false
+                });
+                if failed || left.len() == before {
+                    return false;
+                }
+            }
+            true
+        }
     }
 }
 
@@ -1738,6 +1951,8 @@ impl ComputeAllocator {
             buft,
             fresh: FRESH_PLANS.load(std::sync::atomic::Ordering::Relaxed),
             relayout: None,
+            moved: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
         }
     }
 
@@ -1763,21 +1978,32 @@ impl ComputeAllocator {
         // SAFETY: as above.
         let unplanned = relayout.map(|_| unsafe { unplanned(raw) });
         let mut ok = self.plan(raw, self.fresh);
-        if ok
-            && let Some((r, cuda)) = relayout
-            && let Some(relaid) = unsafe { (r.rewrite)(raw, cuda) }
-        {
+        if ok && let Some((r, cuda)) = relayout {
             let unplanned = unplanned.as_deref().unwrap_or_default();
-            // SAFETY: allocated just now, nothing computed; the tensors the plan gave memory
-            // are planned afresh, as rewritten, and if the rewrite no longer holds then, as
-            // built again.
-            unsafe {
-                forget_plan(unplanned);
-                ok = self.plan(raw, true);
-                if ok && !relaid.holds(raw) {
-                    relaid.undo(raw);
+            // SAFETY: allocated just now, nothing computed. Where the plan as built put the
+            // tensors, read before the rewrite (whose undo restores the nodes it saved as they
+            // were, memory and all, but not the others').
+            let built = unsafe { Placement::of(unplanned) };
+            // SAFETY: as above; the tensors the plan gave memory are planned afresh, as
+            // rewritten. One that must run as built (`Relaid::as_built`) is undone where that
+            // plan fails or the rewrite no longer holds then, and the tensors go back to the
+            // memory the plan as built gave them; any other is undone where it no longer
+            // holds, and the graph is planned afresh.
+            if let Some(relaid) = unsafe { (r.rewrite)(raw, cuda) } {
+                unsafe {
                     forget_plan(unplanned);
                     ok = self.plan(raw, true);
+                    if relaid.as_built() {
+                        if !(ok && relaid.holds(raw)) {
+                            relaid.undo(raw);
+                            forget_plan(unplanned);
+                            ok = self.as_built(raw, unplanned, &built);
+                        }
+                    } else if ok && !relaid.holds(raw) {
+                        relaid.undo(raw);
+                        forget_plan(unplanned);
+                        ok = self.plan(raw, true);
+                    }
                 }
             }
         }
@@ -1789,15 +2015,89 @@ impl ComputeAllocator {
         ok
     }
 
+    /// Gives `graph`'s tensors (`unplanned`, without memory now) the memory the plan as built
+    /// gave them (`built`), after a rewrite planned again was undone: what the rewrite read off
+    /// that layout (which sums ggml-cuda fuses) is then what runs. A plan of the graph alone
+    /// lays it out the same unless the plan as built was the previous graph's (ggml reuses a
+    /// plan a graph fits), so the graph is planned afresh first, and where that puts any tensor
+    /// elsewhere, each goes back to its offset in the allocator's buffer, grown to hold them if
+    /// it must. False, logged, where that fails: the graph does not run in another layout.
+    ///
+    /// # Safety
+    /// As [`Self::plan`]; `unplanned` and `built` are `graph`'s ([`unplanned`],
+    /// [`Placement::of`]).
+    unsafe fn as_built(
+        &self,
+        raw: *mut ffi::ggml_cgraph,
+        unplanned: &[*mut ffi::ggml_tensor],
+        built: &Placement,
+    ) -> bool {
+        // SAFETY: the caller's.
+        unsafe {
+            let planned = self.plan(raw, true);
+            if planned && built.is_current() {
+                return true;
+            }
+            let Some(need) = built.one_buffer(self.buft.raw()) else {
+                tracing::error!(
+                    "a rewrite planned again was undone, and the graph's plan as built spans \
+                     buffers a plan of its own lays out otherwise: not run"
+                );
+                return false;
+            };
+            // ggml's buffers only grow: after a plan, the allocator's holds what an earlier
+            // one gave this graph unless a failed plan freed it.
+            let buffer = if planned { built.buffer_now() } else { None };
+            forget_plan(unplanned);
+            let buffer = match buffer {
+                Some(b) if ffi::ggml_backend_buffer_get_size(b) >= built.end(b) => Some(b),
+                _ => self.grown(need),
+            };
+            let placed = buffer.is_some_and(|b| built.place(b));
+            if !placed {
+                forget_plan(unplanned);
+                tracing::error!(
+                    bytes = need,
+                    "a rewrite planned again was undone, and the graph's memory as built could \
+                     not be given back: not run"
+                );
+            }
+            placed
+        }
+    }
+
+    /// The allocator's buffer, grown to at least `bytes` (as [`Self::reserved`] grows it).
+    /// None if that allocation fails.
+    fn grown(&self, bytes: usize) -> Option<ffi::ggml_backend_buffer_t> {
+        // A graph of one leaf of `bytes` bytes: allocated from the allocator's buffer, at its
+        // start, the buffer grown first if it must.
+        let ctx = Context::new(1, 1);
+        let t = ctx.new_tensor(super::types::I8, &[bytes.max(1) as i64]);
+        let mut graph = ctx.new_graph(1);
+        graph.expand(t);
+        let ok = self.plan(graph.raw(), true);
+        // SAFETY: `t` is a valid tensor; its buffer is the allocator's, which outlives `ctx`.
+        let b = unsafe { (*t.raw()).buffer };
+        (ok && !b.is_null()).then_some(b)
+    }
+
     /// Plans `graph` (`fresh`: from a plan of its own, else from the previous one when it
-    /// fits) and gives its intermediates memory.
+    /// fits) and gives its intermediates memory. After a plan that failed, afresh: ggml keeps
+    /// the failed plan and frees the buffer it could not grow, and a graph fitting that plan
+    /// would get memory in no buffer.
     fn plan(&self, raw: *mut ffi::ggml_cgraph, fresh: bool) -> bool {
+        let fresh = fresh || self.failed.get();
         // SAFETY: a live allocator and graph; reserving plans the graph and grows the buffer
         // if needed, and the allocation then finds the plan valid for this graph.
-        unsafe {
+        let ok = unsafe {
             (!fresh || ffi::ggml_gallocr_reserve(self.raw.as_ptr(), raw))
                 && ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), raw)
+        };
+        self.failed.set(!ok);
+        if !ok {
+            self.moved.set(true);
         }
+        ok
     }
 
     /// This allocator taking `r` on every graph it allocates (whatever its buffer type), as
@@ -1838,6 +2138,8 @@ impl ComputeAllocator {
             buft: BufferType(NonNull::new(over).expect("a padded buffer type")),
             fresh: FRESH_PLANS.load(std::sync::atomic::Ordering::Relaxed),
             relayout: None,
+            moved: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
         }
     }
 

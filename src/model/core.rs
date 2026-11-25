@@ -116,8 +116,8 @@ mod window_attn;
 
 pub use arch::{Arch, ArchRef, Recurrent, TokenConv};
 pub use exec::{
-    ChainOutput, Executor, LENT_SCRATCH, MediaTable, PassRow, Pool, PromptNext, Remote,
-    StateCapture, StepPart, TpLead, default_verify_budget, from_wire, from_wire_with,
+    ChainOutput, Executor, LENT_SCRATCH, MediaTable, PROMPT_GRAPHS, PassRow, Pool, PromptNext,
+    Remote, StateCapture, StepPart, TpLead, default_verify_budget, from_wire, from_wire_with,
     set_mtp_kept_graphs, set_prompt_buffer_reserve, set_prompt_build_ahead, set_prompt_step_stats,
     set_verify_kept_graphs, verify_kept_graphs,
 };
@@ -1657,7 +1657,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
-            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf, |n| weights.get(n).is_some()),
             dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1711,7 +1711,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
-            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf, |n| weights.get(n).is_some()),
             dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -2098,6 +2098,13 @@ impl Model {
             .set_prompt(on && crate::model::fp8::fp8_mma())
     }
 
+    /// Which steps read the dense projections' FP8 copies (`--dense-fp8`, [`dense_twins`]): 0
+    /// none, 1 decode and verify steps, 3 prompt steps too. The ranks of tensor parallelism
+    /// over machines check that they agree (#1183).
+    pub fn dense_fp8_mode(&self) -> u32 {
+        self.dense_twins.mode()
+    }
+
     /// Which kernels run NVFP4 matmuls on CUDA ([`Nvfp4Mm`]); graphs built after this call use
     /// it.
     pub fn set_nvfp4_mm(&mut self, m: Nvfp4Mm) {
@@ -2309,7 +2316,7 @@ impl Model {
     }
 
     pub(crate) fn w(&self, name: &str) -> Result<Tensor<'_>, ModelError> {
-        // `--dense-fp8`: a decode-sized step's graph reads the FP8 copy ([`dense_twins`]).
+        // `--dense-fp8`: a decode or verify step's graph reads the FP8 copy ([`dense_twins`]).
         if let Some(copy) = self.dense_twins.copy_of(name)
             && let Some(t) = self.weights.get(&copy)
         {
@@ -3382,8 +3389,10 @@ impl Model {
         }
         let hp = &self.hp;
         let n: i64 = shape.iter().map(|g| g.tokens() as i64).sum();
-        // `--dense-fp8`: decode-sized steps read the FP8 copies, until the graph is built.
-        let _twins = self.dense_twins.step(n);
+        // `--dense-fp8`: decode and verify steps read the FP8 copies, until the graph is built
+        // (prompt rows keep BF16 without `--dense-fp8-prompt`).
+        let prompt_rows = dense_twins::prompt_rows(shape.iter().map(|g| (g.n_tok, g.verify)));
+        let _twins = self.dense_twins.step(n, prompt_rows);
         let last = layers.end == hp.n_layer;
         let n_out: i64 = if last {
             shape.iter().map(|g| g.out_rows() as i64).sum()
@@ -4072,14 +4081,29 @@ impl Model {
         {
             let silu = !hp.arch.sigmoid_gate();
             let ob = match gn_node {
+                // `--dense-fp8-prompt` (#1183): the delta rule's node writes the projection's
+                // FP8 codes of those rows instead (the same codes; no BF16 rows for anything
+                // else to read). MoE models only: a dense one's codes come from `fp8_codes`.
+                Some((node, ob))
+                    if hp.moe
+                        && fp8_act::plain_bf16_fits(ob)
+                        && self.twin_prompt_reads(il, "ssm_out.weight", o) =>
+                {
+                    fp8_act::share(ctx, o, gdn_mma::codes_on(ctx, node));
+                    None
+                }
                 // The delta rule's node writes them (o's own values are then not computed).
                 Some((node, ob)) => {
                     gdn_mma::norm_on(node);
-                    ob
+                    Some(ob)
                 }
-                None => fused::gated_norm_bf16(ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu),
+                None => Some(fused::gated_norm_bf16(
+                    ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu,
+                )),
             };
-            ctx.set_shared_cast(o, types::BF16, ob);
+            if let Some(ob) = ob {
+                ctx.set_shared_cast(o, types::BF16, ob);
+            }
         }
         fp8_codes(o);
         let out = self.lmm_add(ctx, il, "ssm_out.weight", o, res)?;
@@ -4183,13 +4207,17 @@ impl Model {
             ctx.set_shared_cast(o, types::BF16, ob);
         }
         // `--fp8-act a8-dynamic` prefill: its per-token FP8 codes from one op too; with
-        // `--dense-fp8-prompt` (#1183), MoE models' too.
-        if !tap.on
-            && ((!hp.moe && self.linear.dynamic_batch(n))
-                || self.twin_prompt_reads(il, "attn_output.weight", o))
-            && fp8_act::gate_fits(gate_view, o_pre)
-        {
-            fp8_act::share(ctx, o, fp8_act::gate(ctx, gate_view, o_pre, false));
+        // `--dense-fp8-prompt` (#1183), MoE models' too, and there from the sparse attention
+        // op itself where `o` is its output (the same codes, the output not written).
+        if !tap.on && fp8_act::gate_fits(gate_view, o_pre) {
+            let twin = self.twin_prompt_reads(il, "attn_output.weight", o);
+            if (!hp.moe && self.linear.dynamic_batch(n)) || twin {
+                let q = twin
+                    .then(|| crate::model::qwen4::qsa_attn::gated_codes(ctx, o_pre, gate_view))
+                    .flatten()
+                    .unwrap_or_else(|| fp8_act::gate(ctx, gate_view, o_pre, false));
+                fp8_act::share(ctx, o, q);
+            }
         }
         let out = self.lmm_add(ctx, il, "attn_output.weight", o, res)?;
         tap.tap("attn_output", il, out);
@@ -5196,6 +5224,12 @@ impl Model {
         // As in `ffn`: one SwiGLU node, which ggml-cuda fuses with the two matvecs. Steps of
         // 2-16 tokens on a GB10 read BF16 gate and up in one dense matvec: ggml's bits (#860).
         let names = ["ffn_gate_shexp.weight", "ffn_up_shexp.weight"];
+        // `--dense-fp8-prompt` (#1183): the gate and up GEMM's FP8 codes of h and the gate logit
+        // from one op reading h once.
+        let gate_logit = match gate_logit {
+            None if h.ne()[1] > joined::MAX_TOKENS => self.shexp_codes_gate(ctx, il, h, hq),
+            g => g,
+        };
         // Q8_0 gate and up of 2-8 tokens on a V100 ([`q8_group::part`]): matvecs and SwiGLU in one launch
         // from h quantized once, ggml's bits (#819). One token stays on ggml, which fuses them
         // the same way, unless h's Q8_1 blocks are there already (the hyper-connection mixer's).
@@ -5256,6 +5290,64 @@ impl Model {
             None => self.lmm_q(ctx, il, "ffn_gate_inp_shexp.weight", h, hq)?,
         };
         Ok((sh, g))
+    }
+
+    /// For [`Self::shexp`] of a prompt step (#1183): where its gate and up are a
+    /// `--dense-fp8-prompt` GEMM whose codes come from h's BF16 cast (`twin_codes`: h a BF16
+    /// mix), the codes and the gate logit `ffn_gate_inp_shexp · h` from one op reading h
+    /// once ([`fp8_act::plain_dot`]: the codes of the cast, the logit ggml-cuda's
+    /// `mul_mat_vec_f` bits), the codes shared with the GEMM. `Some(logit)` then. Says once
+    /// why not where the GEMM takes the codes but the op does not fit.
+    fn shexp_codes_gate<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        h: Tensor<'a>,
+        hq: Option<shared_q8::Shared<'a>>,
+    ) -> Option<Tensor<'a>> {
+        let names = ["ffn_gate_shexp.weight", "ffn_up_shexp.weight"];
+        if !names.iter().all(|nm| self.twin_prompt_reads(il, nm, h))
+            || ctx.has_shared_node(h, crate::model::fp8::DYNAMIC_KEY)
+        {
+            return None;
+        }
+        let w = self.lw(il, "ffn_gate_inp_shexp.weight").ok()?;
+        // The logit `lmm_q` would make on ggml's `mul_mat` (F32 `w`: `mul_mat_vec_f`).
+        let ggml_logit = self.plain_weight(il, "ffn_gate_inp_shexp.weight").is_some()
+            && hq.is_none_or(|q| !q.takes(w))
+            && !crate::model::dense_mv::takes(w, h)
+            && !crate::model::dense_mv::takes_wide_chain(w, h);
+        // `twin_codes` quantizes h's BF16 cast: with none shared yet, or a plain copy of h
+        // shared (the routed experts' BF16 rows), its values are h's rounded as the op rounds
+        // them.
+        let plain_cast = ctx.shared_cast(h, types::BF16).is_none_or(|c| {
+            // SAFETY: live tensors of the graph being built.
+            unsafe {
+                let c = &*c.raw();
+                c.op == crate::ggml::ffi::ggml_op_GGML_OP_CPY && std::ptr::eq(c.src[0], h.raw())
+            }
+        });
+        let why = if !crate::model::qwen4::is_bf16_mix(h) || !plain_cast {
+            // E.g. steps whose hyper-connection mixers keep F32 (no `--hc-bf16` mix at this
+            // token count): `twin_codes` quantizes h's F32 values, not their BF16 rounding.
+            "h is not a BF16 hyper-connection mix in this step (its codes come from its F32 \
+             values); other steps may still take it"
+        } else if !ggml_logit || !fp8_act::plain_dot_fits(h, w) {
+            "h or the gate weight in a shape the op does not take (F32 [k, 1] in GPU memory, k a \
+             multiple of 4 with ggml's 256-thread mul_mat_vec_f block, contiguous rows)"
+        } else {
+            let (q, g) = fp8_act::plain_dot(ctx, h, w);
+            fp8_act::share(ctx, h, q);
+            return Some(g);
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "MoE prompt layers: shared expert codes + gate logit as one op off: {why}"
+            );
+        }
+        None
     }
 }
 

@@ -262,15 +262,25 @@ pub(super) struct ModelArgs {
     /// projections (attention, DeltaNet and shared-expert weights; one scale per output row,
     /// made at load) and let decode and verify steps of up to 64 tokens read it with 16-bit
     /// activations: half the bytes those steps stream for them. Prompt steps keep the BF16
-    /// weights and run as without the flag (see --dense-fp8-prompt). Faster decode; moves the
+    /// weights and run as without the flag, and so do decode rows batched in one step with
+    /// prompt rows (see --dense-fp8-prompt); a prompt chunk of one token per sequence (64 tokens
+    /// or fewer in all) has a decode step's shape and reads the copy. Faster decode; moves the
     /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). The
-    /// MTP layer keeps its BF16 weights. One machine without --tp; other models ignore it.
+    /// MTP layer keeps its BF16 weights. Not with --tp or --tp-per-gpu; with --tp-rank each rank
+    /// copies its share of the weights (every row keeps its whole row's scale), and every rank
+    /// must be given the flag. Other models ignore it.
     #[arg(long)]
     pub dense_fp8: bool,
     /// With --dense-fp8: prompt steps read the FP8 copies too, as W8A8 GEMMs with one FP8
     /// scale per token on FP8 tensor cores (sm_89+; elsewhere ignored), the copies of
     /// query/key/value and of the shared expert's gate/up each one GEMM as their BF16 weights
-    /// are. Aims at faster prefill; moves the output further than --dense-fp8 alone.
+    /// are. No step then reads the BF16 weights, so they are not loaded: the dense projections
+    /// take the copies' ~2.7 GiB only, about 2.7 GiB less than without --dense-fp8 (~5.4 GiB
+    /// less than --dense-fp8 alone; with --tp-rank, each rank's share of them). The prompt
+    /// steps of qwen4exp models also take --ple-ops' two ops for the per-layer n-gram
+    /// embedding, and the MTP head's prompt take-ins one op for its input norms (the same bits
+    /// per op as ggml's nodes). Aims at faster prefill; moves the output further than
+    /// --dense-fp8 alone. With --tp-rank, give every rank both flags.
     #[arg(long, requires = "dense_fp8")]
     pub dense_fp8_prompt: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,
@@ -1264,7 +1274,16 @@ struct EngineArgs {
     #[arg(long, default_value_t = legion::engine::lm::STREAM_THREAD_SEQS)]
     stream_thread_seqs: usize,
     /// Model engine: tokens per forward pass, one per decoding sequence plus prompt chunks
-    /// (default 1024; 4096 on a GPU that shares memory with the host, e.g. the GB10).
+    /// (default 1024; 4096 on a GPU that shares memory with the host, e.g. the GB10). Prompts
+    /// longer than the step run in other step sizes when it changes, so greedy output can
+    /// move. On one GPU sharing the host's memory, steps over 4096 tokens keep fewer prompt
+    /// graphs (two, else one, with their compute buffers) when three do not leave room for
+    /// `--kv-cache-tokens`, or without it for one context (the automatic pool can still grow
+    /// past that, up to max(--ctx-size, 262144) tokens); the load logs it. With one kept graph
+    /// the next prompt chunk's graph is not built while the current one computes. Sparse
+    /// attention's indexer (Qwen3.8-Flash-Next) scores the context for at most 4096 of a
+    /// step's tokens at a time, the same output, so a bigger step's compute buffer grows with
+    /// its tokens rather than tokens times context.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
     /// Model engine, on a GPU that shares memory with the host (a DGX Spark's GB10): GiB the

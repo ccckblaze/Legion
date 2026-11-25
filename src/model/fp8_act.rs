@@ -47,6 +47,9 @@ enum Kind {
     GatedNorm = 3,
     /// `src/cuda/fp8_act.cu`'s `plain_bf16`: the row is `x`'s BF16 values.
     Bf16 = 5,
+    /// `src/cuda/fp8_act.cu`'s `plain_dot`: the row is `x`'s F32 values rounded to BF16, and
+    /// the node also holds `x · w` per token ([`plain_dot`]).
+    PlainDot = 6,
 }
 
 /// Most values per row the CUDA kernels hold (`MAX_NV` x 1024 threads).
@@ -220,6 +223,18 @@ pub(crate) fn plain_bf16<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
     node(ctx, Kind::Bf16, k, n, &[x], [0, 0, 0])
 }
 
+/// Whether `t` is a [`plain_bf16`] node.
+///
+/// # Safety
+/// `t` is a valid tensor.
+pub(crate) unsafe fn is_plain_bf16(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &FP8_ACT))
+            && crate::ggml::external_params(&*t)[0] == Kind::Bf16 as i32
+    }
+}
+
 /// Whether [`plain_bf16`] takes `x` on this GPU: BF16 `[k, n]` with contiguous rows of at most
 /// [`MAX_K`] values, `k` a multiple of 4.
 pub(crate) fn plain_bf16_fits(x: Tensor<'_>) -> bool {
@@ -232,6 +247,109 @@ pub(crate) fn plain_bf16_fits(x: Tensor<'_>) -> bool {
         && k % 4 == 0
         && k <= MAX_K
         && n <= i32::MAX as i64
+}
+
+/// [`plain_bf16`] of `x`'s BF16 cast and `mul_mat(w, x)` from one op reading `x` once (#1183):
+/// `(q, g)` for `x` F32 `[k, n]` contiguous and `w` F32 `[k, 1]` (a MoE layer's shared-expert
+/// gate), `q` the packed activations of `x` rounded to BF16 (ggml-cuda's cast rounds the same
+/// way: the bytes of `plain_bf16(cast(x, BF16))`) and `g` F32 `[1, n]` with the bits of
+/// ggml-cuda's `mul_mat_vec_f` of the pair (see [`plain_dot_fits`]). The node holds `q`, then
+/// `g` (4-byte aligned: `k` a multiple of 4).
+pub(crate) fn plain_dot<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    w: Tensor<'a>,
+) -> (Tensor<'a>, Tensor<'a>) {
+    assert!(plain_dot_shapes(x, w), "fp8_act::plain_dot: shapes");
+    let [k, n, _, _] = x.ne();
+    let (_, total) = fp8::dynamic_layout(k, n);
+    let node = ctx.external_with(
+        &FP8_ACT,
+        types::I8,
+        [total as i64 + 4 * n, 1, 1, 1],
+        &[x, w],
+        &[Kind::PlainDot as i32, k as i32, 0, 0, 0],
+    );
+    let g = ctx.reinterpret(ctx.view_1d(node, 4 * n, total), types::F32, [1, n, 1, 1]);
+    (ctx.view_1d(node, total as i64, 0), g)
+}
+
+/// Whether a graph node is a [`plain_dot`] op (counted on the node fuse line).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_plain_dot(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; a node of this module has its kind as its first parameter.
+    unsafe {
+        crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &FP8_ACT))
+            && crate::ggml::external_params(&*node)[0] == Kind::PlainDot as i32
+    }
+}
+
+/// Whether [`plain_dot`] takes `x` and `w` on this GPU, with ggml-cuda's bits for `g`: there
+/// `mul_mat(w, x)` of an F32 `[k, 1]` weight in GPU memory over more than
+/// `MMVF_MAX_BATCH_SIZE` (8) contiguous F32 rows runs `mul_mat_vec_f` with `x` as the matrix
+/// (its transposed-vector path), in a block of [`mmvf_block`] threads, 256 here as the
+/// kernel's.
+pub(crate) fn plain_dot_fits(x: Tensor<'_>, w: Tensor<'_>) -> bool {
+    gpu_fits() && plain_dot_shapes(x, w) && vector_fits(w, x.ne()[0])
+}
+
+fn plain_dot_shapes(x: Tensor<'_>, w: Tensor<'_>) -> bool {
+    let [k, n, _, _] = x.ne();
+    rows_fit(x)
+        && x.is_contiguous()
+        && k % 4 == 0
+        && k <= 256 * (MAX_K / 1024)
+        && mmvf_block(k) == 256
+        && n > 8
+        && w.ty() == types::F32
+        && w.is_contiguous()
+        && w.ne() == [k, 1, 1, 1]
+}
+
+/// ggml-cuda's `mul_mat_vec_f` block for rows of `k` columns (mmvf.cu, NVIDIA): of 32 to 256
+/// threads (multiples of 32), the one with the fewest steps of `2 * block` columns, the
+/// smallest on ties.
+pub(crate) fn mmvf_block(k: i64) -> i64 {
+    let mut best = (32, (k + 63) / 64);
+    for b in (64..=256).step_by(32) {
+        let steps = (k + 2 * b - 1) / (2 * b);
+        if steps < best.1 {
+            best = (b, steps);
+        }
+    }
+    best.0
+}
+
+/// `x · w` in the order of ggml-cuda's `mul_mat_vec_f` in a block of 256 threads (the CPU
+/// reference of [`plain_dot`]'s `g`; FMAs as there): thread `tid` sums the float2 pairs `tid,
+/// tid + 256, ...`, each warp's 32 sums by the shuffle butterfly, then the 8 warp sums (and 24
+/// zeros) the same way.
+pub(crate) fn mmvf_dot(x: &[f32], w: &[f32]) -> f32 {
+    const BLOCK: usize = 256;
+    let butterfly = |v: &[f32]| {
+        let mut v: [f32; 32] = v.try_into().expect("32 lanes");
+        for off in [16, 8, 4, 2, 1] {
+            let prev = v;
+            for (l, x) in v.iter_mut().enumerate() {
+                *x = prev[l] + prev[l ^ off];
+            }
+        }
+        v[0]
+    };
+    let mut lanes = [0f32; BLOCK];
+    for (tid, acc) in lanes.iter_mut().enumerate() {
+        for c2 in (tid..x.len() / 2).step_by(BLOCK) {
+            *acc = x[2 * c2].mul_add(w[2 * c2], *acc);
+            *acc = x[2 * c2 + 1].mul_add(w[2 * c2 + 1], *acc);
+        }
+    }
+    let mut sums = [0f32; 32];
+    for (s, warp) in sums.iter_mut().zip(lanes.chunks_exact(32)) {
+        *s = butterfly(warp);
+    }
+    butterfly(&sums)
 }
 
 /// Gives every [`fp8::mul_mat_dynamic`] of `a` the packed activations `q` (one of the ops above,
@@ -256,9 +374,25 @@ fn with_bf16(dst: &ffi::ggml_tensor) -> bool {
 /// The tokens of a node made by this module: its `k * n` codes and `n` scales hold `n (k + 4)`
 /// bytes, after `2 k n` bytes of BF16 rows in [`rms_norm_bf16`]'s.
 fn tokens(dst: &ffi::ggml_tensor) -> i64 {
-    let k = crate::ggml::external_params(dst)[1] as i64;
-    let bf = if with_bf16(dst) { 2 * k } else { 0 };
-    dst.ne[0] / (bf + k + 4)
+    let p = crate::ggml::external_params(dst);
+    let k = p[1] as i64;
+    let extra = if with_bf16(dst) {
+        2 * k
+    } else if p[0] == Kind::PlainDot as i32 {
+        4
+    } else {
+        0
+    };
+    dst.ne[0] / (extra + k + 4)
+}
+
+/// [`gate`]'s value on the CPU: `sigmoid(x) * g`, or (`silu`) `silu(x) * g`. Also the CPU
+/// reference of the ops that gate and quantize their own output
+/// ([`crate::model::qwen4::qsa_attn::gated_codes`]).
+pub(crate) fn gated_host(x: f32, g: f32, silu: bool) -> f32 {
+    let e = 1.0 + (-x).exp();
+    let a = if silu { x / e } else { 1.0 / e };
+    a * g
 }
 
 /// One token's activation row (`k` values) as the chain computes it on the CPU.
@@ -274,6 +408,11 @@ unsafe fn cpu_row(dst: &ffi::ggml_tensor, t: usize, row: &mut [f32]) {
             let xb = (x.data as *const u8).add(t * x.nb[1]) as *const u16;
             for (i, v) in row.iter_mut().enumerate() {
                 *v = f32::from_bits(u32::from(*xb.add(i)) << 16);
+            }
+        } else if kind == Kind::PlainDot as i32 {
+            let xs = std::slice::from_raw_parts(xrow(t), k);
+            for (v, &x) in row.iter_mut().zip(xs) {
+                *v = f32::from_bits(u32::from(crate::model::nvfp4_mm::bf16_bits(x)) << 16);
             }
         } else if kind == Kind::RmsNorm as i32 {
             let eps = f32::from_bits(p[2] as u32);
@@ -297,9 +436,7 @@ unsafe fn cpu_row(dst: &ffi::ggml_tensor, t: usize, row: &mut [f32]) {
             let gp = (g.data as *const u8).add(t * g.nb[1]) as *const f32;
             for (i, v) in row.iter_mut().enumerate() {
                 let xv = *xp.add(t * x_ld + (i / d) * x_hd + i % d);
-                let e = 1.0 + (-xv).exp();
-                let a = if silu { xv / e } else { 1.0 / e };
-                *v = a * *gp.add(i);
+                *v = gated_host(xv, *gp.add(i), silu);
             }
         } else {
             assert_eq!(kind, Kind::GatedNorm as i32, "fp8_act: kind {kind}");
@@ -333,8 +470,19 @@ unsafe fn cpu_fp8_act(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let bf = with_bf16(dst).then_some(dst.data as *mut u16);
         let out = (dst.data as *mut u8).add(if bf.is_some() { 2 * k * n } else { 0 });
         let scales = out.add(codes) as *mut f32;
+        // `plain_dot`: the gate logits after the scales, `x · w` in ggml-cuda's order.
+        let dot = (crate::ggml::external_params(dst)[0] == Kind::PlainDot as i32).then(|| {
+            let (x, w) = (&*dst.src[0], &*dst.src[1]);
+            let w = std::slice::from_raw_parts(w.data as *const f32, k);
+            (scales.add(n), x, w)
+        });
         let mut row = vec![0f32; k];
         for t in (ith..n).step_by(nth) {
+            if let Some((dot, x, w)) = dot {
+                let xs = (x.data as *const u8).add(t * x.nb[1]) as *const f32;
+                let xs = std::slice::from_raw_parts(xs, k);
+                dot.add(t).write_unaligned(mmvf_dot(xs, w));
+            }
             cpu_row(dst, t, &mut row);
             if let Some(bf) = bf {
                 for (i, v) in row.iter().enumerate() {
@@ -371,6 +519,7 @@ struct Fp8Act {
     src_bf16: i32,
     res: *const f32,
     xs: *mut f32,
+    dot: *mut f32,
 }
 
 #[cfg(feature = "cuda")]
@@ -398,6 +547,7 @@ impl Fp8Act {
             src_bf16: 0,
             res: std::ptr::null(),
             xs: std::ptr::null_mut(),
+            dot: std::ptr::null_mut(),
         }
     }
 }
@@ -541,6 +691,77 @@ pub(crate) unsafe fn quantize_plain(
     }
 }
 
+/// [`plain_bf16`]'s CUDA kernel on device pointers: the codes (`out`, `k * n`) and scales
+/// (`scales`, `n` F32) of the BF16 rows `x` (`[k, n]` contiguous, `k` a multiple of 4). The
+/// launch's result (0 on success; 1: a shape the kernel does not take).
+///
+/// # Safety
+/// Device pointers on the stream's device, sized as documented.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn plain_bf16_raw(
+    x: *const u16,
+    k: i64,
+    out: *mut u8,
+    scales: *mut f32,
+    n: i64,
+    stream: *mut c_void,
+) -> i32 {
+    if k > MAX_K || k % 4 != 0 || n > i32::MAX as i64 {
+        return 1;
+    }
+    // (BF16 rows: `x_ld` in BF16 values.)
+    let p = Fp8Act {
+        x: x.cast(),
+        x_ld: k,
+        out,
+        scales,
+        k: k as i32,
+        n: n as i32,
+        ..Fp8Act::of(Kind::Bf16 as i32)
+    };
+    // SAFETY: the caller's pointers, as documented.
+    unsafe { legion_fp8_act_launch(&p, stream) }
+}
+
+/// [`gate`]'s CUDA kernel on device pointers: the packed activations (`out` the `k * n` codes,
+/// `scales` the `n` F32 scales) of `sigmoid(x) * g` (`silu`: `silu(x) * g`), with element `i`
+/// of token `t` of `x` at `x + t * x_ld + (i / d) * x_hd + i % d` and of `g` at
+/// `g + t * g_ld + i` (strides in floats). The launch's result (0 on success; 1: a shape the
+/// kernel does not take).
+///
+/// # Safety
+/// Device pointers on the stream's device, sized as documented.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn gate_raw(
+    (x, x_hd, x_ld, d): (*const f32, i64, i64, i32),
+    (g, g_ld): (*const f32, i64),
+    out: *mut u8,
+    scales: *mut f32,
+    (k, n): (i64, i64),
+    silu: bool,
+    stream: *mut c_void,
+) -> i32 {
+    if k > MAX_K || n > i32::MAX as i64 {
+        return 1;
+    }
+    let p = Fp8Act {
+        x,
+        x_ld,
+        x_hd,
+        d,
+        g,
+        g_ld,
+        out,
+        scales,
+        k: k as i32,
+        n: n as i32,
+        silu: i32::from(silu),
+        ..Fp8Act::of(Kind::Gate as i32)
+    };
+    // SAFETY: the caller's pointers, as documented.
+    unsafe { legion_fp8_act_launch(&p, stream) }
+}
+
 #[cfg(feature = "cuda")]
 unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node made by this module, device tensors of the stream's device.
@@ -574,6 +795,9 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         if p[0] == Kind::RmsNorm as i32 {
             a.w = (*dst.src[1]).data as *const f32;
             a.eps = f32::from_bits(p[2] as u32);
+        } else if p[0] == Kind::PlainDot as i32 {
+            a.w = (*dst.src[1]).data as *const f32;
+            a.dot = a.scales.add(n as usize);
         } else if p[0] == Kind::Gate as i32 {
             let g = &*dst.src[1];
             (a.x_hd, a.x_ld) = if x.ne[2] == 1 && x.ne[3] == 1 {

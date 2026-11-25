@@ -32,23 +32,61 @@ fn only_small_steps_of_a_file_with_copies_read_them() {
     let on = DenseTwins {
         on: true,
         prompt: false,
+        bare: false,
         active: Cell::new(false),
     };
     let w = "blk.0.attn_q.weight";
     assert_eq!(on.copy_of(w), None, "outside a graph build");
     {
-        let _g = on.step(64);
+        let _g = on.step(64, false);
         assert_eq!(on.copy_of(w).as_deref(), Some("blk.0.attn_q.fp8.weight"));
         {
-            let _inner = on.step(4096);
+            let _inner = on.step(4096, true);
             assert_eq!(on.copy_of(w), None, "a prompt step");
         }
         assert!(on.copy_of(w).is_some(), "the outer build's state is back");
     }
     assert_eq!(on.copy_of(w), None);
     let off = DenseTwins::default();
-    let _g = off.step(1);
+    let _g = off.step(1, false);
     assert_eq!(off.copy_of(w), None, "no copies in the file");
+}
+
+/// Without `--dense-fp8-prompt`, prompt rows read BF16 at any length, alone or batched with
+/// decode rows; decode and verify steps up to 64 tokens read the copies.
+#[test]
+fn prompt_rows_keep_bf16_at_any_length() {
+    // (tokens per sequence, verify) of each group.
+    assert!(!prompt_rows([(1, false)]), "a decode step");
+    assert!(!prompt_rows([(4, true), (1, false)]), "verify and decode");
+    assert!(prompt_rows([(5, false)]), "a short prompt chunk");
+    assert!(
+        prompt_rows([(1, false), (37, false)]),
+        "decode rows with a prompt chunk"
+    );
+    assert!(prompt_rows([(4, true), (2, false)]));
+    assert!(!prompt_rows([]));
+    let on = DenseTwins {
+        on: true,
+        prompt: false,
+        bare: false,
+        active: Cell::new(false),
+    };
+    let w = "blk.0.attn_q.weight";
+    for (n, rows, reads) in [
+        (5, true, false),
+        (64, true, false),
+        (16, false, true),
+        (64, false, true),
+        (65, false, false),
+    ] {
+        let _g = on.step(n, rows);
+        assert_eq!(
+            on.copy_of(w).is_some(),
+            reads,
+            "{n} tokens, prompt rows {rows}"
+        );
+    }
 }
 
 #[test]
@@ -56,24 +94,82 @@ fn prompt_mode_reads_the_copies_in_every_step() {
     let mut on = DenseTwins {
         on: true,
         prompt: false,
+        bare: false,
         active: Cell::new(false),
     };
     assert!(on.set_prompt(true));
     let w = "blk.0.attn_q.weight";
     assert_eq!(on.copy_of(w), None, "outside a graph build");
     {
-        let _g = on.step(4096);
+        let _g = on.step(4096, true);
         assert_eq!(on.copy_of(w).as_deref(), Some("blk.0.attn_q.fp8.weight"));
     }
     {
-        let _g = on.step(1);
+        let _g = on.step(1, false);
         assert!(on.copy_of(w).is_some());
     }
+    {
+        let _g = on.step(5, true);
+        assert!(on.copy_of(w).is_some(), "short prompt rows too");
+    }
     assert!(!on.set_prompt(false));
-    let _g = on.step(4096);
+    let _g = on.step(4096, true);
     assert_eq!(on.copy_of(w), None, "prompt mode off");
     let mut off = DenseTwins::default();
     assert!(!off.set_prompt(true), "no copies in the file");
+}
+
+/// With the BF16 weights left out of the load, every read gives the copy: outside a graph
+/// build and in any step; names without a copy stay themselves.
+#[test]
+fn a_bare_load_reads_the_copies_everywhere() {
+    let mut bare = DenseTwins {
+        on: true,
+        prompt: false,
+        bare: true,
+        active: Cell::new(false),
+    };
+    assert!(bare.set_prompt(true));
+    let w = "blk.0.attn_q.weight";
+    assert_eq!(bare.copy_of(w).as_deref(), Some("blk.0.attn_q.fp8.weight"));
+    assert_eq!(
+        bare.copy_of("blk.0.attn_q.scale").as_deref(),
+        Some("blk.0.attn_q.fp8.scale")
+    );
+    for (n, rows) in [
+        (4096, true),
+        (5, true),
+        (1, false),
+        (64, false),
+        (65, false),
+    ] {
+        let _g = bare.step(n, rows);
+        assert!(bare.copy_of(w).is_some(), "{n} tokens, prompt rows {rows}");
+    }
+    assert!(bare.copy_of(w).is_some(), "after the builds");
+    // (The MTP layer's projections are named for a copy the file lacks: `Model::w` then reads
+    // the weight itself.)
+    for name in [
+        "blk.0.ssm_alpha.weight",
+        "output.weight",
+        "token_embd.weight",
+    ] {
+        assert_eq!(bare.copy_of(name), None, "{name}");
+    }
+}
+
+#[test]
+fn originals_count_as_left_out_only_all_together() {
+    let listed: Vec<String> = ["blk.0.attn_q.weight", "blk.1.ssm_out.weight"]
+        .map(String::from)
+        .to_vec();
+    assert!(originals_left_out(&listed, |_| false), "none loaded");
+    assert!(!originals_left_out(&listed, |_| true), "all loaded");
+    assert!(
+        !originals_left_out(&listed, |n| n.starts_with("blk.1.")),
+        "some loaded (another machine's layers left out)"
+    );
+    assert!(!originals_left_out(&[], |_| false), "no copies in the file");
 }
 
 /// Copies in one CPU buffer as the loader stores them: layer 0's query, key and value codes
@@ -148,4 +244,19 @@ fn runs_join_adjacent_copies_only() {
         runs.get(&members(1, &qkv, "weight"), &members(1, &qkv, "scale"))
             .is_none()
     );
+}
+
+/// The mode tensor parallel ranks compare (#1183): none without copies, whatever
+/// `--dense-fp8-prompt` says; decode and verify steps with them; prompt steps too with the flag.
+#[test]
+fn the_mode_says_which_steps_read_the_copies() {
+    let mut t = DenseTwins::default();
+    assert_eq!(t.mode(), 0);
+    assert!(!t.set_prompt(true));
+    assert_eq!(t.mode(), 0, "no copies in the file");
+    t.on = true;
+    t.set_prompt(false);
+    assert_eq!(t.mode(), 1);
+    assert!(t.set_prompt(true));
+    assert_eq!(t.mode(), 3);
 }

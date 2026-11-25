@@ -49,6 +49,15 @@ static SELECT: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static SELECT_INTO: ExternalOp = ExternalOp {
+    name: "qsa_select_into",
+    cpu: cpu_select_into,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_select_into),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 static SELECT_ALL: ExternalOp = ExternalOp {
     name: "qsa_select_all",
     cpu: cpu_select_all,
@@ -99,6 +108,15 @@ static ATTN: ExternalOp = ExternalOp {
     cpu: cpu_attn,
     #[cfg(feature = "cuda")]
     cuda: Some(cuda_attn),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+static ATTN_CODES: ExternalOp = ExternalOp {
+    name: "qsa_attn_codes",
+    cpu: cpu_attn_codes,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_attn_codes),
     #[cfg(not(feature = "cuda"))]
     cuda: None,
 };
@@ -442,14 +460,66 @@ pub fn select<'a>(
     tail: Tensor<'a>,
     pos: Tensor<'a>,
 ) -> Tensor<'a> {
-    let [n_top, ng, ..] = top.ne();
+    select_rows(ctx, top, score, pool_idxs, tail, pos, top.ne()[1])
+}
+
+/// [`select`] of the first `top.ne[1]` of a step's `tokens` tokens, in a node with a row for
+/// every token: [`select_into`] writes the later tokens' rows over it in place (#1183: a
+/// prompt step's selections chunk by chunk without a concat). The rows past `top`'s tokens
+/// are the node's until then.
+pub fn select_rows<'a>(
+    ctx: &'a Context,
+    top: Tensor<'a>,
+    score: Tensor<'a>,
+    pool_idxs: Tensor<'a>,
+    tail: Tensor<'a>,
+    pos: Tensor<'a>,
+    tokens: i64,
+) -> Tensor<'a> {
+    let n_top = top.ne()[0];
+    assert!(top.ne()[1] <= tokens, "qsa_select: more tokens than rows");
     let kpool = pool_idxs.ne()[0];
     let cap = n_top * kpool + kpool - 1;
     ctx.external(
         &SELECT,
         types::I32,
-        [1 + cap, ng, 1, 1],
+        [1 + cap, tokens, 1, 1],
         &[top, score, pool_idxs, tail, pos],
+    )
+}
+
+/// [`select`] of tokens `first..first + top.ne[1]` written over those rows of `rows` (a
+/// [`select_rows`] or [`select_into`] node of the same picks per token, read by nothing else)
+/// in place, the rest of its rows left as they are.
+#[allow(clippy::too_many_arguments)]
+pub fn select_into<'a>(
+    ctx: &'a Context,
+    rows: Tensor<'a>,
+    first: i64,
+    top: Tensor<'a>,
+    score: Tensor<'a>,
+    pool_idxs: Tensor<'a>,
+    tail: Tensor<'a>,
+    pos: Tensor<'a>,
+) -> Tensor<'a> {
+    let [n_top, ng, ..] = top.ne();
+    let kpool = pool_idxs.ne()[0];
+    assert_eq!(
+        rows.ne()[0],
+        1 + n_top * kpool + kpool - 1,
+        "qsa_select_into: row length"
+    );
+    assert!(
+        first >= 0 && first + ng <= rows.ne()[1],
+        "qsa_select_into: rows {first}..{} of {}",
+        first + ng,
+        rows.ne()[1]
+    );
+    ctx.external_inplace(
+        &SELECT_INTO,
+        rows,
+        &[top, score, pool_idxs, tail, pos],
+        &[first as i32],
     )
 }
 
@@ -563,6 +633,206 @@ pub fn attention<'a>(
     )
 }
 
+/// `--dense-fp8-prompt` (#1183): [`crate::model::fp8_act::gate`]`(gate, o, false)` (the
+/// attn_output GEMM's packed FP8 activations, [`crate::model::fp8::dynamic_layout`]) from the
+/// attention op itself, for `o` a prompt step's [`attention`] output (one op, as
+/// `[d * n_head, tokens]`) and `gate` F32 `[d, n_head, tokens]` (columns contiguous, any head
+/// and token strides). The codes and scales have that op's bits: on a GB10 the prompt kernel
+/// gates and quantizes in its epilogue with `src/cuda/fp8_act_row.cuh`'s expressions, so the
+/// output is not written and read back (`attn_gw_kernel`'s CODES); elsewhere the op runs the
+/// attention, then the gate's kernel. `None` where `o` is not such an output.
+pub(crate) fn gated_codes<'a>(
+    ctx: &'a Context,
+    o: Tensor<'a>,
+    gate: Tensor<'a>,
+) -> Option<Tensor<'a>> {
+    // SAFETY: the graph's live tensors.
+    unsafe {
+        let raw = o.raw();
+        let node = if (*raw).op == ffi::ggml_op_GGML_OP_RESHAPE {
+            (*raw).src[0]
+        } else {
+            raw
+        };
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &ATTN)) {
+            return None;
+        }
+        let q = &*(*node).src[0];
+        let [d, n_head, n_tok, n_seqs] = q.ne;
+        let (k, tokens) = (d * n_head, n_tok * n_seqs);
+        // The prompt form (the decode form holds the parts behind the output).
+        if (*node).ne != q.ne || tokens <= DECODE_TOKENS || o.ne() != [k, tokens, 1, 1] {
+            return None;
+        }
+        if gate.ty() != types::F32 || gate.nb()[0] != 4 || gate.ne() != [d, n_head, tokens, 1] {
+            return None;
+        }
+        let mut args: Vec<Tensor<'a>> = (0..5).map(|i| ctx.wrap((*node).src[i])).collect();
+        args.push(gate);
+        let (_, total) = crate::model::fp8::dynamic_layout(k, tokens);
+        let bytes = codes_scratch(total) + 4 * (k * tokens) as usize + codes_sync(tokens);
+        let node = ctx.external(&ATTN_CODES, types::I8, [bytes as i64, 1, 1, 1], &args);
+        Some(ctx.view_1d(node, total as i64, 0))
+    }
+}
+
+/// Whether `node` is made by [`gated_codes`] (`node_fuse`'s count of producers that write an
+/// FP8 GEMM's codes themselves).
+///
+/// # Safety
+/// `node` must point to a valid tensor.
+pub(crate) unsafe fn is_gated_codes(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &ATTN_CODES)) }
+}
+
+/// The query's head norm and RoPE as ggml's nodes compute them (`rms_norm`, `mul` by the
+/// weight, `rope_multi` without frequency factors, `ext_factor` 0), for [`fold_q`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QNormRope {
+    /// The query before the norm: F32 `[d, n_head, tokens]`, columns contiguous.
+    pub raw: *mut ffi::ggml_tensor,
+    /// The norm's weight: F32 `[d]`.
+    pub w: *mut ffi::ggml_tensor,
+    /// The RoPE's positions: I32 `[4 * tokens]`.
+    pub pos: *mut ffi::ggml_tensor,
+    pub eps: f32,
+    pub n_dims: i32,
+    /// ggml's mrope sections, each at most 255.
+    pub sections: [i32; 4],
+    /// `GGML_ROPE_TYPE_IMROPE`, else `GGML_ROPE_TYPE_MROPE`.
+    pub imrope: bool,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub attn_factor: f32,
+    /// The attention's first token among `raw`'s (and the positions').
+    pub off: i32,
+}
+
+/// A [`gated_codes`] node's parameter 0 after [`fold_q`]: 1 (MROPE) or 2 (IMROPE); 0 before.
+const P_FOLD: usize = 0;
+
+/// Whether [`fold_q`] made `node` (a [`gated_codes`] node) read its query before the norm and
+/// RoPE.
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_q_folded(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { is_gated_codes(node) && crate::ggml::external_params(&*node)[P_FOLD] != 0 }
+}
+
+/// Why [`fold_q`] does not take the [`gated_codes`] node `node` (`None`: it does): the fold is
+/// `attn_gw_kernel`'s codes path (the launcher's own pick on a compute capability 12.x GPU), at
+/// head size 256 over F16 K and V.
+///
+/// # Safety
+/// `node` is an allocated [`gated_codes`] node.
+pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'static str> {
+    #[cfg(feature = "cuda")]
+    // SAFETY: the caller's.
+    unsafe {
+        let (q, k, v) = (&*(*node).src[0], &*(*node).src[1], &*(*node).src[2]);
+        if k.type_ != types::F16 || v.type_ != types::F16 {
+            return Some("a quantized KV cache (the fold reads F16 K and V)");
+        }
+        if q.ne[0] != 256 || !supported(q.ne[0], q.ne[1], k.ne[0] / q.ne[0]) {
+            return Some("head size not 256");
+        }
+        if prompt_kernel() != 0 {
+            return Some("a forced prompt kernel (LEGION_DEBUG_QSA_PROMPT_KERNEL)");
+        }
+        if gw_cg() {
+            return Some("LEGION_DEBUG_QSA_GW_L1=0");
+        }
+        let cc = crate::ggml::cuda_device_of(k).and_then(crate::hw::per_device::cc);
+        if cc.map(|c| c.0) != Some(12) {
+            return Some("not a compute capability 12.x GPU (the fold is attn_gw_kernel's)");
+        }
+        None
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = node;
+        Some("a build without CUDA")
+    }
+}
+
+/// Makes the [`gated_codes`] node `node` read its query before the head norm and RoPE `f`
+/// (`node_fuse`, after allocation, with ggml's nodes of them turned off): its kernel computes
+/// them as ggml-cuda does ([`fold_q_off`] says where).
+///
+/// # Safety
+/// `node` is a [`gated_codes`] node [`fold_q_off`] takes, `f`'s tensors valid and allocated, and
+/// `f` the chain whose output `node`'s query reads, `f.off` tokens in.
+pub(crate) unsafe fn fold_q(node: *mut ffi::ggml_tensor, f: &QNormRope) {
+    assert!(
+        f.sections.iter().all(|s| (0..256).contains(s)),
+        "qsa_attn_codes: RoPE sections {:?}",
+        f.sections
+    );
+    let packed = f
+        .sections
+        .iter()
+        .enumerate()
+        .fold(0u32, |a, (i, &s)| a | ((s as u32) << (8 * i)));
+    // SAFETY: the caller's.
+    unsafe {
+        let mut srcs: Vec<*mut ffi::ggml_tensor> = (0..6).map(|i| (*node).src[i]).collect();
+        srcs.extend([f.raw, f.w, f.pos]);
+        let params = [
+            1 + f.imrope as i32,
+            f.n_dims,
+            packed as i32,
+            f.eps.to_bits() as i32,
+            f.freq_base.to_bits() as i32,
+            f.freq_scale.to_bits() as i32,
+            f.attn_factor.to_bits() as i32,
+            f.off,
+        ];
+        crate::ggml::make_external(node, &ATTN_CODES, &srcs, &params);
+    }
+}
+
+/// [`fold_q`]'s parameters of a node, `None` where it did not fold the node's query.
+///
+/// # Safety
+/// `node` is a [`gated_codes`] node.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+unsafe fn folded(node: &ffi::ggml_tensor) -> Option<QNormRope> {
+    let p = crate::ggml::external_params(node);
+    if p[P_FOLD] == 0 {
+        return None;
+    }
+    let f = |i: usize| f32::from_bits(p[i] as u32);
+    Some(QNormRope {
+        raw: node.src[6],
+        w: node.src[7],
+        pos: node.src[8],
+        eps: f(3),
+        n_dims: p[1],
+        sections: std::array::from_fn(|i| (((p[2] as u32) >> (8 * i)) & 0xff) as i32),
+        imrope: p[P_FOLD] == 2,
+        freq_base: f(4),
+        freq_scale: f(5),
+        attn_factor: f(6),
+        off: p[7],
+    })
+}
+
+/// Where a [`gated_codes`] node's F32 rows start: after the packed activations (`total`
+/// bytes), aligned to 256 bytes. Then `tokens` rows of `d * n_head` values (attention's output
+/// or, on the GB10 kernel, the gated values of the CTAs that finish a token first), then the
+/// kernel's per-token counters ([`codes_sync`]).
+fn codes_scratch(total: usize) -> usize {
+    total.next_multiple_of(256)
+}
+
+/// Bytes of the GB10 kernel's per-token counters: a ticket, a done count and the amax bits.
+fn codes_sync(tokens: i64) -> usize {
+    12 * tokens as usize
+}
+
 /// Most tokens a step may have for the split decode kernel.
 pub const DECODE_TOKENS: i64 = 64;
 /// Parts each token's selection is split into in decode and verify steps.
@@ -636,7 +906,9 @@ pub enum PromptKernel {
     GwOneL1 = 10,
 }
 
-/// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
+/// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`). A graph
+/// whose query [`fold_q`] folded (built under [`PromptKernel::Auto`]) then fails to compute
+/// rather than run another kernel: build it again after forcing one.
 #[cfg(feature = "cuda")]
 pub fn set_prompt_kernel(k: PromptKernel) {
     PROMPT_KERNEL.store(k as u8, std::sync::atomic::Ordering::Relaxed);
@@ -788,9 +1060,25 @@ fn select_row(
 }
 
 unsafe fn cpu_select(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    // SAFETY: a node made by `select`, host tensors.
+    // SAFETY: a node made by `select_rows`.
+    unsafe { cpu_select_at(dst, 0, 0, ith, nth) }
+}
+
+unsafe fn cpu_select_into(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    let first = crate::ggml::external_params(dst)[0] as usize;
+    // SAFETY: a node made by `select_into`: its operands follow the rows it writes over.
+    unsafe { cpu_select_at(dst, 1, first, ith, nth) }
+}
+
+/// [`select`]'s rows on the host for the operands at `dst.src[s0..s0 + 5]`, token `t` of them
+/// into row `first + t` of `dst`.
+///
+/// # Safety
+/// A node made by [`select_rows`] (`s0` 0) or [`select_into`] (1), host tensors.
+unsafe fn cpu_select_at(dst: &ffi::ggml_tensor, s0: usize, first: usize, ith: usize, nth: usize) {
+    // SAFETY: the caller's.
     unsafe {
-        let src = |i: usize| &*dst.src[i];
+        let src = |i: usize| &*dst.src[s0 + i];
         let (top, score, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
         let (n_top, ng) = (top.ne[0] as usize, top.ne[1] as usize);
         let kpool = pidx.ne[0] as usize;
@@ -807,7 +1095,7 @@ unsafe fn cpu_select(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             );
             let p = at_i32((pos.data as *const u8).add(t * pos.nb[0]), 0);
             let out = std::slice::from_raw_parts_mut(
-                (dst.data as *mut u8).add(t * dst.nb[1]) as *mut i32,
+                (dst.data as *mut u8).add((first + t) * dst.nb[1]) as *mut i32,
                 row_len,
             );
             select_row(
@@ -1101,55 +1389,154 @@ unsafe fn cpu_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: called by ggml for a node made by `attention`, with host tensors.
     unsafe {
         let o = Operands::of(dst);
+        let rows = o.n_seqs * o.n_tok * o.n_head;
+        let mut buf = RowBuf::new(o.d);
+        for row in (ith..rows).step_by(nth) {
+            cpu_row(&o, row, &mut buf);
+        }
+    }
+}
+
+/// [`cpu_row`]'s scratch.
+struct RowBuf {
+    kf: Vec<f32>,
+    q: Vec<f32>,
+    scores: Vec<f32>,
+    out: Vec<f32>,
+}
+
+impl RowBuf {
+    fn new(d: usize) -> Self {
+        Self {
+            kf: vec![0f32; d],
+            q: vec![0f32; d],
+            scores: Vec::new(),
+            out: vec![0f32; d],
+        }
+    }
+}
+
+/// [`cpu_attn`]'s output row `row` (token `row / n_head`, head `row % n_head`), written to
+/// `o.dst`.
+///
+/// # Safety
+/// `o` read from a node made by [`attention`] or [`gated_codes`], with host tensors.
+unsafe fn cpu_row(o: &Operands, row: usize, buf: &mut RowBuf) {
+    // SAFETY: the caller's.
+    unsafe {
         let g = o.n_head / o.n_head_kv;
         let scale = 1.0 / (o.d as f32).sqrt();
-        let rows = o.n_seqs * o.n_tok * o.n_head;
-        let mut kf = vec![0f32; o.d];
-        let mut q = vec![0f32; o.d];
-        let mut scores = Vec::new();
-        let mut out = vec![0f32; o.d];
-        for row in (ith..rows).step_by(nth) {
-            let h = row % o.n_head;
-            let tok = row / o.n_head;
-            let (s, t) = (tok / o.n_tok, tok % o.n_tok);
-            let kvh = h / g;
-            q.copy_from_slice(std::slice::from_raw_parts(
-                o.q.add(s * o.q_nb[3] + t * o.q_nb[2] + h * o.q_nb[1]) as *const f32,
-                o.d,
-            ));
-            round_f16(&mut q);
-            let sel = o.sel.add(tok * o.sel_row);
-            let n = *sel as usize;
-            let ids = std::slice::from_raw_parts(sel.add(1), n);
-            let cell = |p: i32| {
-                let p = p as usize;
-                let b = *o.table.add(s * o.table_width + p / KV_BLOCK) as usize;
-                b * KV_BLOCK + p % KV_BLOCK
-            };
-            scores.clear();
-            for &p in ids {
-                read_head(o.k, o.k_type, o.k_nb1, cell(p), kvh, &mut kf);
-                let dot: f32 = q.iter().zip(&kf).map(|(a, b)| a * b).sum();
-                scores.push(dot * scale);
+        let h = row % o.n_head;
+        let tok = row / o.n_head;
+        let (s, t) = (tok / o.n_tok, tok % o.n_tok);
+        let kvh = h / g;
+        buf.q.copy_from_slice(std::slice::from_raw_parts(
+            o.q.add(s * o.q_nb[3] + t * o.q_nb[2] + h * o.q_nb[1]) as *const f32,
+            o.d,
+        ));
+        round_f16(&mut buf.q);
+        let sel = o.sel.add(tok * o.sel_row);
+        let n = *sel as usize;
+        let ids = std::slice::from_raw_parts(sel.add(1), n);
+        let cell = |p: i32| {
+            let p = p as usize;
+            let b = *o.table.add(s * o.table_width + p / KV_BLOCK) as usize;
+            b * KV_BLOCK + p % KV_BLOCK
+        };
+        buf.scores.clear();
+        for &p in ids {
+            read_head(o.k, o.k_type, o.k_nb1, cell(p), kvh, &mut buf.kf);
+            let dot: f32 = buf.q.iter().zip(&buf.kf).map(|(a, b)| a * b).sum();
+            buf.scores.push(dot * scale);
+        }
+        let max = buf.scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for x in &mut buf.scores {
+            *x = (*x - max).exp();
+            sum += *x;
+        }
+        for x in &mut buf.scores {
+            *x /= sum;
+        }
+        round_f16(&mut buf.scores);
+        buf.out.fill(0.0);
+        for (&p, w) in ids.iter().zip(&buf.scores) {
+            read_head(o.v, o.v_type, o.v_nb1, cell(p), kvh, &mut buf.kf);
+            for (acc, x) in buf.out.iter_mut().zip(&buf.kf) {
+                *acc += w * x;
             }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0;
-            for x in &mut scores {
-                *x = (*x - max).exp();
-                sum += *x;
+        }
+        std::slice::from_raw_parts_mut(o.dst.add(row * o.d), o.d).copy_from_slice(&buf.out);
+    }
+}
+
+/// A [`gated_codes`] node's pieces: the attention operands (their output in the node's F32
+/// rows), the gate (`src[5]`: its data, head and token strides in floats), the codes and the
+/// scales.
+struct CodesOperands {
+    attn: Operands,
+    gate: *const f32,
+    gate_hd: usize,
+    gate_ld: usize,
+    codes: *mut u8,
+    scales: *mut f32,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    sync: *mut u32,
+}
+
+impl CodesOperands {
+    /// # Safety
+    /// `dst` must be a node made by [`gated_codes`].
+    unsafe fn of(dst: &ffi::ggml_tensor) -> Self {
+        // SAFETY: the caller's; the pieces lie in the node as `gated_codes` sized it.
+        unsafe {
+            let mut attn = Operands::of(dst);
+            let (k, tokens) = (attn.d * attn.n_head, attn.n_tok * attn.n_seqs);
+            let (codes, total) = crate::model::fp8::dynamic_layout(k as i64, tokens as i64);
+            let base = dst.data as *mut u8;
+            let scratch = codes_scratch(total);
+            attn.dst = base.add(scratch) as *mut f32;
+            let gate = &*dst.src[5];
+            Self {
+                attn,
+                gate: gate.data as *const f32,
+                gate_hd: gate.nb[1] / 4,
+                gate_ld: gate.nb[2] / 4,
+                codes: base,
+                scales: base.add(codes) as *mut f32,
+                sync: base.add(scratch + 4 * k * tokens) as *mut u32,
             }
-            for x in &mut scores {
-                *x /= sum;
+        }
+    }
+}
+
+/// The CPU implementation of [`gated_codes`]: per token, [`cpu_attn`]'s rows of every head,
+/// then [`crate::model::fp8_act`]'s gate and [`crate::model::fp8::quantize_token`] of them.
+unsafe fn cpu_attn_codes(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: called by ggml for a node made by `gated_codes`, with host tensors.
+    unsafe {
+        // `fold_q` takes CUDA nodes only.
+        assert!(
+            crate::ggml::external_params(dst)[P_FOLD] == 0,
+            "qsa_attn_codes: a folded query on the CPU"
+        );
+        let c = CodesOperands::of(dst);
+        let o = &c.attn;
+        let (d, k, tokens) = (o.d, o.d * o.n_head, o.n_tok * o.n_seqs);
+        let mut buf = RowBuf::new(d);
+        let mut y = vec![0f32; k];
+        for tok in (ith..tokens).step_by(nth) {
+            for h in 0..o.n_head {
+                cpu_row(o, tok * o.n_head + h, &mut buf);
             }
-            round_f16(&mut scores);
-            out.fill(0.0);
-            for (&p, w) in ids.iter().zip(&scores) {
-                read_head(o.v, o.v_type, o.v_nb1, cell(p), kvh, &mut kf);
-                for (acc, x) in out.iter_mut().zip(&kf) {
-                    *acc += w * x;
-                }
+            let rows = std::slice::from_raw_parts(o.dst.add(tok * k), k);
+            for (i, v) in y.iter_mut().enumerate() {
+                let x = *c.gate.add(tok * c.gate_ld + (i / d) * c.gate_hd + i % d);
+                *v = crate::model::fp8_act::gated_host(x, rows[i], false);
             }
-            std::slice::from_raw_parts_mut(o.dst.add(row * o.d), o.d).copy_from_slice(&out);
+            let (q, s) = crate::model::fp8::quantize_token(&y);
+            std::ptr::copy_nonoverlapping(q.as_ptr(), c.codes.add(tok * k), k);
+            c.scales.add(tok).write_unaligned(s);
         }
     }
 }
@@ -1239,6 +1626,29 @@ mod cuda {
         /// 1: `attn_gw_kernel` copies with `cp.async.cg` (`LEGION_DEBUG_QSA_GW_L1=0`), 0
         /// through L1.
         pub gw_cg: i32,
+        /// [`super::gated_codes`] (null: off): the gate (strides in floats), the codes and
+        /// scales written instead of the output, and the kernel's zeroed per-token counters.
+        pub gate: *const f32,
+        pub gate_ld: i64,
+        pub gate_hd: i64,
+        pub codes: *mut u8,
+        pub scales: *mut f32,
+        pub sync: *mut u32,
+        /// [`super::fold_q`] (null: off): `q` is the query before its head norm (weight `qn_w`)
+        /// and RoPE (positions `qn_pos`, section `s` of token `t` at `t + s * qn_pos_n`), which
+        /// the GB10 kernel computes as ggml-cuda does.
+        pub qn_w: *const f32,
+        pub qn_pos: *const i32,
+        pub qn_pos_n: i32,
+        pub qn_eps: f32,
+        pub qn_rot: i32,
+        pub qn_sections: [i32; 4],
+        pub qn_imrope: i32,
+        pub qn_freq_base: f32,
+        pub qn_freq_scale: f32,
+        pub qn_attn_factor: f32,
+        /// Set by the launcher.
+        pub qn_theta_scale: f32,
     }
 
     #[repr(C)]
@@ -1301,6 +1711,7 @@ mod cuda {
         pub fn legion_qsa_pool_mask_launch(p: *const PoolMask, stream: *mut c_void) -> i32;
         pub fn legion_qsa_select_launch(p: *const Select, stream: *mut c_void) -> i32;
         pub fn legion_qsa_attn_launch(p: *const Attn, stream: *mut c_void) -> i32;
+        pub fn cudaMemsetAsync(p: *mut c_void, v: i32, n: usize, stream: *mut c_void) -> i32;
     }
 }
 
@@ -1339,9 +1750,32 @@ unsafe fn cuda_pool_mask(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_select(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node made by `select`, device tensors of the stream's device.
+    // SAFETY: a node made by `select_rows`.
+    unsafe { cuda_select_at(dst, 0, 0, stream) }
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_select_into(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    let first = crate::ggml::external_params(dst)[0] as usize;
+    // SAFETY: a node made by `select_into`: its operands follow the rows it writes over.
+    unsafe { cuda_select_at(dst, 1, first, stream) }
+}
+
+/// [`cpu_select_at`] on CUDA.
+///
+/// # Safety
+/// A node made by [`select_rows`] (`s0` 0) or [`select_into`] (1), device tensors of the
+/// stream's device.
+#[cfg(feature = "cuda")]
+unsafe fn cuda_select_at(
+    dst: &ffi::ggml_tensor,
+    s0: usize,
+    first: usize,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
     unsafe {
-        let src = |i: usize| &*dst.src[i];
+        let src = |i: usize| &*dst.src[s0 + i];
         let (top, score, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
         let n_top = top.ne[0] as usize;
         if n_top > CUDA_MAX_TOP {
@@ -1360,7 +1794,7 @@ unsafe fn cuda_select(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(),
             tail_nb1: tail.nb[1] as i64,
             pos: pos.data as *const i32,
             pos_nb0: pos.nb[0] as i64,
-            dst: dst.data as *mut i32,
+            dst: (dst.data as *mut u8).add(first * dst.nb[1]) as *mut i32,
             dst_nb1: dst.nb[1] as i64,
             n_top: n_top as i32,
             kpool: pidx.ne[0] as i32,
@@ -1457,6 +1891,109 @@ unsafe fn cuda_select_vis(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
 unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node made by `attention`, device tensors of the stream's device.
     let o = unsafe { Operands::of(dst) };
+    let p = attn_params(&o)?;
+    let r = launched("qsa_attn", unsafe {
+        cuda::legion_qsa_attn_launch(&p, stream)
+    });
+    if r.is_ok() {
+        // SAFETY: the node's operands.
+        unsafe { after_attn(&o, stream) };
+    }
+    r
+}
+
+/// [`gated_codes`] on CUDA: the prompt kernel writes the codes where it can (the GB10's
+/// `attn_gw_kernel`); where another kernel ran (it wrote the output to the node's F32 rows),
+/// [`crate::model::fp8_act::gate`]'s kernel quantizes those rows.
+#[cfg(feature = "cuda")]
+unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `gated_codes`, device tensors of the stream's device.
+    let c = unsafe { CodesOperands::of(dst) };
+    let o = &c.attn;
+    let (k, tokens) = ((o.d * o.n_head) as i64, (o.n_tok * o.n_seqs) as i64);
+    let mut p = attn_params(o)?;
+    p.gate = c.gate;
+    p.gate_hd = c.gate_hd as i64;
+    p.gate_ld = c.gate_ld as i64;
+    p.codes = c.codes;
+    p.scales = c.scales;
+    p.sync = c.sync;
+    // SAFETY: a `gated_codes` node; `fold_q`'s tensors are the node's, allocated.
+    if let Some(f) = unsafe { folded(dst) } {
+        // ggml's norm and RoPE nodes are off, so only the fold's kernel makes this query:
+        // a kernel forced after the rewrite is refused, not silently replaced by it.
+        if p.mma_kernel != 0 || p.gw_cg != 0 {
+            let why = "qsa_attn_codes: a prompt kernel was forced after node_fuse folded the \
+                       query under the launcher's choice; build the graph again";
+            return Err(why.into());
+        }
+        // SAFETY: `fold_q`'s sources: the query before the norm (`f.off` tokens in, as the
+        // attention's query viewed the RoPE's output), the weight and the positions.
+        unsafe {
+            let (raw, pos) = (&*f.raw, &*f.pos);
+            p.q = (raw.data as *const u8).add(f.off as usize * raw.nb[2]) as *const f32;
+            p.q_nb1 = raw.nb[1] as i64;
+            p.q_nb2 = raw.nb[2] as i64;
+            p.q_nb3 = (raw.nb[2] * o.n_tok) as i64;
+            p.qn_w = (*f.w).data as *const f32;
+            p.qn_pos = (pos.data as *const i32).add(f.off as usize);
+            p.qn_pos_n = (pos.ne[0] / 4) as i32;
+        }
+        p.qn_eps = f.eps;
+        p.qn_rot = f.n_dims;
+        p.qn_sections = f.sections;
+        p.qn_imrope = f.imrope as i32;
+        p.qn_freq_base = f.freq_base;
+        p.qn_freq_scale = f.freq_scale;
+        p.qn_attn_factor = f.attn_factor;
+    }
+    // SAFETY: the node's counters, `codes_sync(tokens)` bytes.
+    let e = unsafe { cuda::cudaMemsetAsync(c.sync as *mut c_void, 0, codes_sync(tokens), stream) };
+    if e != 0 {
+        return Err(format!("qsa_attn_codes: cudaMemsetAsync failed ({e})"));
+    }
+    // SAFETY: the parameters' device pointers.
+    let r = match unsafe { cuda::legion_qsa_attn_launch(&p, stream) } {
+        3 => {
+            // SAFETY: the node's gate, rows, codes and scales, as `gated_codes` sized them.
+            let r = unsafe {
+                crate::model::fp8_act::gate_raw(
+                    (c.gate, c.gate_hd as i64, c.gate_ld as i64, o.d as i32),
+                    (o.dst as *const f32, k),
+                    c.codes,
+                    c.scales,
+                    (k, tokens),
+                    false,
+                    stream,
+                )
+            };
+            launched("qsa_attn_codes (fp8_act gate)", r)
+        }
+        r => launched("qsa_attn_codes", r),
+    };
+    if r.is_ok() {
+        // SAFETY: the node's operands.
+        unsafe { after_attn(o, stream) };
+    }
+    r
+}
+
+/// What follows a prompt step's attention launch: the selections' dump where it is on.
+///
+/// # Safety
+/// `o` read from a live node on the stream's device.
+#[cfg(feature = "cuda")]
+unsafe fn after_attn(o: &Operands, stream: *mut c_void) {
+    let tokens = o.n_tok * o.n_seqs;
+    if tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
+        // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
+        unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
+    }
+}
+
+/// The launch parameters of the attention op whose operands are `o` (no codes).
+#[cfg(feature = "cuda")]
+fn attn_params(o: &Operands) -> Result<cuda::Attn, String> {
     if !supported(o.d as i64, o.n_head as i64, o.n_head_kv as i64) {
         return Err(format!(
             "qsa_attn: unsupported shape: head size {}, {} heads over {} kv heads",
@@ -1507,22 +2044,35 @@ unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), S
         hgroups: decode_hgroups(),
         mma_kernel: prompt_kernel() as i32,
         gw_cg: gw_cg() as i32,
+        gate: std::ptr::null(),
+        gate_ld: 0,
+        gate_hd: 0,
+        codes: std::ptr::null_mut(),
+        scales: std::ptr::null_mut(),
+        sync: std::ptr::null_mut(),
+        qn_w: std::ptr::null(),
+        qn_pos: std::ptr::null(),
+        qn_pos_n: 0,
+        qn_eps: 0.0,
+        qn_rot: 0,
+        qn_sections: [0; 4],
+        qn_imrope: 0,
+        qn_freq_base: 0.0,
+        qn_freq_scale: 0.0,
+        qn_attn_factor: 0.0,
+        qn_theta_scale: 0.0,
     };
-    let r = launched("qsa_attn", unsafe {
-        cuda::legion_qsa_attn_launch(&p, stream)
-    });
-    let tokens = o.n_tok * o.n_seqs;
-    if r.is_ok() && tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
-        // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
-        unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
-    }
-    r
+    Ok(p)
 }
 
 #[cfg(any(test, feature = "cuda"))]
 pub mod bench;
+#[cfg(test)]
+mod codes_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod decode_tests;
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod quant_tests;
 pub mod sel_dump;

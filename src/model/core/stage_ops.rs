@@ -38,6 +38,7 @@ pub(crate) const PURE: &[&str] = &[
     "ple_conv",
     "qsa_pool_mask",
     "qsa_select",
+    "qsa_select_into",
     "qsa_select_all",
     "qsa_scores",
     "qsa_scores_exact",
