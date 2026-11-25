@@ -190,9 +190,33 @@ and the answer sha must equal the cold-computed sha.
     already falls back to a shallower boundary) and no format change. Tracked as C6.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
-  hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
+  batched reader I/O, now with a price
   tag (verification is the ~112 MB/s floor above, reads are not); the ~45 s wait a
   full-window session pays before its first window even when nothing is being hydrated.
   Post-C5 re-arms this last one: a RAM-resident full-window follow-up should be timed again
   - if its first-window wait is still ~45 s with no hydration involved, it is a separate
   scheduler issue and the C5 thread count is not its lever.
+
+## Stats and C6 (2026-11-25 late)
+
+- **Hydrate accounting is live** (`6e6f9f1`, fixed by `6b794ae`): `/health` carries a
+  `conv_tier` object (walks, chains_present, blobs_ok/mismatch, states_ok/bad, alloc/upload
+  fails, revive_aborts, tokens/bytes hydrated), the oMLX `cache/stats.py` counterpart. The
+  first deploy kept saying null because every route reaches the engine through
+  `MeteredEngine`, which swallowed the new trait method with its default - the wrapper now
+  forwards it. Verified live: a three-revive sequence moved walks 3->7, tokens_hydrated
+  +769,792 (3 x 261,888 minus tails), blobs_ok +12,028 (3 x 4,009), no failures.
+- **The state column is incompressible, proven** (231 adjacent boundary-state pairs:
+  11.4% equal bytes, diff-zeroing + lzma saves 1.6%, whole-file lzma ~6%). GDN recurrent
+  state is dense-updated; storage-level deltas and generic compression are both dead. The
+  surviving lever was always policy.
+- **C6 landed** (`9db3a2d`): spaced checkpoints are thinned on the way to the disk
+  (`--conv-disk-state-stride`, default 8) - every anchor, the last four spaced points of a
+  prompt, one per stride older. The revive walk already cut back to the deepest boundary
+  holding a state, so thinning costs at most one stride of re-prefill and never a miss;
+  no format change. 2-card dev: a 131K session parked 6 states instead of 16 (depths
+  65536/98304/106496/114688/122880/130944) and 2,065 blocks unchanged; after a restart the
+  same request revived in 9.1 s (cold 135.5), hydrated exactly the deepest kept boundary
+  (+130,944 tokens, +2,046 blobs), answer sha bit-identical, zero mismatches. Parked cost
+  per full-window conversation: 8.6 GiB -> ~6.5 GiB (~30 sessions inside the 200 GiB cap).
+  Production boot 22:5x CST carries it; gates (det x3, image, undeclared) all pass.
