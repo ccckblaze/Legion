@@ -311,20 +311,33 @@ an unbounded writer queue during a big eviction storm. `0` restores the unbounde
 `Sha256::update` reset `buf_len` to the remainder instead of adding to it, so a stream
 ending with a partly-filled block after a prior non-empty buffer dropped the tail bytes -
 `sha256(b"abc")` was wrong. It is unreachable for the product paths: chain hashes run on
-256-byte token blocks and blob keys on word-aligned byte counts, both multiples of the
-64-byte block, so the buffer is never partly filled at finish. Verified: identical digests
-before/after the fix across those producers - existing tier data stays valid, nothing
-needs re-signing. It only becomes live the moment a new caller hashes arbitrary lengths,
-which the added `sha256_vectors` test (FIPS vectors incl. the "abc" and multi-block cases)
-now guarantees.
+256-byte token blocks and blob keys on block-sized byte counts (1,228,800 B - a multiple
+of 64), so those digests are identical before/after the fix and the 39,940 block keys stay
+valid. The state sidecars are NOT: their lengths carry tails (e.g. 118,038,536 % 64 = 8),
+so every pre-fix state key in a manifest is the buggy digest of its bytes, and the fixed
+engine fails verification - which surfaces not as corruption but as `states_bad` and
+`revive_aborts` with zero hydration (`bf930f3` added the warn line naming it). Repair:
+`eval/ct-rekey-states.py <tier-dir>` recomputes state keys from the file bytes and
+rewrites the shards atomically; run it with the lane stopped, once per tier
+(dev2: 61/61, prod: 368/368 re-keyed, blocks untouched - the script counts tail-sized
+block entries and only re-hashes those with `--deep`). Both lanes revived green after it.
+The added `sha256_vectors` test (FIPS vectors incl. the "abc" and multi-block cases)
+guards the fixed path.
 
 ### L2 verification sequence (server)
 
 1. `cargo test --release --features cuda --lib conv_tier` - all green (6 tests incl. the
    two new: `sha256_vectors`, `pack_fingerprint_tracks_content`; `scan_migrates_v3_and_gates_by_pack`
    pins the re-sign + v4-foreign semantics).
-2. dev :8092 reboot: `conv tier: live ... (0 missing, 0 foreign, 18461 v3 migrated)`
-   expected on the dev2 tier, plus the pending-clear line; one par revive round, wall in
-   the 66 s band, errs 0.
-3. prod 4-card cutover to the new binary, `gate.sh 4` (det×3, acc, IMG, undecl) before
-   handback.
+2. dev :8092: stop, `ct-rekey-states.py` (61/61), boot the L2 binary - `conv tier: live
+   18493 blocks 61 states 21.2 GiB (0 missing, 0 foreign, 18554 v3 migrated)`, par revive
+   round `wall 74.7 s` (D1 band, prod traffic shares the box), `hydrated` x7, errs 0.
+   First dev boots had FAILED with `revive_aborts` = every walk (the state-key story
+   above) - the par wall looked "slow", it was actually zero hydration + cold re-prefill.
+3. prod 4-card: stop, rekey (368/368), boot `bin-L2` (`bf930f3`), live line green;
+   `gate.sh 4 L2rekey` (det×3, acc, IMG, undecl) before handback.
+
+Note on the lane script: `legion-lane.sh 2` reads `lane.env` unless
+`LEGION_LANE_ENV=/data/work/legion/lane-dev.env` is prefixed - without it a "dev" boot
+carries the prod port and tier and dies on the bind (`Address already in use` on :8090,
+logged before "listening"). Always prefix dev lane actions.
