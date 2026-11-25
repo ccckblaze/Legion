@@ -25,7 +25,7 @@ fn tools() -> Vec<Tool> {
 }
 
 fn parse(body: &str) -> Option<(String, Value)> {
-    parse_glm(body, &tools()).map(|(n, a)| (n, serde_json::from_str(&a).unwrap()))
+    parse_glm(body, &tools(), false).map(|(n, a)| (n, serde_json::from_str(&a).unwrap()))
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn rejects_what_is_not_a_call() {
 
 #[test]
 fn streams_calls_out_of_the_text() {
-    let mut p = GlmParser::new(&tools());
+    let mut p = GlmParser::new(&tools(), false);
     let text = "Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\n<tool_call>now</tool_call>";
     let mut events = Vec::new();
     for c in text.chars() {

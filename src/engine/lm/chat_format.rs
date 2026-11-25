@@ -10,7 +10,8 @@ use crate::tokenizer::Tokenizer;
 pub(super) struct ChatFormat {
     reasoning: (&'static str, &'static str),
     prompt_reasoning: PromptReasoning,
-    tools: fn(&[Tool]) -> Box<dyn ToolParser>,
+    /// `(tools, hand undeclared names to the client) -> parser` ([`ChatFormat::tool_parser`]).
+    tools: fn(&[Tool], bool) -> Box<dyn ToolParser>,
     extra_stop_tokens: Vec<u32>,
     /// The `<tool_call>` and `</tool_call>` tokens of a vocabulary whose tool calls are in the
     /// Qwen3-Coder format, which strict tools constrain; `None`: strict is not enforced.
@@ -36,12 +37,12 @@ impl ChatFormat {
         let glm = ["<tool_call>", "<arg_key>", "<arg_value>"]
             .iter()
             .all(|t| tok.token_id(t).is_some());
-        let tools: fn(&[Tool]) -> Box<dyn ToolParser> = if gemma4 {
-            |tools| Box::new(Gemma4Parser::new(tools))
+        let tools: fn(&[Tool], bool) -> Box<dyn ToolParser> = if gemma4 {
+            |tools, call_undeclared| Box::new(Gemma4Parser::new(tools, call_undeclared))
         } else if glm {
-            |tools| Box::new(GlmParser::new(tools))
+            |tools, call_undeclared| Box::new(GlmParser::new(tools, call_undeclared))
         } else {
-            |tools| Box::new(Qwen3CoderParser::new(tools))
+            |tools, call_undeclared| Box::new(Qwen3CoderParser::new(tools, call_undeclared))
         };
         let (reasoning, prompt_reasoning) = if gemma4 {
             // Gemma 4 opens its own thought channel; even a template with thinking off
@@ -115,8 +116,9 @@ impl ChatFormat {
         ReasoningParser::new(self.reasoning.0, self.reasoning.1, inside)
     }
 
-    pub(super) fn tool_parser(&self, tools: &[Tool]) -> Box<dyn ToolParser> {
-        (self.tools)(tools)
+    /// The reply's parser for `tools`; `call_undeclared` is `--undeclared-tool-calls call`.
+    pub(super) fn tool_parser(&self, tools: &[Tool], call_undeclared: bool) -> Box<dyn ToolParser> {
+        (self.tools)(tools, call_undeclared)
     }
 
     pub(super) fn stop_tokens(&self, tok: &Tokenizer) -> Vec<u32> {
