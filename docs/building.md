@@ -53,7 +53,7 @@ The full machine setup (RHEL 8, kernel, driver, NVLink) is in [ac922.md](ac922.m
   on this box (observed 2026-11-25, at every upstream commit, including ones that boot fine when
   built on 1.99.1). Build on the same `rustc 1.99.1` the numbers were made with: on the AC922 it
   lives in `/opt/rust/bin` (from the official powerpc64le tarball), so `PATH=/opt/rust/bin:...`
-  and check `rustc --version` before trusting a rebuilt binary.
+  and check `rustc --version` before trusting a rebuilt binary. The repo pins the version in `rust-toolchain.toml`, but RHEL's module cargo is not rustup-driven and ignores that file: the check is the only guard.
 - ggml's CPU backend on POWER uses the VSX `vector` keyword, which needs GNU C++ (`gnu++17`).
   ggml sets `CMAKE_CXX_STANDARD 17` with cmake's default GNU extensions, so nothing extra is
   needed, but do not force `CMAKE_CXX_EXTENSIONS=OFF`.
