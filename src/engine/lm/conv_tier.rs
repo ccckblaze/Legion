@@ -909,6 +909,246 @@ pub fn read_verified_window(dir: &Path, items: &[(&str, String, u64)], threads: 
     out
 }
 
+/// What one conversation's hydrate needs, decided by walking the index (D1): the run's end,
+/// the deepest boundary with a length-matched state, and the blobs in between, chain-ordered.
+/// `plan` is the same walk `place()` ran inline before: a task takes it once, the engine
+/// re-plans when there is no task yet.
+#[derive(Clone, Debug)]
+pub struct HydratePlan {
+    /// The block the resume stands on: blobs start at `chains[start_pre]` in `block_chains`.
+    pub start: usize,
+    /// The chain run found on disk, capped by the prompt (for the walk counter and logs).
+    pub m: usize,
+    /// The chains to hydrate, ascending: `block_chains(prompt[..m*block])[start..j]`.
+    pub chains: Vec<String>,
+    /// The boundary state: (chain of the resume point, key, bytes); `None`: stateless model.
+    pub state: Option<(String, String, u64)>,
+}
+
+/// Where a hydrate plan's walk stopped failing, so the engine can bump the same counters
+/// the inline path did (state reads and blob reads have different ledgers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HydrateFault {
+    /// The state's bytes mismatched or vanished between plan and read.
+    State,
+    /// A blob's sha mismatched after it was indexed.
+    Blob,
+    /// A blob or state the plan named was no longer there (a trim race): not a fault of
+    /// integrity, the extension just aborts.
+    Gone,
+}
+
+/// One step's consumption from a running [`HydrateTask`] ([`HydrateTask::take`]).
+pub struct HydrateDelivery {
+    /// Verified blobs, chain-ordered (possibly empty while the producer is behind).
+    pub blobs: Vec<Vec<u8>>,
+    /// The state's bytes, delivered exactly once, after the last blob.
+    pub state: Option<Vec<u8>>,
+    /// Every blob and the state have been delivered: the engine may extend its table.
+    pub done: bool,
+    /// The plan died (a trim race or an integrity failure): abort, bump the fault's counter.
+    pub failed: Option<HydrateFault>,
+}
+
+/// The read+verify part of a hydrate, run ahead of the engine (D1): a producer thread reads
+/// and sha-verifies the plan's windows while the engine keeps stepping, and each `place()`
+/// attempt uploads what is ready, up to its budget. Cross-conversation hydrations overlap
+/// each other and the decode windows: before this, a burst of revive-heavy requests paid
+/// every session's full verify+upload serially on the engine thread (§366, §369).
+/// Pool blocks uploaded between steps are parked in the task, so a `Wait` retry loses
+/// nothing; when the job dies the engine sweeps the parked blocks back (abort + take_ids).
+pub struct HydrateTask {
+    plan: HydratePlan,
+    dir: PathBuf,
+    threads: usize,
+    /// Verified windows the engine has not taken: bounds the transient RAM at
+    /// `cap * VERIFY_WINDOW * block_bytes` per task (2 x 512 x ~1.2 MiB ~ 1.2 GiB).
+    cap: usize,
+    inner: Mutex<HydrateInner>,
+    room: std::sync::Condvar,
+}
+
+struct HydrateInner {
+    windows: std::collections::VecDeque<Vec<Vec<u8>>>,
+    produced: usize,
+    taken: usize,
+    state: Option<Vec<u8>>,
+    done: bool,
+    failed: Option<HydrateFault>,
+    aborted: bool,
+    /// Pool blocks the engine parked after uploading them, pending the table's extension.
+    ids: Vec<u32>,
+}
+
+impl HydrateTask {
+    /// The walk shared by `place()` (re-plan) and [`Self::start`] (one-shot): `None` when
+    /// there is nothing to hydrate (misaligned resume, no chain run, no state match).
+    pub fn plan(
+        tier: &ConvTier,
+        prompt: &[u32],
+        resumed: usize,
+        block: usize,
+        state_size: Option<u64>,
+    ) -> Option<HydratePlan> {
+        let len = prompt.len();
+        let start = resumed / block;
+        let cap = (len - 1) / block;
+        if resumed % block != 0 || start >= cap {
+            return None;
+        }
+        let m = chain_run(prompt, block, |c| tier.block(c).is_some()).min(cap).max(start);
+        tier.stats().note_walk(m as u64);
+        if m <= start {
+            return None;
+        }
+        let chains = block_chains(&prompt[..m * block], block);
+        let j = match state_size {
+            None => m,
+            Some(size) => (start + 1..=m)
+                .rev()
+                .find(|&i| tier.state(&chains[i - 1]).is_some_and(|e| e.bytes == size))
+                .unwrap_or(start),
+        };
+        if j <= start {
+            return None;
+        }
+        let state = match &state_size {
+            None => None,
+            Some(size) => tier
+                .state(&chains[j - 1])
+                .map(|e| (chains[j - 1].clone(), e.key, *size)),
+        };
+        Some(HydratePlan {
+            start,
+            m,
+            chains: chains[start..j].to_vec(),
+            state,
+        })
+    }
+
+    /// Spawn the producer thread for one plan. `tier` is cloned (it is an `Arc` shell):
+    /// the thread needs the index (a plan can race a trim between entries) and the directory.
+    pub fn start(tier: &ConvTier, plan: HydratePlan) -> Arc<Self> {
+        let task = Arc::new(Self {
+            dir: tier.cfg().dir.clone(),
+            threads: tier.cfg().verify_threads,
+            cap: 2,
+            plan,
+            inner: Mutex::new(HydrateInner {
+                windows: std::collections::VecDeque::new(),
+                produced: 0,
+                taken: 0,
+                state: None,
+                done: false,
+                failed: None,
+                aborted: false,
+                ids: Vec::new(),
+            }),
+            room: std::sync::Condvar::new(),
+        });
+        let producer = Arc::clone(&task);
+        let tier = tier.clone();
+        std::thread::spawn(move || producer.produce(&tier));
+        task
+    }
+
+    fn produce(self: Arc<Self>, tier: &ConvTier) {
+        let fail = |t: &Self, f: HydrateFault| {
+            let mut i = t.inner.lock().unwrap();
+            i.failed = Some(f);
+            i.done = true;
+            t.room.notify_all();
+        };
+        if let Some((chain, key, bytes)) = self.plan.state.clone() {
+            match read_state_verified(&self.dir, &chain, &key, bytes) {
+                Some(b) => self.inner.lock().unwrap().state = Some(b),
+                None if tier.state(&chain).is_none() => return fail(&self, HydrateFault::Gone),
+                None => return fail(&self, HydrateFault::State),
+            }
+        }
+        let mut at = 0usize;
+        while at < self.plan.chains.len() {
+            let end = (at + VERIFY_WINDOW).min(self.plan.chains.len());
+            let mut items: Vec<(&str, String, u64)> = Vec::with_capacity(end - at);
+            for chain in &self.plan.chains[at..end] {
+                match tier.block(chain) {
+                    Some(e) => items.push((chain.as_str(), e.key, e.bytes)),
+                    None => return fail(&self, HydrateFault::Gone),
+                }
+            }
+            let got = read_verified_window(&self.dir, &items, self.threads);
+            let mut blobs = Vec::with_capacity(end - at);
+            for g in got {
+                match g {
+                    Some(b) => blobs.push(b),
+                    None => return fail(&self, HydrateFault::Blob),
+                }
+            }
+            let mut i = self.inner.lock().unwrap();
+            while i.windows.len() >= self.cap && !i.aborted && i.failed.is_none() {
+                i = self.room.wait(i).unwrap();
+            }
+            if i.aborted || i.failed.is_some() {
+                return;
+            }
+            i.produced += blobs.len();
+            i.windows.push_back(blobs);
+            drop(i);
+            at = end;
+        }
+        let mut i = self.inner.lock().unwrap();
+        i.done = true;
+        self.room.notify_all();
+    }
+
+    /// Take up to `budget` verified blobs, chain-ordered, plus the state when this drains
+    /// the plan. Never blocks: an empty take just means the producer is behind.
+    pub fn take(&self, budget: usize) -> HydrateDelivery {
+        let mut i = self.inner.lock().unwrap();
+        if let Some(f) = i.failed {
+            return HydrateDelivery { blobs: Vec::new(), state: None, done: false, failed: Some(f) };
+        }
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        while blobs.len() < budget {
+            match i.windows.front_mut() {
+                Some(w) if !w.is_empty() => {
+                    blobs.push(w.remove(0));
+                    i.taken += 1;
+                }
+                Some(_) => {
+                    i.windows.pop_front();
+                }
+                None => break,
+            }
+        }
+        let done = i.done && i.windows.is_empty() && i.taken == i.produced;
+        let state = if done { i.state.take() } else { None };
+        self.room.notify_all();
+        HydrateDelivery { blobs, state, done, failed: None }
+    }
+
+    pub fn plan(&self) -> &HydratePlan {
+        &self.plan
+    }
+
+    /// Park this step's uploaded pool blocks so a `Wait` retry resumes from them.
+    pub fn park_ids(&self, ids: &[u32]) {
+        self.inner.lock().unwrap().ids.extend_from_slice(ids);
+    }
+
+    /// The engine's or the sweep's: the parked blocks leave the task for good.
+    pub fn take_ids(&self) -> Vec<u32> {
+        std::mem::take(&mut self.inner.lock().unwrap().ids)
+    }
+
+    /// Stop the producer (a dying job, or a plan aborted mid-drain).
+    pub fn abort(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.aborted = true;
+        self.room.notify_all();
+    }
+}
+
 /// SHA-256, self-contained (FIPS 180-4): the tier's only hash, for addresses and integrity.
 #[derive(Clone)]
 pub struct Sha256 {

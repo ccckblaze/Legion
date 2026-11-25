@@ -1527,6 +1527,15 @@ struct EngineArgs {
     /// re-prefill on the thinned tail, never a wrong answer (0: keep every point, §368 C6).
     #[arg(long, value_name = "N", default_value_t = 8)]
     conv_disk_state_stride: usize,
+    /// Conversation cold tier, hydrate (D1): upload at most this many verified blocks per
+    /// placement attempt; the rest of a full-window hydration streams across steps while the
+    /// decode windows keep running (0: upload the whole plan in one attempt, pre-D1 shape).
+    #[arg(long, value_name = "N", default_value_t = 256)]
+    conv_disk_hydrate_budget: usize,
+    /// Conversation cold tier, hydrate (D1): at most this many conversations hydrating at
+    /// once; each parks two verified windows (~1.2 GiB) of host RAM while waiting.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    conv_disk_hydrate_tasks: usize,
     #[arg(long, value_name = "N")]
     prefix_cache_states: Option<usize>,
     /// Model engine, prefix caching on a model with recurrent layers (Qwen3.5+, Flash-Next,
@@ -2239,6 +2248,8 @@ pub async fn run(
                 kv_slots: e.kv_slots,
                 kv_slot_stage_rows: e.kv_slot_stage_rows,
                 conv_disk,
+                conv_hydrate_budget: e.conv_disk_hydrate_budget,
+                conv_hydrate_tasks: e.conv_disk_hydrate_tasks,
                 prefix_cache_states,
                 prefix_cache_interval: e.prefix_cache_interval,
                 ring_checkpoints: e.ring_checkpoints,

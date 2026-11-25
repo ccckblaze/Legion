@@ -270,16 +270,26 @@ impl Worker {
     pub(super) fn resume<'t>(&mut self, mut seq: Box<Seq<'t>>, slot: usize) -> Resume<'t> {
         let len = seq.prompt.len();
         let take = self.admit_blocks(len, seq.need);
-        let p = match self.place(seq.cache_key(), take, slot) {
+        // A preemption that was still hydrating resumes its task; `cache_key` borrows the
+        // sequence, so the task travels through a local for the call.
+        let mut hydrate = seq.hydrate.take();
+        let p = match self.place(seq.cache_key(), take, slot, &mut hydrate) {
             Placement::Placed(p) => p,
-            Placement::Wait => return Resume::Wait(seq),
+            Placement::Wait => {
+                seq.hydrate = hydrate;
+                return Resume::Wait(seq);
+            }
             Placement::Failed(e) => {
+                if hydrate.is_some() {
+                    self.hydrate_abort(&mut hydrate, false);
+                }
                 // Where its text is: on the stream thread the error must follow the text queued
                 // before the preemption.
                 seq.active.fail(&mut self.outbox, e);
                 return Resume::Failed;
             }
         };
+        debug_assert!(hydrate.is_none(), "a resumed sequence leaves no live hydration");
         seq.blocks = p.table.blocks().iter().map(|b| b.0).collect();
         seq.table = p.table;
         seq.reserved = p.fresh;

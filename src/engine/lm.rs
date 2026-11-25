@@ -1210,6 +1210,13 @@ pub struct LmConfig {
     /// Conversation cold tier: `--conv-disk`, content-addressed KV blocks and state
     /// checkpoints on NVMe ([`conv_tier`]); `None`: the tier is off.
     pub conv_disk: Option<conv_tier::ConvDiskCfg>,
+    /// Cold-tier hydrate (D1): pool blocks one `place()` uploads before handing the step
+    /// back (`--conv-disk-hydrate-budget`). The disk reads and sha checks run ahead of the
+    /// engine on the task's producer, so this bounds only the engine-thread stall.
+    pub conv_hydrate_budget: usize,
+    /// Cold-tier hydrate (D1): at most this many conversations hydrating at once
+    /// (`--conv-disk-hydrate-tasks`); the rest place on memory alone, as before.
+    pub conv_hydrate_tasks: usize,
     /// Saved recurrent states for prefix caching; 0 turns prefix caching off.
     pub prefix_cache_states: usize,
     /// With prefix caching on a model with recurrent state: also save the state every this
@@ -1682,6 +1689,8 @@ impl LmConfig {
             kv_slots: KvSlots::Auto,
             kv_slot_stage_rows: KV_SLOT_STAGE_ROWS,
             conv_disk: None,
+            conv_hydrate_budget: 256,
+            conv_hydrate_tasks: 4,
             prefix_cache_states: 8,
             prefix_cache_interval: 0,
             ring_checkpoints: None,
@@ -1858,6 +1867,11 @@ struct Job {
     queued_at: Instant,
     /// Held while the job waits; dropped when it is admitted or discarded.
     _queued: QueueSlot,
+    /// The live cold-tier hydration ([`conv_tier::HydrateTask`], D1): spawned by the first
+    /// `place()` that finds a plan, carried across its `Wait` retries, cleared when the
+    /// extension lands or aborts. A job that dies parked keeps its uploaded blocks until
+    /// the step-head sweep returns them.
+    hydrate: Option<Arc<conv_tier::HydrateTask>>,
 }
 
 /// One place in the waiting queue; frees itself when dropped.
@@ -6326,6 +6340,10 @@ impl LmEngine {
             conv_tmpl,
             conv_saves: Vec::new(),
             prefix_interval: cfg.prefix_cache_interval,
+            hydrate_budget: cfg.conv_hydrate_budget,
+            hydrate_tasks: cfg.conv_hydrate_tasks,
+            parked: std::collections::HashMap::new(),
+            dropped: Vec::new(),
             gather: cfg.deterministic_gather,
             admit_gather: cfg.admit_gather,
             capture_cut: cfg.prefix_capture_cut,
@@ -6623,6 +6641,7 @@ impl LmEngine {
                 sched: p.sched,
                 queued_at: Instant::now(),
                 _queued: queued,
+                hydrate: None,
             })
             .map_err(|_| {
                 Refused::Failed(EngineError::Internal("the model worker stopped".into()))
@@ -6724,6 +6743,19 @@ struct Worker {
     conv_saves: Vec<(usize, String, u64)>,
     /// [`LmConfig::prefix_cache_interval`].
     prefix_interval: usize,
+    /// [`LmConfig::conv_hydrate_budget`] / [`LmConfig::conv_hydrate_tasks`] (D1).
+    hydrate_budget: usize,
+    hydrate_tasks: usize,
+    /// Live hydrations: task address -> (handle for the step-head sweep, pool blocks
+    /// uploaded and parked between steps). Entries die with their task: finalized,
+    /// aborted, or swept after the job holding it vanished.
+    parked: std::collections::HashMap<
+        usize,
+        (std::sync::Weak<conv_tier::HydrateTask>, Vec<u32>),
+    >,
+    /// Parked-task addresses whose job was dropped by this step's `retain`: the sweep at
+    /// the next step's head returns their blocks and stops their producers.
+    dropped: Vec<usize>,
     /// [`LmConfig::deterministic_gather`].
     gather: Option<std::time::Duration>,
     /// [`LmConfig::admit_gather`].
@@ -6909,6 +6941,9 @@ struct Seq<'t> {
     next: u32,
     /// Prompt positions at which to save the recurrent state for prefix caching, ascending.
     saves: Vec<(usize, SaveKind)>,
+    /// A resumed preemption's live cold-tier hydration ([`Job::hydrate`], D1): a preempted
+    /// sequence re-places through [`Worker::resume`], which may still owe uploads.
+    hydrate: Option<Arc<conv_tier::HydrateTask>>,
     started: Instant,
     /// The engine's model bytes when the sequence was admitted (#391): the request-done line
     /// reports the steps since.
@@ -7121,7 +7156,25 @@ impl Worker {
                     }
                 }
             }
-            waiting.retain(|w| w.keep(&mut self.outbox));
+            waiting.retain(|w| {
+                let keep = w.keep(&mut self.outbox);
+                if !keep && let Waiting::New(job) = w && let Some(t) = &job.hydrate {
+                    // A client that hangs up mid-hydrate: its parked blocks go back at the
+                    // sweep below and its producer stops at its next wake-up.
+                    self.dropped.push(Arc::as_ptr(t) as usize);
+                }
+                keep
+            });
+            for key in self.dropped.drain(..) {
+                if let Some((wk, ids)) = self.parked.remove(&key) {
+                    if let Some(t) = wk.upgrade() {
+                        t.abort();
+                    }
+                    for id in ids {
+                        self.pool.decref(BlockId(id));
+                    }
+                }
+            }
             self.warming_changed();
             // `on-demand`: room for the decoding sequences' next step, victims preempted.
             if self.on_demand()
@@ -7267,7 +7320,7 @@ impl Worker {
     fn admit<'t>(
         &mut self,
         tokenizer: &'t Tokenizer,
-        job: Job,
+        mut job: Job,
         ticket: Ticket,
         slot: usize,
     ) -> Admission<'t> {
@@ -7284,6 +7337,8 @@ impl Worker {
             return Admission::Failed(job, e.to_string());
         }
         let take = self.admit_blocks(len, need);
+        // The hydration (if any) is `place()`'s to drive; a `Wait` hands it back with the job.
+        let mut hydrate = job.hydrate.take();
         let Placed {
             table,
             fresh,
@@ -7295,11 +7350,21 @@ impl Worker {
             job.media.as_ref().map_or(&job.prompt, |(_, key)| key),
             take,
             slot,
+            &mut hydrate,
         ) {
             Placement::Placed(p) => p,
-            Placement::Wait => return Admission::Wait(job),
-            Placement::Failed(e) => return Admission::Failed(job, e),
+            Placement::Wait => {
+                job.hydrate = hydrate;
+                return Admission::Wait(job);
+            }
+            Placement::Failed(e) => {
+                if hydrate.is_some() {
+                    self.hydrate_abort(&mut hydrate, false);
+                }
+                return Admission::Failed(job, e);
+            }
         };
+        debug_assert!(hydrate.is_none(), "a placed sequence leaves no live hydration");
         let stateless = self.stateless();
         let mut seq = Seq {
             active: Active::new(
@@ -7341,6 +7406,7 @@ impl Worker {
             ngram: (self.spec_config.mtp_ngram > 0 && matches!(self.drafting, Drafting::Mtp(_)))
                 .then(|| crate::spec::mtp_ngram::MtpNgram::new(self.spec_config.mtp_ngram)),
             draft_ngram: None,
+            hydrate: None,
             ticket,
             need,
             resuming: false,
@@ -7366,10 +7432,40 @@ impl Worker {
         Admission::Admitted(Box::new(seq))
     }
 
+    /// Retire a live hydration (D1): stop its producer, return every parked pool block,
+    /// forget the entry. `count` marks it as a failed revive (a tier-side fault); room
+    /// shortages give the plan up silently, exactly as the inline path never ran at all.
+    fn hydrate_abort(&mut self, hydrate: &mut Option<Arc<conv_tier::HydrateTask>>, count: bool) {
+        if let Some(t) = hydrate.take() {
+            let ids = self
+                .parked
+                .remove(&(Arc::as_ptr(&t) as usize))
+                .map(|(_, ids)| ids)
+                .unwrap_or_default();
+            for id in ids {
+                self.pool.decref(BlockId(id));
+            }
+            t.abort();
+            if count {
+                if let Some(tier) = &self.conv {
+                    tier.stats()
+                        .revive_aborts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// Places `prompt` in prefill slot `slot`: matches it against the prefix cache and the
     /// warm sequences, reserves its `take` blocks (less those it resumes from), and sets up
     /// its ring, KV slot and recurrent state.
-    fn place(&mut self, prompt: &[u32], take: usize, slot: usize) -> Placement {
+    fn place(
+        &mut self,
+        prompt: &[u32],
+        take: usize,
+        slot: usize,
+        hydrate: &mut Option<Arc<conv_tier::HydrateTask>>,
+    ) -> Placement {
         let len = prompt.len();
         // Longest cached prefix with a saved state, block-aligned, leaving at least one prompt
         // token to compute (its logits start the reply). A model without recurrent state
@@ -7422,46 +7518,38 @@ impl Worker {
         } else if self.warm_on && !self.warm.is_empty() && self.ring_ckpts_log {
             self.log_warm_miss(prompt);
         }
-        // The cold tier's hydrate: past what memory holds, up the chain run on disk,
-        // cut back to the furthest boundary whose saved state the tier has (stateless
-        // models need none). Only from a block-aligned resume, and under the radix's
-        // own rule: leave one prompt token to compute.
-        let mut conv_run: Vec<String> = Vec::new();
-        let mut conv_state: Option<String> = None;
-        if let Some(tier) = &self.conv {
-            let start = resumed / KV_BLOCK;
-            let cap = (len - 1) / KV_BLOCK;
-            if resumed % KV_BLOCK == 0 && start < cap {
-                let m = conv_tier::chain_run(prompt, KV_BLOCK, |c| tier.block(c).is_some())
-                    .min(cap)
-                    .max(start);
-                tier.stats().note_walk(m as u64);
-                if m > start {
-                    let chains = conv_tier::block_chains(&prompt[..m * KV_BLOCK], KV_BLOCK);
-                    let j = if self.stateless() {
-                        m
-                    } else {
-                        let size = self.exec.conv_state_size() as u64;
-                        (start + 1..=m)
-                            .rev()
-                            .find(|&i| tier.state(&chains[i - 1]).is_some_and(|e| e.bytes == size))
-                            .unwrap_or(start)
-                    };
-                    if j > start {
-                        conv_run = chains[start..j].to_vec();
-                        conv_state = if self.stateless() {
-                            None
-                        } else {
-                            Some(chains[j - 1].clone())
-                        };
-                    }
-                }
-            }
+        // The cold tier's hydrate (D1): a standing task reads and verifies the chain run
+        // ahead of the engine - past what memory holds, cut back to the furthest boundary
+        // whose saved state the tier has (stateless models need none), the same walk the
+        // inline path ran. Each attempt uploads what is ready, up to `hydrate_budget`
+        // blocks, and waits for the rest: cross-conversation hydrations, and the disk and
+        // hashing work itself, overlap the decode windows instead of serializing on the
+        // engine thread (§366's burst wall).
+        let state_size = if stateless {
+            None
+        } else {
+            Some(self.exec.conv_state_size() as u64)
+        };
+        if hydrate.is_none()
+            && let Some(tier) = &self.conv
+            && resumed % KV_BLOCK == 0
+            && (len - 1) / KV_BLOCK > resumed / KV_BLOCK
+            && self.parked.len() < self.hydrate_tasks
+            && let Some(plan) =
+                conv_tier::HydrateTask::plan(tier, prompt, resumed, KV_BLOCK, state_size)
+        {
+            let t = conv_tier::HydrateTask::start(tier, plan);
+            let key = Arc::as_ptr(&t) as usize;
+            self.parked.insert(key, (Arc::downgrade(&t), Vec::new()));
+            *hydrate = Some(t);
         }
-        let ext = conv_run.len();
-        let fresh = take.saturating_sub(resumed / KV_BLOCK + ext);
+        let ext = match hydrate.as_ref() {
+            Some(t) => t.plan().chains.len(),
+            None => 0,
+        };
+        let mut fresh = take.saturating_sub(resumed / KV_BLOCK + ext);
         // `on-demand` leaves the decoding sequences room to grow (0 under `reserve`).
-        let want = fresh + self.kv_keep + ext;
+        let mut want = fresh + self.kv_keep + ext;
         let available = |w: &Self| (w.pool.free_blocks() as usize).saturating_sub(w.reserved);
         if want > available(self) {
             let short = want - available(self);
@@ -7475,6 +7563,91 @@ impl Worker {
                 }
             }
             if want > available(self) {
+                if hydrate.is_some() {
+                    // Nothing fits even with the disk part given back: retire this hydrate
+                    // (its producer parked at most the window cap) and place on memory alone.
+                    self.hydrate_abort(hydrate, false);
+                    fresh = take.saturating_sub(resumed / KV_BLOCK);
+                    want = fresh + self.kv_keep;
+                }
+                if want > available(self) {
+                    match warm {
+                        Some((mut w, _)) => {
+                            w.table = table;
+                            w.tokens.truncate(resumed);
+                            self.warm.push(w);
+                        }
+                        None => table.release(&mut self.pool),
+                    }
+                    return Placement::Wait;
+                }
+            }
+        }
+        // Fill the run (D1): upload what the producer verified, in chain order, up to this
+        // step's budget, and park the pool references for the next attempt - nothing waits
+        // on the engine except the uploads themselves. A dead plan (a trim race, an
+        // integrity failure) aborts the extension exactly like the inline path did: the
+        // blocks go back and memory's resume stands alone.
+        let mut conv_state_bytes: Option<Vec<u8>> = None;
+        if let Some(t) = hydrate.clone() {
+            let key = Arc::as_ptr(&t) as usize;
+            let tier = self.conv.clone().expect("a task is only born with a tier");
+            let st = tier.stats();
+            let mut ids: Vec<BlockId> = match self.parked.get_mut(&key) {
+                Some((_, v)) => v.drain(..).map(BlockId).collect(),
+                None => Vec::new(),
+            };
+            // `0` is documented as "the whole plan in one attempt" (the pre-D1 shape).
+            let budget = if self.hydrate_budget == 0 {
+                usize::MAX
+            } else {
+                self.hydrate_budget
+            };
+            let d = t.take(budget);
+            let mut ok = true;
+            if let Some(f) = d.failed {
+                ok = false;
+                match f {
+                    conv_tier::HydrateFault::State => {
+                        st.states_bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                    conv_tier::HydrateFault::Blob => {
+                        st.blobs_mismatch.fetch_add(1, Ordering::Relaxed);
+                    }
+                    conv_tier::HydrateFault::Gone => {}
+                }
+            }
+            if ok {
+                for bytes in d.blobs {
+                    st.blobs_ok.fetch_add(1, Ordering::Relaxed);
+                    st.bytes_hydrated.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    let Some(b) = self.pool.allocate() else {
+                        st.alloc_fails.fetch_add(1, Ordering::Relaxed);
+                        ok = false;
+                        break;
+                    };
+                    if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
+                        tracing::warn!("conv tier: hydrate block: {err}");
+                        self.pool.decref(b);
+                        st.upload_fails.fetch_add(1, Ordering::Relaxed);
+                        ok = false;
+                        break;
+                    }
+                    ids.push(b);
+                }
+            }
+            if !ok {
+                self.parked.remove(&key);
+                t.abort();
+                st.revive_aborts.fetch_add(1, Ordering::Relaxed);
+                for b in ids {
+                    self.pool.decref(b);
+                }
+                *hydrate = None;
+            } else if !d.done {
+                if let Some((_, v)) = self.parked.get_mut(&key) {
+                    v.extend(ids.into_iter().map(|b| b.0));
+                }
                 match warm {
                     Some((mut w, _)) => {
                         w.table = table;
@@ -7484,93 +7657,18 @@ impl Worker {
                     None => table.release(&mut self.pool),
                 }
                 return Placement::Wait;
-            }
-        }
-        // Fill the run. The state first (the smaller read, and its absence aborts
-        // before any block lands in the pool); then verified blobs. A race with the
-        // writer's trim aborts the extension rather than poisoning it: the blocks go
-        // back and memory's resume stands alone.
-        let mut conv_state_bytes: Option<Vec<u8>> = None;
-        if ext > 0 {
-            let tier = self.conv.clone().expect("the walk ran with a tier");
-            let dir = tier.cfg().dir.clone();
-            let mut ok = true;
-            let mut state_bytes: Option<Vec<u8>> = None;
-            if let Some(chain) = conv_state.as_ref() {
-                match tier.state(chain) {
-                    Some(e) => {
-                        state_bytes = conv_tier::read_state_verified(&dir, chain, &e.key, e.bytes);
-                        ok = state_bytes.is_some();
-                        if ok {
-                            tier.stats().states_ok.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            tier.stats().states_bad.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    None => ok = false,
+            } else {
+                let ext = t.plan().chains.len();
+                if d.state.is_some() {
+                    st.states_ok.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            let mut ids: Vec<BlockId> = Vec::new();
-            if ok {
-                // Verified in parallel windows (workers own the blob reads and the hashing),
-                // uploaded here in order: serially this was a ~46 s hashing wall per conversation
-                // (§366). A window may hash blobs past its failure point that never upload: the
-                // verdict is unchanged, the work is wasted.
-                for window in conv_run.chunks(conv_tier::VERIFY_WINDOW) {
-                    let mut items: Vec<(&str, String, u64)> = Vec::with_capacity(window.len());
-                    for chain in window.iter() {
-                        match tier.block(chain) {
-                            Some(e) => items.push((chain.as_str(), e.key, e.bytes)),
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !ok {
-                        break;
-                    }
-                    let verified =
-                        conv_tier::read_verified_window(&dir, &items, tier.cfg().verify_threads);
-                    for (chain, bytes) in window.iter().zip(verified) {
-                        let Some(bytes) = bytes else {
-                            tier.stats().blobs_mismatch.fetch_add(1, Ordering::Relaxed);
-                            ok = false;
-                            break;
-                        };
-                        let st = tier.stats();
-                        st.blobs_ok.fetch_add(1, Ordering::Relaxed);
-                        st.bytes_hydrated.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        let Some(b) = self.pool.allocate() else {
-                            tier.stats().alloc_fails.fetch_add(1, Ordering::Relaxed);
-                            ok = false;
-                            break;
-                        };
-                        if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
-                            tracing::warn!("conv tier: hydrate block {chain}: {err}");
-                            self.pool.decref(b);
-                            tier.stats().upload_fails.fetch_add(1, Ordering::Relaxed);
-                            ok = false;
-                            break;
-                        }
-                        ids.push(b);
-                    }
-                    if !ok {
-                        break;
-                    }
-                }
-            }
-            if ok {
                 table.extend_owned(&ids, KV_BLOCK as u32);
                 resumed = (resumed / KV_BLOCK + ext) * KV_BLOCK;
-                conv_state_bytes = state_bytes;
-                tier.stats().tokens_hydrated.fetch_add(ext as u64 * KV_BLOCK as u64, Ordering::Relaxed);
+                conv_state_bytes = d.state;
+                st.tokens_hydrated.fetch_add(ext as u64 * KV_BLOCK as u64, Ordering::Relaxed);
+                self.parked.remove(&key);
+                *hydrate = None;
                 tracing::info!(blocks = ext, tokens = resumed, "conv tier: hydrated");
-            } else {
-                tier.stats().revive_aborts.fetch_add(1, Ordering::Relaxed);
-                for b in ids {
-                    self.pool.decref(b);
-                }
             }
         }
         self.reserved += fresh;
