@@ -108,3 +108,15 @@ fn streams_calls_out_of_the_text() {
     );
     assert!(p.had_calls());
 }
+
+#[test]
+fn undeclared_names_need_the_call_policy() {
+    let body = "search_web<arg_key>q</arg_key><arg_value>Paris weather</arg_value>";
+    assert_eq!(parse(body), None);
+    let (name, args) = parse_glm(body, &tools(), true)
+        .map(|(n, a)| (n, serde_json::from_str::<Value>(&a).unwrap()))
+        .unwrap();
+    assert_eq!(name, "search_web");
+    // With no declared schema the value is typed as far as it parses, like the other parsers.
+    assert_eq!(args, json!({"q": "Paris weather"}));
+}
