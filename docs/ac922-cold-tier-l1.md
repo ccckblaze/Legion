@@ -77,6 +77,11 @@ Eviction: LRU over entries by `last_used`, `--conv-disk-ttl-min` (0: keep), and 
    shutdown/eviction-time, decode windows untouched).
 4. Space gate: refuse writes past the cap; report bytes/parked-session at /health stats.
 
+Gate 1 note from implementation: `usage.cached_tokens` does not report hydrated or
+even RAM-radix hits on this engine (observed 0 on every repeat), so the live gate is
+the `conv tier: hydrated blocks=N tokens=M` INFO line plus wall plus the sha
+equality. N and M must both be > 0 and the answer sha must equal the warm sha.
+
 ## Cut plan
 
 - C1 (this commit): flags + config + module + boot scan + health line. No-op otherwise.
@@ -84,3 +89,39 @@ Eviction: LRU over entries by `last_used`, `--conv-disk-ttl-min` (0: keep), and 
 - C3: hydrate at load before the first prompt (pool alloc + insert + store), guarded by
   `--conv-disk-restore`; revive-det harness (`eval/revive.py`).
 - C4: eviction-time spill (mid-run churn, not just restarts) + TTL/LRU trim.
+
+## Landed status (2026-11-25)
+
+- **C1/C2/C3 are implemented and verified; the cut differs from the sketch above where
+  they diverge**: the dump is not shutdown-only. Every completed block and every saved
+  state is queued behind the step (`ack`-gated, deduped, writer thread, O_DIRECT), so
+  crashes and evictions lose at most the in-flight tail. Hydrate runs in `place()`:
+  past what memory resumes, walk the on-disk chain run, cut back to the furthest
+  boundary with a byte-length-matched saved state, verify every blob's sha256 at read
+  (a mismatch or a trim race aborts the extension and falls back to plain memory
+  resume; nothing is poisoned). FORMAT is now 3 (the state region carries the slot's
+  token history window; FORMAT-2 fixtures are foreign and ignored by scan).
+- **2-card dev verification (port 8097, Q4_K_XL + MTP, q8 KV)**: 48K-char probe ->
+  A(12,844 tok)+B(13,477 tok) cold 17.6/18.2 s; dir holds 430 blocks @1,228,800 B +
+  9 states (~113 MiB each), 430/430 sha_verified; stop -> start (memory empty) ->
+  repeat A: `conv tier: hydrated blocks=200 tokens=12800` (full prefix, the tail 44
+  tokens recomputed), wall 6.5 s (-63% vs cold), answer sha identical to warm
+  (9081a2af...). A's sha also reproduced bit-identically across two independent boots
+  before the restart, which is the det gate for the dump path itself.
+- **Production (4 cards, port 8090, 2026-11-25 14:51 CST)**: the CT binary plus
+  `--mmproj /data/work/vision-test/mmproj-BF16.gguf --conv-disk
+  /data/cache/conv-tier-prod --conv-disk-gib 200` are live via lane.env
+  (`LEGION_BIN`, `LEGION_EXTRA`; env backed up before the change). Boot scan
+  `0 blocks 0 states ... restore on` (fresh dir; per-geometry digests keep 2-card
+  fixtures out), vision tower on the first model GPU, text smoke OK, image probe
+  `1,005.50` twice with identical sha, second pass `cached=384`.
+- **Vision adoption evidence**: the GPU tower (sm_70 path) and the CPU oracle tower
+  (`LEGION_DEBUG_VISION_CPU=1`) return the same invoice amount with 13-char content;
+  greedy reasoning text drifts between arms as ggml's "close, not bitwise" contract
+  predicts, while GPU-arm repeats are bit-identical (3x dev, 2x prod) and image
+  encode is ~2.7 s vs ~32 s on CPU. Per-image cost is a one-time prefill, and the
+  image prefix itself is radix-cached (`cached_tokens` on the repeat).
+- **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
+  implemented; the churn-vs-cap behaviour under production mix is not yet measured);
+  hydrated bytes/parked-session stats at `/health`; batched reader I/O; 4-card
+  revive-det once real sessions churn.
