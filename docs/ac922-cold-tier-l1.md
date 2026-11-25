@@ -161,6 +161,16 @@ and the answer sha must equal the cold-computed sha.
     engine `queue_ms` ~46 s -> 9.1-10.4 s, `vs.cold` bit-identical [true x 4] in both rounds,
     one of them with the page cache dropped first. The state sidecar read stays single-thread
     (~110 MB, ~1 s, not the wall). Full-window revive is in single-digit-to-low-teens seconds.
+  - C=4 burst on cold RAM after C5: wall 267.6 s -> 120.1 s, because the four hydrations,
+    still serialized on the engine thread, each cost ~10 s instead of ~46 s. Aggregate stayed
+    window-composition-bound (7.3 tok/s; one stream at 40.6 tg, the rest starved) and C=4
+    shas stayed unreproducible between rounds - unchanged findings, now with the tier wait
+    taken out of them. Cross-conversation hydrate overlap would be the next cut, not C5's.
+  - this burst's per-session hydrated runs came out at the full 4,092 blocks (261,888
+    tokens), not the 3,254 the C=1 rounds showed earlier - the open question flips shape:
+    identical fixtures, different run lengths, so the short run was likely a walk stopping
+    early (a state-boundary or trim-race condition), not missing blobs. Worth chasing
+    against the saved boot logs before quoting revive spans as the tier's floor.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
   hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
