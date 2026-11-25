@@ -1127,7 +1127,7 @@ impl HydrateTask {
         HydrateDelivery { blobs, state, done, failed: None }
     }
 
-    pub fn plan(&self) -> &HydratePlan {
+    pub fn plan_ref(&self) -> &HydratePlan {
         &self.plan
     }
 

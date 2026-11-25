@@ -7544,7 +7544,7 @@ impl Worker {
             *hydrate = Some(t);
         }
         let ext = match hydrate.as_ref() {
-            Some(t) => t.plan().chains.len(),
+            Some(t) => t.plan_ref().chains.len(),
             None => 0,
         };
         let mut fresh = take.saturating_sub(resumed / KV_BLOCK + ext);
@@ -7658,7 +7658,7 @@ impl Worker {
                 }
                 return Placement::Wait;
             } else {
-                let ext = t.plan().chains.len();
+                let ext = t.plan_ref().chains.len();
                 if d.state.is_some() {
                     st.states_ok.fetch_add(1, Ordering::Relaxed);
                 }
