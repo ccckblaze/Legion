@@ -44,6 +44,9 @@ pub struct ConvDiskCfg {
     pub ttl_min: u64,
     /// Hydrate at load (`--conv-disk-restore`, on): with it off the tier only ever writes.
     pub restore: bool,
+    /// Read and hash blobs with this many workers while hydrating (`--conv-disk-verify-threads`):
+    /// one thread hashes a full conversation's blocks in ~46 s, and it is the engine thread.
+    pub verify_threads: usize,
 }
 
 impl ConvDiskCfg {
@@ -196,8 +199,14 @@ fn fs_shards(dir: &Path) -> Vec<PathBuf> {
 
 /// `--conv-disk` given: make sure the tree exists and report what survived the last run.
 /// C1 reads; C3 hydrates from the returned map.
-pub fn boot(dir: &Path, gib: f64, ttl_min: u64, restore: bool) -> Option<(ConvDiskCfg, Scanned)> {
-    let cfg = ConvDiskCfg { dir: dir.to_path_buf(), gib, ttl_min, restore };
+pub fn boot(
+    dir: &Path,
+    gib: f64,
+    ttl_min: u64,
+    restore: bool,
+    verify_threads: usize,
+) -> Option<(ConvDiskCfg, Scanned)> {
+    let cfg = ConvDiskCfg { dir: dir.to_path_buf(), gib, ttl_min, restore, verify_threads };
     for sub in ["blocks", "states", "pending"] {
         if let Err(e) = fs::create_dir_all(cfg.dir.join(sub)) {
             tracing::warn!("conv tier: {sub} under {}: {e}", cfg.dir.display());
@@ -792,6 +801,33 @@ pub fn read_state_verified(dir: &Path, chain: &str, key: &str, want_bytes: u64) 
     Some(bytes)
 }
 
+/// Hydrate verifies in windows of at most this many blocks: the window bounds the transient
+/// RAM (512 blocks of ~1 MiB) and the engine thread still uploads in order, window by window.
+pub const VERIFY_WINDOW: usize = 512;
+
+/// A window's blobs, each read and hashed by a worker pool, returned in the order of `items`:
+/// per blob the same verdict as [`read_verified`], with the engine thread waiting on the pool
+/// instead of doing the hashing itself. Workers touch only the filesystem and pure hashing;
+/// a `None` at position i means the run stops at i exactly as the serial loop would.
+pub fn read_verified_window(dir: &Path, items: &[(&str, String, u64)], threads: usize) -> Vec<Option<Vec<u8>>> {
+    let mut out: Vec<Option<Vec<u8>>> = items.iter().map(|_| None).collect();
+    if items.is_empty() {
+        return out;
+    }
+    let threads = threads.clamp(1, items.len());
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (group, part) in out.chunks_mut(chunk).zip(items.chunks(chunk)) {
+            scope.spawn(move || {
+                for (slot, (chain, key, want)) in group.iter_mut().zip(part) {
+                    *slot = read_verified(dir, chain, key, *want);
+                }
+            });
+        }
+    });
+    out
+}
+
 /// SHA-256, self-contained (FIPS 180-4): the tier's only hash, for addresses and integrity.
 #[derive(Clone)]
 pub struct Sha256 {
@@ -960,8 +996,14 @@ mod tests {
     #[test]
     fn scan_drops_missing_and_counts_foreign() {
         let dir = std::env::temp_dir().join(format!("ct-test-{}", uuid::Uuid::new_v4()));
-        let cfg = ConvDiskCfg { dir: dir.clone(), gib: 1.0, ttl_min: 0, restore: true };
-        boot(&dir, 1.0, 0, true).unwrap();
+        let cfg = ConvDiskCfg {
+            dir: dir.clone(),
+            gib: 1.0,
+            ttl_min: 0,
+            restore: true,
+            verify_threads: 2,
+        };
+        boot(&dir, 1.0, 0, true, 2).unwrap();
         let sig =
             Signature { model: "m".into(), digest: "d".into(), quant: "q".into(), block_bytes: 8, block_tokens: 64 };
         let chain = "ab1234";

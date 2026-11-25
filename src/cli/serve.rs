@@ -1516,6 +1516,11 @@ struct EngineArgs {
     /// Index the cold tier at load but never hydrate from it (dump-only, for A/B bisection).
     #[arg(long)]
     conv_disk_no_restore: bool,
+    /// Conversation cold tier, hydrate: read and hash blobs with this many workers. One thread
+    /// hashes a full-window conversation in ~46 s on the engine thread; the pool takes that
+    /// wall to a few seconds without changing any verdict (§366).
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    conv_disk_verify_threads: usize,
     #[arg(long, value_name = "N")]
     prefix_cache_states: Option<usize>,
     /// Model engine, prefix caching on a model with recurrent layers (Qwen3.5+, Flash-Next,
@@ -2202,6 +2207,7 @@ pub async fn run(
                     e.conv_disk_gib,
                     e.conv_disk_ttl_min,
                     !e.conv_disk_no_restore,
+                    e.conv_disk_verify_threads,
                 )
                 .map(|(c, _)| c)
             });

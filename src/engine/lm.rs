@@ -7498,26 +7498,46 @@ impl Worker {
             }
             let mut ids: Vec<BlockId> = Vec::new();
             if ok {
-                for chain in conv_run.iter() {
-                    let Some(e) = tier.block(chain) else {
-                        ok = false;
-                        break;
-                    };
-                    let Some(bytes) = conv_tier::read_verified(&dir, chain, &e.key, e.bytes) else {
-                        ok = false;
-                        break;
-                    };
-                    let Some(b) = self.pool.allocate() else {
-                        ok = false;
-                        break;
-                    };
-                    if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
-                        tracing::warn!("conv tier: hydrate block {chain}: {err}");
-                        self.pool.decref(b);
-                        ok = false;
+                // Verified in parallel windows (workers own the blob reads and the hashing),
+                // uploaded here in order: serially this was a ~46 s hashing wall per conversation
+                // (§366). A window may hash blobs past its failure point that never upload: the
+                // verdict is unchanged, the work is wasted.
+                for window in conv_run.chunks(conv_tier::VERIFY_WINDOW) {
+                    let mut items: Vec<(&str, String, u64)> = Vec::with_capacity(window.len());
+                    for chain in window.iter() {
+                        match tier.block(chain) {
+                            Some(e) => items.push((chain.as_str(), e.key, e.bytes)),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
                         break;
                     }
-                    ids.push(b);
+                    let verified =
+                        conv_tier::read_verified_window(&dir, &items, tier.cfg().verify_threads);
+                    for (chain, bytes) in window.iter().zip(verified) {
+                        let Some(bytes) = bytes else {
+                            ok = false;
+                            break;
+                        };
+                        let Some(b) = self.pool.allocate() else {
+                            ok = false;
+                            break;
+                        };
+                        if let Err(err) = self.exec.conv_hydrate_block(b.0 as usize, &bytes) {
+                            tracing::warn!("conv tier: hydrate block {chain}: {err}");
+                            self.pool.decref(b);
+                            ok = false;
+                            break;
+                        }
+                        ids.push(b);
+                    }
+                    if !ok {
+                        break;
+                    }
                 }
             }
             if ok {
