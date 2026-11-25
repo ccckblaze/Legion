@@ -34,6 +34,7 @@ mod early_commit;
 mod even;
 mod first_rows;
 mod fit;
+pub mod conv_tier;
 mod host_tier;
 mod host_time;
 mod kv_fit;
@@ -1206,6 +1207,9 @@ pub struct LmConfig {
     /// attention, so the host part crosses the link once per layer rather than once per tile
     /// of query rows (#1153; the same bits). 0: attention reads the slot in place.
     pub kv_slot_stage_rows: usize,
+    /// Conversation cold tier: `--conv-disk`, content-addressed KV blocks and state
+    /// checkpoints on NVMe ([`conv_tier`]); `None`: the tier is off.
+    pub conv_disk: Option<conv_tier::ConvDiskCfg>,
     /// Saved recurrent states for prefix caching; 0 turns prefix caching off.
     pub prefix_cache_states: usize,
     /// With prefix caching on a model with recurrent state: also save the state every this
@@ -1674,6 +1678,7 @@ impl LmConfig {
             kv_stage_tokens: 16384,
             kv_slots: KvSlots::Auto,
             kv_slot_stage_rows: KV_SLOT_STAGE_ROWS,
+            conv_disk: None,
             prefix_cache_states: 8,
             prefix_cache_interval: 0,
             ring_checkpoints: None,

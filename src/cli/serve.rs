@@ -1492,6 +1492,20 @@ struct EngineArgs {
     kv_slot_stage_rows: usize,
     /// Model engine: saved recurrent states for prefix caching (one per cached prefix point,
     /// ~50 MB each on a 4B model; default 8); 0 turns prefix caching off.
+    /// Conversation cold tier: keep content-addressed KV blocks and recurrent-state
+    /// checkpoints under this directory (docs/ac922-cold-tier-l1.md), so a restart or an
+    /// eviction resumes from a disk read instead of a prefill storm. Unset: the tier is off.
+    #[arg(long, value_name = "DIR")]
+    conv_disk: Option<std::path::PathBuf>,
+    /// The tier's global size cap across every model, GiB (`--conv-disk`'s ledger, LRU-trimmed).
+    #[arg(long, value_name = "GIB", default_value_t = 100.0)]
+    conv_disk_gib: f64,
+    /// Drop tier entries untouched for this many minutes; 0: keep until the cap trims.
+    #[arg(long, value_name = "MIN", default_value_t = 0)]
+    conv_disk_ttl_min: u64,
+    /// Index the cold tier at load but never hydrate from it (dump-only, for A/B bisection).
+    #[arg(long)]
+    conv_disk_no_restore: bool,
     #[arg(long, value_name = "N")]
     prefix_cache_states: Option<usize>,
     /// Model engine, prefix caching on a model with recurrent layers (Qwen3.5+, Flash-Next,
@@ -2167,6 +2181,18 @@ pub async fn run(
             let prefill_chunk = e.prefill_chunk.unwrap_or_else(|| {
                 legion::engine::lm::default_prefill_chunk(device, integrated, max_batch_tokens)
             });
+            let conv_disk = e
+                .conv_disk
+                .as_deref()
+                .and_then(|d| {
+                    legion::engine::lm::conv_tier::boot(
+                        d,
+                        e.conv_disk_gib,
+                        e.conv_disk_ttl_min,
+                        !e.conv_disk_no_restore,
+                    )
+                    .map(|(c, _)| c)
+                });
             let cfg = LmConfig {
                 model_path,
                 mmproj: e.model.mmproj.clone(),
@@ -2187,6 +2213,7 @@ pub async fn run(
                 kv_stage_tokens: e.kv_stage_tokens,
                 kv_slots: e.kv_slots,
                 kv_slot_stage_rows: e.kv_slot_stage_rows,
+                conv_disk,
                 prefix_cache_states,
                 prefix_cache_interval: e.prefix_cache_interval,
                 ring_checkpoints: e.ring_checkpoints,
