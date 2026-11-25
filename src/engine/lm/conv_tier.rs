@@ -34,7 +34,14 @@ use serde::{Deserialize, Serialize};
 /// The tier's own layout version; a manifest of another format is ignored, not merged.
 /// FORMAT 3: state snapshots carry the slot's token history window (and hydrate is
 /// keyed by chains, C3).
-pub const FORMAT: u32 = 3;
+/// FORMAT 4: entries carry the checkpoint's content fingerprint in their signature
+/// (oMLX's key hygiene: a re-quantized pack must never serve from the old tier). A
+/// format-3 manifest is still read, and its entries trusted once and re-signed with
+/// the live fingerprint on their way into the index (they were written by this very
+/// pack; the next flush rewrites the shard as v4).
+pub const FORMAT: u32 = 4;
+/// The last layout version whose entries carry no `pack` and are migrated on read.
+pub const FORMAT_LEGACY: u32 = 3;
 
 /// `--conv-disk`: the tier's directory, global size cap and retention. `None` (unset) is
 /// the whole feature off; every other default matches the design doc.
@@ -53,12 +60,20 @@ pub struct ConvDiskCfg {
     /// A full-window conversation keeps 32 states at stride 1 and 10 at stride 8, and a revive
     /// walks back to the deepest kept boundary either way (§368 C6).
     pub state_stride: usize,
+    /// The writer queue's byte ceiling (`--conv-disk-pending-gib`, oMLX's bounded pending
+    /// buffer): past it a dump steps aside - the blocks are acked back, the chain is left
+    /// unclaimed, and a later completion or eviction queues it again. 0: no ceiling.
+    pub pending_gib: f64,
 }
 
 impl ConvDiskCfg {
     /// The cap is global across models, oMLX #5497: one number bounds the whole directory.
     pub fn cap_bytes(&self) -> u64 {
         (self.gib * (1u64 << 30) as f64) as u64
+    }
+
+    pub fn pending_max(&self) -> u64 {
+        (self.pending_gib * (1u64 << 30) as f64) as u64
     }
 }
 
@@ -67,6 +82,11 @@ impl ConvDiskCfg {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Signature {
     pub model: String,
+    /// The checkpoint's content fingerprint ([`pack_fingerprint`]): a re-quantized or
+    /// replaced pack changes it, and its old blocks stop matching. Format-3 entries
+    /// carry the empty string, which the read path migrates (see [`FORMAT`]).
+    #[serde(default)]
+    pub pack: String,
     pub digest: String,
     pub quant: String,
     pub block_bytes: u64,
@@ -116,6 +136,8 @@ pub struct Scanned {
     pub bytes: u64,
     pub missing: usize,
     pub foreign: usize,
+    /// Format-3 entries trusted once and re-signed with the live pack fingerprint.
+    pub migrated: usize,
 }
 
 /// What the tier actually gave back, the oMLX `cache/stats.py` counterpart: realized reuse
@@ -133,6 +155,8 @@ pub struct ConvStats {
     pub revive_aborts: AtomicU64,
     pub tokens_hydrated: AtomicU64,
     pub bytes_hydrated: AtomicU64,
+    /// Dumps that stepped aside at the writer queue's ceiling (`--conv-disk-pending-gib`).
+    pub dumps_backpressured: AtomicU64,
 }
 
 impl ConvStats {
@@ -155,6 +179,8 @@ impl ConvStats {
             revive_aborts: g(&self.revive_aborts),
             tokens_hydrated: g(&self.tokens_hydrated),
             bytes_hydrated: g(&self.bytes_hydrated),
+            dumps_backpressured: g(&self.dumps_backpressured),
+            pending_bytes: 0,
         }
     }
 }
@@ -173,6 +199,9 @@ pub struct StatsSnapshot {
     pub revive_aborts: u64,
     pub tokens_hydrated: u64,
     pub bytes_hydrated: u64,
+    pub dumps_backpressured: u64,
+    /// Bytes in the writer queue right now (filled by `ConvTier::stats_snapshot`).
+    pub pending_bytes: u64,
 }
 
 /// Hash-keyed blobs shard by the chain's first byte: one flat directory of tens of
@@ -192,6 +221,23 @@ fn shard_name(shard: &str) -> String {
     format!("manifest-{shard}.json")
 }
 
+/// Signature match, with the format-3 migration: an entry that carries no `pack` and
+/// otherwise agrees with the live model was written by this pack before the fingerprint
+/// existed - it enters the index re-signed (and the next shard flush makes that durable).
+/// The trust is scoped to the legacy layout: a v4 manifest with a `pack`-less entry is
+/// corruption (or a downgrade attack), not history, and stays foreign.
+fn sig_matches(e: &Signature, live: &Signature, legacy_layout: bool) -> bool {
+    e == live || (legacy_layout && e.pack.is_empty() && live_legacy_eq(e, live))
+}
+
+fn live_legacy_eq(e: &Signature, live: &Signature) -> bool {
+    e.model == live.model
+        && e.digest == live.digest
+        && e.quant == live.quant
+        && e.block_bytes == live.block_bytes
+        && e.block_tokens == live.block_tokens
+}
+
 /// Read every manifest shard and count what is actually on the fly (a killed flusher can
 /// leave an entry without a file: those drop out here rather than failing a request later).
 ///
@@ -200,20 +246,22 @@ fn shard_name(shard: &str) -> String {
 pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, BlockEntry>, Scanned) {
     let mut blocks: HashMap<String, BlockEntry> = HashMap::new();
     let (mut st_keep, mut bytes, mut missing, mut foreign) = (0usize, 0u64, 0usize, 0usize);
+    let mut migrated = 0usize;
     let mut states: HashMap<String, StateEntry> = HashMap::new();
     let shards = fs_shards(&cfg.dir);
     for path in shards {
         let Ok(raw) = fs::read(&path) else { continue };
         let m = match serde_json::from_slice::<Manifest>(&raw) {
-            Ok(m) if m.format == FORMAT => m,
+            Ok(m) if m.format == FORMAT || m.format == FORMAT_LEGACY => m,
             _ => continue,
         };
+        let legacy = m.format == FORMAT_LEGACY;
         for e in m.blocks {
             if e.chain.len() < 2 || e.bytes == 0 || e.tokens.is_empty() {
                 missing += 1;
                 continue;
             }
-            if live.is_some_and(|l| l != &e.sig) {
+            if live.is_some_and(|l| !sig_matches(&e.sig, l, legacy)) {
                 foreign += 1;
                 continue;
             }
@@ -221,16 +269,30 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
                 missing += 1;
                 continue;
             }
+            let mut e = e;
+            if let Some(l) = live {
+                if e.sig != *l {
+                    e.sig = l.clone();
+                    migrated += 1;
+                }
+            }
             bytes += e.bytes;
             blocks.insert(e.chain.clone(), e);
         }
         for s in m.states {
             let keep = s.chain.len() >= 2
                 && s.bytes > 0
-                && live.map_or(true, |l| l == &s.sig)
+                && live.map_or(true, |l| sig_matches(&s.sig, l, legacy))
                 && state_path(&cfg.dir, &s.chain).exists();
             if keep {
                 st_keep += 1;
+                let mut s = s;
+                if let Some(l) = live {
+                    if s.sig != *l {
+                        s.sig = l.clone();
+                        migrated += 1;
+                    }
+                }
                 states.insert(s.chain.clone(), s);
             } else {
                 missing += 1;
@@ -240,7 +302,7 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
     let found = blocks.len();
     (
         blocks,
-        Scanned { blocks: found, states: st_keep, bytes, missing, foreign },
+        Scanned { blocks: found, states: st_keep, bytes, missing, foreign, migrated },
     )
 }
 
@@ -269,6 +331,7 @@ pub fn boot(
     restore: bool,
     verify_threads: usize,
     state_stride: usize,
+    pending_gib: f64,
 ) -> Option<(ConvDiskCfg, Scanned)> {
     let cfg = ConvDiskCfg {
         dir: dir.to_path_buf(),
@@ -277,11 +340,25 @@ pub fn boot(
         restore,
         verify_threads,
         state_stride,
+        pending_gib,
     };
     for sub in ["blocks", "states", "pending"] {
         if let Err(e) = fs::create_dir_all(cfg.dir.join(sub)) {
             tracing::warn!("conv tier: {sub} under {}: {e}", cfg.dir.display());
             return None;
+        }
+    }
+    // A killed writer leaves `pending/` littered: those files were never linked in and the
+    // scan ignores the directory, so boot clears it (oMLX's startup scan does the same).
+    if let Ok(rd) = fs::read_dir(cfg.dir.join("pending")) {
+        let mut gone = 0usize;
+        for e in rd.flatten() {
+            if e.path().is_file() && fs::remove_file(e.path()).is_ok() {
+                gone += 1;
+            }
+        }
+        if gone > 0 {
+            tracing::info!("conv tier: cleared {gone} interrupted pending writes");
         }
     }
     let st = scan(&cfg, None).1;
@@ -357,6 +434,9 @@ struct Inner {
     /// Blocks whose files are on disk: the engine gives their pool references back.
     acks: Mutex<Vec<u32>>,
     bytes: Mutex<u64>,
+    /// Bytes in the writer queue (materialized or promised): the backpressure gauge
+    /// against `pending_max()` (oMLX's bounded pending buffer).
+    pending: AtomicU64,
     stats: ConvStats,
 }
 
@@ -377,11 +457,16 @@ impl ConvTier {
         for path in fs_shards(&cfg.dir) {
             let Ok(raw) = fs::read(&path) else { continue };
             let m = match serde_json::from_slice::<Manifest>(&raw) {
-                Ok(m) if m.format == FORMAT => m,
+                Ok(m) if m.format == FORMAT || m.format == FORMAT_LEGACY => m,
                 _ => continue,
             };
+            let legacy = m.format == FORMAT_LEGACY;
             for s in m.states {
-                if s.bytes > 0 && s.sig == sig && state_path(&cfg.dir, &s.chain).exists() {
+                if s.bytes > 0 && sig_matches(&s.sig, &sig, legacy) && state_path(&cfg.dir, &s.chain).exists() {
+                    let mut s = s;
+                    if s.sig != sig {
+                        s.sig = sig.clone();
+                    }
                     state_chains.insert(s.chain.clone());
                     states.insert(s.chain.clone(), s);
                 }
@@ -398,6 +483,7 @@ impl ConvTier {
             states: Mutex::new(states),
             acks: Mutex::new(Vec::new()),
             bytes: Mutex::new(total),
+            pending: AtomicU64::new(0),
             stats: ConvStats::default(),
         });
         let me = inner.clone();
@@ -421,7 +507,9 @@ impl ConvTier {
     }
 
     pub fn stats_snapshot(&self) -> StatsSnapshot {
-        self.inner.stats.snapshot()
+        let mut s = self.inner.stats.snapshot();
+        s.pending_bytes = self.inner.pending.load(Ordering::Relaxed);
+        s
     }
 
     /// Queue a prompt's finished blocks. Chains already stored or queued are skipped (the
@@ -440,7 +528,25 @@ impl ConvTier {
                 }
             });
         }
-        if !jobs.is_empty() && self.inner.tx.send(Job::Blocks(jobs)).is_err() {
+        if jobs.is_empty() {
+            return;
+        }
+        // Backpressure (oMLX's capped pending buffer): past the ceiling this dump steps
+        // aside whole - ids ack straight back, chains stay unclaimed, and a later prompt
+        // completion or eviction queues the blocks again. The engine thread never waits.
+        let n: u64 = jobs.iter().flat_map(|j| j.slices.iter().map(|s| s.len as u64)).sum();
+        let cap = self.inner.cfg.pending_max();
+        if cap > 0 && self.inner.pending.fetch_add(n, Ordering::Relaxed) + n > cap {
+            self.inner.pending.fetch_sub(n, Ordering::Relaxed);
+            self.inner.stats.dumps_backpressured.fetch_add(jobs.len() as u64, Ordering::Relaxed);
+            let mut acks = self.inner.acks.lock().unwrap();
+            for j in &jobs {
+                acks.push(j.id);
+            }
+            return;
+        }
+        if self.inner.tx.send(Job::Blocks(jobs)).is_err() {
+            self.inner.pending.fetch_sub(n, Ordering::Relaxed);
             tracing::warn!("conv tier: writer gone, block dumps dropped");
         }
     }
@@ -453,7 +559,17 @@ impl ConvTier {
             }
             chains.insert(job.chain.clone());
         }
-        let _ = self.inner.tx.send(Job::States(vec![job]));
+        let n = job.bytes.len() as u64;
+        let cap = self.inner.cfg.pending_max();
+        if cap > 0 && self.inner.pending.fetch_add(n, Ordering::Relaxed) + n > cap {
+            self.inner.pending.fetch_sub(n, Ordering::Relaxed);
+            self.inner.state_chains.lock().unwrap().remove(&job.chain);
+            self.inner.stats.dumps_backpressured.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.inner.tx.send(Job::States(vec![job])).is_err() {
+            self.inner.pending.fetch_sub(n, Ordering::Relaxed);
+        }
     }
 
     /// The ids whose files are on disk (or dropped): the engine decrefs their blocks.
@@ -594,14 +710,30 @@ mod cuda {
 
 /// Link a freshly written file into place: never over an existing one (#5543).
 fn link_once(tmp: &Path, to: &Path) -> std::io::Result<()> {
-    if let Some(p) = to.parent() {
-        fs::create_dir_all(p)?;
-    }
+    let Some(p) = to.parent() else { return Ok(()) };
+    fs::create_dir_all(p)?;
     if to.exists() {
         let _ = fs::remove_file(tmp);
         return Ok(());
     }
-    fs::rename(tmp, to)
+    // oMLX's durability order (`_fsync_parent_dir`): the manifest may name a file only
+    // once the bytes and the directory entry are both on the platter.
+    sync_file(tmp);
+    fs::rename(tmp, to)?;
+    sync_dir(p);
+    Ok(())
+}
+
+fn sync_file(path: &Path) {
+    if let Ok(f) = fs::File::open(path) {
+        let _ = f.sync_all();
+    }
+}
+
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
 }
 
 fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
@@ -626,12 +758,16 @@ fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
             match job {
                 Job::Blocks(jobs) => {
                     for j in jobs {
+                        let n: u64 = j.slices.iter().map(|s| s.len as u64).sum();
                         dump_block(&inner, &mut streams, j, &mut dirty);
+                        inner.pending.fetch_sub(n, Ordering::Relaxed);
                     }
                 }
                 Job::States(jobs) => {
                     for j in jobs {
+                        let n = j.bytes.len() as u64;
                         dump_state(&inner, j, &mut dirty);
+                        inner.pending.fetch_sub(n, Ordering::Relaxed);
                     }
                 }
             }
@@ -802,7 +938,9 @@ fn flush(inner: &Inner, dirty: &mut HashSet<String>) {
             let f = fs::File::open(&tmp)?;
             f.sync_all()?;
             drop(f);
-            fs::rename(&tmp, &to)
+            fs::rename(&tmp, &to)?;
+            sync_dir(&inner.cfg.dir);
+            Ok(())
         }).is_err() {
             tracing::warn!("conv tier: manifest write failed");
         }
@@ -860,6 +998,106 @@ pub fn chain_run(tokens: &[u32], block: usize, mut accept: impl FnMut(&str) -> b
         n += 1;
     }
     n
+}
+
+/// The checkpoint's content fingerprint, oMLX's key hygiene (format/seed/dims in the
+/// key, never a false hit) taken one step further: per model file - a split GGUF's
+/// shards or every shard in a directory - `sha256(name || size || mtime || head ||
+/// tail)`, the file digests then hashed in path order into one hex. A full hash of a
+/// ~70 GiB pack per boot is not affordable; a re-quantized or replaced pack is: the
+/// GGUF metadata header it rewrites sits in the head, and its data moves the tail.
+pub fn pack_fingerprint(path: &Path) -> String {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if path.is_dir() {
+        if let Ok(rd) = fs::read_dir(path) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+                if (ext == "gguf" || ext == "safetensors") && p.is_file() {
+                    files.push(p);
+                }
+            }
+        }
+    } else if path.is_file() {
+        files.push(path.to_path_buf());
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(stem) = shard_stem(&name) {
+            if let Some(dir) = path.parent() {
+                if let Ok(rd) = fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let n = p.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+                        if n != name && p.is_file() && shard_stem(&n).as_deref() == Some(stem.as_str()) {
+                            files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut outer = Sha256::new();
+    for f in &files {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let md = f.metadata().ok();
+        let size = md.as_ref().map_or(0, |m| m.len());
+        let mtime = md
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let mut h = Sha256::new();
+        h.update(name.as_bytes());
+        h.update(&size.to_le_bytes());
+        h.update(&mtime.to_le_bytes());
+        h.update(&sample(f, size, false));
+        h.update(&sample(f, size, true));
+        outer.update(sha256_hex_fin(&h).as_bytes());
+    }
+    sha256_hex_fin(&outer)
+}
+
+/// `model-00001-of-00004.gguf` -> `model` (`None` when the name is not a split shard's).
+fn shard_stem(name: &str) -> Option<String> {
+    let (head, ext) = name.rsplit_once('.')?;
+    if ext != "gguf" && ext != "safetensors" {
+        return None;
+    }
+    let (a, b) = head.rsplit_once("-of-")?;
+    if b.is_empty() || !b.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (stem, i) = a.rsplit_once('-')?;
+    if stem.is_empty() || i.is_empty() || !i.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// One edge sample of a model file: at most 64 KiB of its head or tail.
+fn sample(path: &Path, size: u64, tail: bool) -> Vec<u8> {
+    let want = size.min(1 << 16) as usize;
+    if want == 0 {
+        return Vec::new();
+    }
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = vec![0u8; want];
+    use std::io::{Read, Seek, SeekFrom};
+    let from = if tail { size.saturating_sub(want as u64) } else { 0 };
+    if f.seek(SeekFrom::Start(from)).is_err() {
+        return Vec::new();
+    }
+    match f.read(buf.as_mut_slice()) {
+        Ok(0) => Vec::new(),
+        Ok(n) => {
+            buf.truncate(n);
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 /// A blob's bytes, only if they hash to `key`: the chain is the *address*, and the
@@ -1236,7 +1474,12 @@ impl Sha256 {
         }
         let rest = &data[full..];
         self.buf[..rest.len()].copy_from_slice(rest);
-        self.buf_len = rest.len();
+        // Add, never overwrite: when a small tail exhausted `data` inside the partial-block
+        // branch above, `buf_len` already counts those bytes (a plain `=` here dropped them,
+        // and `pad` then hashed over them: `sha256(b"abc")` ignored `abc`). Inputs that
+        // enter aligned (the chain's 256 B block updates, whole-block blob keys) never
+        // took the broken path, which is why the on-disk tier is self-consistent today.
+        self.buf_len += rest.len();
     }
 
     pub fn finish(mut self) -> [u8; 32] {
@@ -1324,11 +1567,13 @@ mod tests {
             restore: true,
             verify_threads: 2,
             state_stride: 8,
+            pending_gib: 64.0,
         };
-        boot(&dir, 1.0, 0, true, 2, 8).unwrap();
+        boot(&dir, 1.0, 0, true, 2, 8, 64.0).unwrap();
         let sig =
-            Signature { model: "m".into(), digest: "d".into(), quant: "q".into(), block_bytes: 8, block_tokens: 64 };
+            Signature { model: "m".into(), pack: "p".into(), digest: "d".into(), quant: "q".into(), block_bytes: 8, block_tokens: 64 };
         let chain = "ab1234";
+        fs::create_dir_all(dir.join("blocks").join("ab")).unwrap();
         fs::write(blob_path(&dir, chain), [7u8; 8]).unwrap();
         let m = Manifest {
             format: FORMAT,
@@ -1383,5 +1628,111 @@ mod tests {
         // A short tail chunk never joins the run.
         assert_eq!(chain_run(&toks[..192], 64, |_| true), 3);
         assert_eq!(chain_run(&toks[..192], 64, |_| false), 0);
+    }
+
+    /// A format-3 manifest (no `pack` in its signatures) enters the index re-signed with
+    /// the live fingerprint - the tier survives the upgrade - while a live-pack mismatch
+    /// is still foreign, and a v4 entry from another pack never matches.
+    #[test]
+    fn scan_migrates_v3_and_gates_by_pack() {
+        let dir = std::env::temp_dir().join(format!("ct-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join("blocks").join("ab")).unwrap();
+        let cfg = ConvDiskCfg {
+            dir: dir.clone(),
+            gib: 1.0,
+            ttl_min: 0,
+            restore: true,
+            verify_threads: 2,
+            state_stride: 8,
+            pending_gib: 0.0,
+        };
+        let legacy = Signature {
+            model: "m".into(),
+            pack: String::new(),
+            digest: "d".into(),
+            quant: "q".into(),
+            block_bytes: 8,
+            block_tokens: 64,
+        };
+        let live = Signature { pack: "p-live".into(), ..legacy.clone() };
+        let other = Signature { pack: "p-other".into(), ..legacy.clone() };
+        fs::write(dir.join("blocks").join("ab").join("ab1234.bin"), [7u8; 8]).unwrap();
+        let m = Manifest {
+            format: FORMAT_LEGACY,
+            blocks: vec![
+                BlockEntry {
+                    chain: "ab1234".into(),
+                    key: "k".into(),
+                    prev: None,
+                    tokens: vec![1, 2],
+                    bytes: 8,
+                    sig: legacy.clone(),
+                    last_used_ms: 1,
+                },
+                BlockEntry {
+                    chain: "ab5678".into(),
+                    key: "k".into(),
+                    prev: None,
+                    tokens: vec![3, 4],
+                    bytes: 8,
+                    sig: other.clone(),
+                    last_used_ms: 1,
+                },
+            ],
+            states: Vec::new(),
+        };
+        fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m).unwrap()).unwrap();
+        let (blocks, st) = scan(&cfg, Some(&live));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(st.migrated, 1);
+        assert_eq!(st.foreign, 1);
+        assert_eq!(blocks["ab1234"].sig, live);
+        // A v4 manifest indexes only live-pack entries: a different pack is foreign, and
+        // an empty pack (which only a v3 writer ever produced) is no longer trusted.
+        let mut v4ok = m.blocks[0].clone();
+        v4ok.sig = live.clone();
+        let v4other = m.blocks[1].clone();
+        let mut v4blank = m.blocks[0].clone();
+        v4blank.chain = "ab4321".into();
+        let m4 = Manifest {
+            format: FORMAT,
+            blocks: vec![v4ok, v4other, v4blank],
+            states: Vec::new(),
+        };
+        fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m4).unwrap()).unwrap();
+        let (blocks, st) = scan(&cfg, Some(&live));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(st.migrated, 0);
+        assert_eq!(st.foreign, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The fingerprint follows the file's bytes where the signature must: head or tail
+    /// changes move it, an unrelated rename of the same bytes does not (name is hashed,
+    /// so a rename DOES move it - by design: the path is part of the model's identity).
+    #[test]
+    fn pack_fingerprint_tracks_content() {
+        let dir = std::env::temp_dir().join(format!("ct-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("model-00001-of-00001.gguf");
+        fs::write(&f, vec![1u8; 1 << 18]).unwrap();
+        let a = pack_fingerprint(&f);
+        assert!(!a.is_empty());
+        let mut bytes = vec![1u8; 1 << 18];
+        bytes[(1 << 18) - 8..].copy_from_slice(&[9u8; 8][..]);
+        fs::write(&f, &bytes).unwrap();
+        let b = pack_fingerprint(&f);
+        assert_ne!(a, b, "a tail change must move the fingerprint");
+        // Split shards all count: touching a sibling moves the whole fingerprint.
+        fs::write(&f, vec![1u8; 1 << 18]).unwrap();
+        let s = dir.join("model-00002-of-00002.gguf");
+        fs::write(&s, vec![3u8; 1 << 17]).unwrap();
+        let c = pack_fingerprint(&f);
+        fs::write(&s, vec![4u8; 1 << 17]).unwrap();
+        let d = pack_fingerprint(&f);
+        assert_ne!(c, d, "a shard change must move the fingerprint");
+        assert_eq!(shard_stem("model-00001-of-00002.gguf").as_deref(), Some("model"));
+        assert_eq!(shard_stem("plain.gguf"), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

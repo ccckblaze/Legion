@@ -13,6 +13,7 @@ fn json_overrides_thinking_and_template_kwargs() {
     let engine = LmEngine {
         vision: None,
         info: ModelInfo::default(),
+        conv_tier: None,
         chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer),
         undeclared_tool_calls: false,
         tokenizer,

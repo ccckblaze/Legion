@@ -6246,6 +6246,7 @@ impl LmEngine {
                         .model_name
                         .clone()
                         .unwrap_or_else(|| cfg.model_path.display().to_string()),
+                    pack: conv_tier::pack_fingerprint(&cfg.model_path),
                     digest: exec
                         .kv_cell_tensor_bytes()
                         .iter()
@@ -6258,13 +6259,14 @@ impl LmEngine {
                 };
                 let (blocks, st) = conv_tier::scan(&disk, Some(&sig));
                 tracing::info!(
-                    "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign), restore {}",
+                    "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign, {} v3 migrated), restore {}",
                     st.blocks,
                     st.states,
                     st.bytes as f64 / (1u64 << 30) as f64,
                     st.missing,
                     st.foreign,
-                    if disk.restore { "on" } else { "off" }
+                    if disk.restore { "on" } else { "off" },
+                    st.migrated
                 );
                 Some(conv_tier::ConvTier::start(disk, blocks, sig))
             }

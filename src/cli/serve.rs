@@ -1536,6 +1536,11 @@ struct EngineArgs {
     /// once; each parks two verified windows (~1.2 GiB) of host RAM while waiting.
     #[arg(long, value_name = "N", default_value_t = 4)]
     conv_disk_hydrate_tasks: usize,
+    /// Conversation cold tier (oMLX parity): the writer queue's byte ceiling - dumps past
+    /// it step aside (acked back, re-queued by a later completion or eviction) instead of
+    /// growing host RAM without bound when the disk falls behind. 0: no ceiling.
+    #[arg(long, value_name = "G", default_value_t = 64.0)]
+    conv_disk_pending_gib: f64,
     #[arg(long, value_name = "N")]
     prefix_cache_states: Option<usize>,
     /// Model engine, prefix caching on a model with recurrent layers (Qwen3.5+, Flash-Next,
@@ -2224,6 +2229,7 @@ pub async fn run(
                     !e.conv_disk_no_restore,
                     e.conv_disk_verify_threads,
                     e.conv_disk_state_stride,
+                    e.conv_disk_pending_gib,
                 )
                 .map(|(c, _)| c)
             });
