@@ -9222,9 +9222,23 @@ impl Worker {
                     }
                     copies.push((Pool::Seq, seq.slot, Pool::Saved, s.slot));
                     // The cold tier snapshots block-aligned prompt saves too.
+                    // Spaced checkpoints are thinned on the way to the disk (C6): the tier
+                    // keeps every anchor, the last four spaced points of the prompt, and one
+                    // per `state_stride` older points. A revive already walks back to the
+                    // deepest boundary with a state, so thinning costs re-prefill, never a
+                    // miss: the saved RAM and disk go to more conversations.
                     if self.conv.is_some() && seq.n_past % KV_BLOCK == 0 {
-                        let chain = conv_tier::chain_of(&seq.cache_key()[..seq.n_past]);
-                        self.conv_saves.push((s.slot, chain, seq.n_past as u64));
+                        let stride = self.conv.as_ref().expect("checked").cfg().state_stride;
+                        let step = self.prefix_interval.div_ceil(KV_BLOCK) * KV_BLOCK;
+                        let keep = kind != SaveKind::Spaced
+                            || stride == 0
+                            || step == 0
+                            || seq.prompt.len().saturating_sub(seq.n_past) <= 4 * step
+                            || seq.n_past % (stride * step) == 0;
+                        if keep {
+                            let chain = conv_tier::chain_of(&seq.cache_key()[..seq.n_past]);
+                            self.conv_saves.push((s.slot, chain, seq.n_past as u64));
+                        }
                     }
                 }
             }

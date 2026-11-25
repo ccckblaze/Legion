@@ -48,6 +48,11 @@ pub struct ConvDiskCfg {
     /// Read and hash blobs with this many workers while hydrating (`--conv-disk-verify-threads`):
     /// one thread hashes a full conversation's blocks in ~46 s, and it is the engine thread.
     pub verify_threads: usize,
+    /// Spaced prompt checkpoints land on disk every this many save points, plus the last four
+    /// of the prompt and every turn end (`--conv-disk-state-stride`; 0: dump every point).
+    /// A full-window conversation keeps 32 states at stride 1 and 10 at stride 8, and a revive
+    /// walks back to the deepest kept boundary either way (§368 C6).
+    pub state_stride: usize,
 }
 
 impl ConvDiskCfg {
@@ -263,8 +268,16 @@ pub fn boot(
     ttl_min: u64,
     restore: bool,
     verify_threads: usize,
+    state_stride: usize,
 ) -> Option<(ConvDiskCfg, Scanned)> {
-    let cfg = ConvDiskCfg { dir: dir.to_path_buf(), gib, ttl_min, restore, verify_threads };
+    let cfg = ConvDiskCfg {
+        dir: dir.to_path_buf(),
+        gib,
+        ttl_min,
+        restore,
+        verify_threads,
+        state_stride,
+    };
     for sub in ["blocks", "states", "pending"] {
         if let Err(e) = fs::create_dir_all(cfg.dir.join(sub)) {
             tracing::warn!("conv tier: {sub} under {}: {e}", cfg.dir.display());
@@ -1070,8 +1083,9 @@ mod tests {
             ttl_min: 0,
             restore: true,
             verify_threads: 2,
+            state_stride: 8,
         };
-        boot(&dir, 1.0, 0, true, 2).unwrap();
+        boot(&dir, 1.0, 0, true, 2, 8).unwrap();
         let sig =
             Signature { model: "m".into(), digest: "d".into(), quant: "q".into(), block_bytes: 8, block_tokens: 64 };
         let chain = "ab1234";

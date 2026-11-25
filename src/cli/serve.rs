@@ -1521,6 +1521,12 @@ struct EngineArgs {
     /// wall to a few seconds without changing any verdict (§366).
     #[arg(long, value_name = "N", default_value_t = 8)]
     conv_disk_verify_threads: usize,
+    /// Conversation cold tier, dump: keep one spaced prompt checkpoint every N save points, plus
+    /// the last four and every turn end. 32 states per full-window conversation become 10; a
+    /// revive walks back to the deepest kept boundary, so the price is at most one stride of
+    /// re-prefill on the thinned tail, never a wrong answer (0: keep every point, §368 C6).
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    conv_disk_state_stride: usize,
     #[arg(long, value_name = "N")]
     prefix_cache_states: Option<usize>,
     /// Model engine, prefix caching on a model with recurrent layers (Qwen3.5+, Flash-Next,
@@ -2208,6 +2214,7 @@ pub async fn run(
                     e.conv_disk_ttl_min,
                     !e.conv_disk_no_restore,
                     e.conv_disk_verify_threads,
+                    e.conv_disk_state_stride,
                 )
                 .map(|(c, _)| c)
             });
