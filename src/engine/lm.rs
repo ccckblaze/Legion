@@ -6210,11 +6210,11 @@ impl LmEngine {
         // or a tensor-parallel tier keep it off.
         let conv = match cfg.conv_disk.clone() {
             None => None,
-            Some(disk) if slot_blocks > 0 || ring.is_some() => {
+            Some(_) if slot_blocks > 0 || ring.is_some() => {
                 tracing::warn!("conv tier: needs the radix block cache, no slots or rings: off");
                 None
             }
-            Some(disk) if !exec.conv_tiers_addressable() => {
+            Some(_) if !exec.conv_tiers_addressable() => {
                 tracing::warn!("conv tier: a tensor-parallel host tier cannot be dumped: off");
                 None
             }

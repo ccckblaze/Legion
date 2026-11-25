@@ -24,9 +24,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -137,7 +136,7 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
     let shards = fs_shards(&cfg.dir);
     for path in shards {
         let Ok(raw) = fs::read(&path) else { continue };
-        let m: Manifest = match serde_json::from_slice(&raw) {
+        let m = match serde_json::from_slice::<Manifest>(&raw) {
             Ok(m) if m.format == FORMAT => m,
             _ => continue,
         };
@@ -294,7 +293,7 @@ impl ConvTier {
         // Re-read the state sidecars the boot scan counted (few of them).
         for path in fs_shards(&cfg.dir) {
             let Ok(raw) = fs::read(&path) else { continue };
-            let m: Manifest = match serde_json::from_slice(&raw) {
+            let m = match serde_json::from_slice::<Manifest>(&raw) {
                 Ok(m) if m.format == FORMAT => m,
                 _ => continue,
             };
@@ -520,7 +519,7 @@ fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(j) => j,
-            Err(TryRecvError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => break,
             Err(_) => {
                 if last_flush.elapsed() > Duration::from_secs(5) && !dirty.is_empty() {
                     flush(&inner, &mut dirty);
@@ -623,7 +622,7 @@ fn dump_state(inner: &Inner, j: StateJob, dirty: &mut HashSet<String>) {
 /// The cap is the hard wall (oMLX #5497): drop least-recently-used entries, blocks first,
 /// until the tier fits again. `--conv-disk-ttl-min` drops aged entries the same way.
 fn trim(inner: &Inner, dirty: &mut HashSet<String>) {
-    let cap = inner.cfg.cap_bytes;
+    let cap = inner.cfg.cap_bytes();
     let ttl = inner.cfg.ttl_min;
     let age_ms = if ttl > 0 { Some((ttl as u64).saturating_mul(60_000)) } else { None };
     let over = *inner.bytes.lock().unwrap() > cap;
