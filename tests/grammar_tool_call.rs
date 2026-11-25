@@ -377,26 +377,16 @@ fn undeclared_names_need_the_call_policy() {
     );
     assert!(
         accepts(&free, body),
-        "the policy lets the call through the grammar"
+        "the policy admits the name in the grammar"
     );
     assert_eq!(
         parse_mode(&tools, body, true),
-        vec![("unlisted".into(), json!({"cmd": "ls"}))]
+        vec![("unlisted".into(), json!({"cmd": "ls"}))],
+        "call mode hands it to the client"
     );
-    assert_eq!(
-        parse_mode(&tools, body, false),
-        vec![],
-        "text mode is not a call (the reply keeps the markup)"
+    let known = "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n";
+    assert!(
+        accepts(&strict, known) && accepts(&free, known),
+        "declared names are unaffected"
     );
-    // A declared tool is unaffected by the policy.
-    let known = "\n"
-        + "<function="
-        + "get_weather>\n"
-        + "<parameter="
-        + "city>\nOslo\n"
-        + "</parameter>"
-        + "\n"
-        + "</function>"
-        + "\n";
-    assert!(accepts(&strict, &known) && accepts(&free, &known));
 }

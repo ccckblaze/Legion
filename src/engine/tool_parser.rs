@@ -370,7 +370,8 @@ mod tests {
 
     #[test]
     fn hermes_undeclared_name_follows_the_policy() {
-        let body = format!("{OPEN}{\"name\": \"unlisted\", \"arguments\": {\"x\": 1}}{CLOSE}");
+        let json = r#"{"name": "unlisted", "arguments": {"x": 1}}"#;
+        let body = format!("{OPEN}{json}{CLOSE}");
         assert_eq!(
             run(HermesParser::new(&tools(), false), &[&body]).0,
             vec![text(&body)]
