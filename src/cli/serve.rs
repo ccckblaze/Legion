@@ -1170,6 +1170,16 @@ impl ModelArgs {
     }
 }
 
+/// What to do with a well-formed call naming a tool the request did not declare.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(super) enum UndeclaredToolCallsArg {
+    /// Leave the block in the reply's text, as an unparsed call always has (`--spec`'s tool
+    /// markup included).
+    Text,
+    /// Hand it to the client as a tool call, so a drifted name stays on the tool channel.
+    Call,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(super) enum ExpertMv {
     Legion,
@@ -1543,6 +1553,11 @@ struct EngineArgs {
     /// sequences kept for prefix caching, the tokens it shares with each and its checkpoints.
     #[arg(long)]
     ring_checkpoint_log: bool,
+    /// Tool calls: `call` hands a well-formed call naming a tool the request did not declare to
+    /// the client instead of leaving its markup in the reply text. A drifted name then reaches
+    /// the tool channel (the client reports an unknown tool) rather than the conversation.
+    #[arg(long, value_enum, default_value_t = UndeclaredToolCallsArg::Text)]
+    undeclared_tool_calls: UndeclaredToolCallsArg,
     /// Model engine, debug (#46): with --prefix-cache-interval, end a prefill step at every
     /// point as before in-step saves (one more step per point), even where the step could save
     /// the state inside it. Off by default; for comparing the two ways' bits.
@@ -2181,18 +2196,15 @@ pub async fn run(
             let prefill_chunk = e.prefill_chunk.unwrap_or_else(|| {
                 legion::engine::lm::default_prefill_chunk(device, integrated, max_batch_tokens)
             });
-            let conv_disk = e
-                .conv_disk
-                .as_deref()
-                .and_then(|d| {
-                    legion::engine::lm::conv_tier::boot(
-                        d,
-                        e.conv_disk_gib,
-                        e.conv_disk_ttl_min,
-                        !e.conv_disk_no_restore,
-                    )
-                    .map(|(c, _)| c)
-                });
+            let conv_disk = e.conv_disk.as_deref().and_then(|d| {
+                legion::engine::lm::conv_tier::boot(
+                    d,
+                    e.conv_disk_gib,
+                    e.conv_disk_ttl_min,
+                    !e.conv_disk_no_restore,
+                )
+                .map(|(c, _)| c)
+            });
             let cfg = LmConfig {
                 model_path,
                 mmproj: e.model.mmproj.clone(),
@@ -2220,6 +2232,7 @@ pub async fn run(
                 ring_checkpoint_every: e.ring_checkpoint_every,
                 ring_checkpoint_span: e.ring_checkpoint_span,
                 ring_checkpoint_log: e.ring_checkpoint_log,
+                undeclared_tool_calls: e.undeclared_tool_calls == UndeclaredToolCallsArg::Call,
                 deterministic_gather,
                 admit_gather,
                 prefix_capture_cut: e.prefix_capture_cut,

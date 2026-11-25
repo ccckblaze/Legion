@@ -41,12 +41,15 @@ fn check_parsers(format: &ChatFormat, reasoning: &str, call: &str) {
     assert_eq!(thought, "plan");
     assert_eq!(answer, "answer");
 
-    let mut parser = format.tool_parser(&[Tool {
-        name: "lookup".into(),
-        description: None,
-        parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
-        strict: false,
-    }]);
+    let mut parser = format.tool_parser(
+        &[Tool {
+            name: "lookup".into(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+            strict: false,
+        }],
+        false,
+    );
     let mut events = Vec::new();
     for c in call.chars() {
         events.extend(parser.push(&c.to_string()));

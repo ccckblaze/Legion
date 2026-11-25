@@ -193,6 +193,7 @@ fn strict_tools_constrain_only_inside_a_call() {
                 strict: Some(&schema),
             }],
             end,
+            false,
         )
         .unwrap();
     let n = vocab().vocab_size();

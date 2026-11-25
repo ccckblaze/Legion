@@ -21,13 +21,13 @@ const VALUE_CLOSE: &str = "</arg_value>";
 pub struct GlmParser(pub(super) Core);
 
 impl GlmParser {
-    pub fn new(tools: &[Tool]) -> Self {
-        Self(Core::new(parse_glm, tools))
+    pub fn new(tools: &[Tool], call_undeclared: bool) -> Self {
+        Self(Core::new(parse_glm, tools, call_undeclared))
     }
 }
 
 /// `NAME<arg_key>...` into `(name, arguments json)`.
-fn parse_glm(body: &str, tools: &[Tool]) -> Option<(String, String)> {
+fn parse_glm(body: &str, tools: &[Tool], _call_undeclared: bool) -> Option<(String, String)> {
     let body = body.trim();
     let end = body.find(KEY_OPEN).unwrap_or(body.len());
     let name = body[..end].trim();
