@@ -144,6 +144,18 @@ pub struct KvPool {
     views: Context,
 }
 
+/// One KV pool tensor's cold-tier dump geometry ([`KvPool::block_template`]): the
+/// address of block 0's bytes on the device side (`dev`) and, for a tiered tensor, of
+/// block `hbm`'s bytes in the pinned arena (`host`), and the bytes one block takes.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvBlockBase {
+    pub dev: usize,
+    pub host: Option<usize>,
+    pub stride: usize,
+    pub hbm: usize,
+    pub device: u32,
+}
+
 /// A KV pool's host tier (#352): blocks from `hbm_blocks` on live in pinned host memory on NUMA
 /// node `node` (the one closest to CUDA device `device`), read over the link at its full rate
 /// (68.5 GB/s per V100 on an AC922).
@@ -741,6 +753,73 @@ impl KvPool {
             }
         }
         out
+    }
+
+    /// The conversation cold tier's dump geometry: one entry per tensor
+    /// [`Self::bytes_per_block`] counts, in that order. A block's bytes are the
+    /// entries' `stride`-sized ranges at `block` indices, `dev` for VRAM blocks and
+    /// `host` (the pinned arena, CPU-addressable) for the blocks from `hbm` on.
+    /// The tier's chain-addressed blobs and hydrates both read blocks in exactly
+    /// this order: do not reorder without a format bump.
+    pub fn block_template(&self, device: u32) -> Vec<ConvBlockBase> {
+        let mut out: Vec<ConvBlockBase> = Vec::new();
+        for il in 0..self.dims.len() {
+            if self.dims[il].is_none() || self.ring_layers[il] || self.source[il] != il {
+                continue;
+            }
+            // A compact or K-only cache holds both in one granule tensor; its `cache_v`
+            // alias is the same bytes, so it never appears here.
+            let one_granule = self.compact[il] > 0 || self.k_only[il];
+            for kind in if one_granule { ["k"].as_slice() } else { ["k", "v"].as_slice() } {
+                let name = format!("cache_{kind}-{il}");
+                if let Some(t) = self.ctx.tensor(&name) {
+                    // An untiered pool's tensor: VRAM, or all host in a spilled pool.
+                    out.push(self.plain_base(&t, device));
+                } else if let Some(t) = self.tiers.iter().find_map(|c| c.tensor(&name)) {
+                    // A tiered range: its VRAM blocks in this VA, its arena blocks in
+                    // the arena tensor (CPU addresses). No arena: a tensor-parallel
+                    // tier, which [`Executor::conv_tiers_addressable`] keeps out.
+                    let Some(ht) = self
+                        .arena
+                        .as_ref()
+                        .and_then(|a| a.tensor(&format!("host_{name}")))
+                    else {
+                        continue;
+                    };
+                    out.push(ConvBlockBase {
+                        dev: unsafe { t.data_addr() } as usize,
+                        host: Some(unsafe { ht.data_addr() } as usize),
+                        stride: KV_BLOCK * t.nb()[1],
+                        hbm: self.hbm_blocks,
+                        device,
+                    });
+                }
+            }
+            if let Some(t) = self.ctx.tensor(&format!("cache_idx-{il}")) {
+                out.push(self.plain_base(&t, device));
+            }
+        }
+        if self.tiers.is_empty() || self.arena.is_some() {
+            debug_assert_eq!(
+                out.iter().map(|e| e.stride).sum::<usize>(),
+                self.bytes_per_block(),
+                "the cold tier's block template must cover exactly [`Self::bytes_per_block`]"
+            );
+        }
+        out
+    }
+
+    /// One [`Self::block_template`] entry for a pool-context tensor: never host unless
+    /// the whole pool is.
+    fn plain_base(&self, t: &Tensor<'_>, device: u32) -> ConvBlockBase {
+        let ptr = unsafe { t.data_addr() } as usize;
+        ConvBlockBase {
+            dev: ptr,
+            host: self.host.then_some(ptr),
+            stride: KV_BLOCK * t.nb()[1],
+            hbm: if self.host { 0 } else { usize::MAX },
+            device,
+        }
     }
 
     /// Bytes per cell of layer `il`'s own K and V (`row` values each, K only for a K-only

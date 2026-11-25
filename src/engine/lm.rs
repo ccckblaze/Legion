@@ -82,7 +82,7 @@ use super::{
 };
 use crate::chat_template::ChatTemplate;
 use crate::gguf::GgufFile;
-use crate::kv::{BlockPool, BlockTable, radix::RadixCache};
+use crate::kv::{BlockId, BlockPool, BlockTable, radix::RadixCache};
 use crate::model::core::{
     Executor, Group, KV_BLOCK, KvPool, KvRing, Logits, Media, Model, PROMPT_GRAPHS, Pool,
     PromptNext, SeqInput, SpecPool, StatePool,
@@ -6203,6 +6203,55 @@ impl LmEngine {
             _ => None,
         };
         exec.set_tier_passes(tier_step.is_some());
+        // The conversation cold tier (`--conv-disk`): whole prompt blocks and
+        // block-aligned saved states land on NVMe behind the engine, and (C3) revive a
+        // conversation after a restart without recomputing it. It needs the radix
+        // tree's block identity and host tiers the writer can address; slots, rings,
+        // or a tensor-parallel tier keep it off.
+        let conv = match cfg.conv_disk.clone() {
+            None => None,
+            Some(disk) if slot_blocks > 0 || ring.is_some() => {
+                tracing::warn!("conv tier: needs the radix block cache, no slots or rings: off");
+                None
+            }
+            Some(disk) if !exec.conv_tiers_addressable() => {
+                tracing::warn!("conv tier: a tensor-parallel host tier cannot be dumped: off");
+                None
+            }
+            Some(disk) => {
+                let sig = conv_tier::Signature {
+                    model: cfg
+                        .model_name
+                        .clone()
+                        .unwrap_or_else(|| cfg.model_path.display().to_string()),
+                    digest: exec
+                        .kv_cell_tensor_bytes()
+                        .iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join("-"),
+                    quant: format!("{:?}", exec.kv_types()),
+                    block_bytes: exec.kv_block_bytes() as u64,
+                    block_tokens: KV_BLOCK as u32,
+                };
+                let (blocks, st) = conv_tier::scan(&disk, Some(&sig));
+                tracing::info!(
+                    "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign), restore {}",
+                    st.blocks,
+                    st.states,
+                    st.bytes as f64 / (1u64 << 30) as f64,
+                    st.missing,
+                    st.foreign,
+                    if disk.restore { "on" } else { "off" }
+                );
+                Some(conv_tier::ConvTier::start(disk, blocks, sig))
+            }
+        };
+        let conv_tmpl = if conv.is_some() {
+            exec.conv_block_template()
+        } else {
+            Vec::new()
+        };
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -6263,6 +6312,9 @@ impl LmEngine {
             ring_ckpt_span: cfg.ring_checkpoint_span,
             ring_ckpts_log: cfg.ring_checkpoint_log,
             saved: SavedStates::new(saved_slots),
+            conv,
+            conv_tmpl,
+            conv_saves: Vec::new(),
             prefix_interval: cfg.prefix_cache_interval,
             gather: cfg.deterministic_gather,
             admit_gather: cfg.admit_gather,
@@ -6645,6 +6697,15 @@ struct Worker {
     /// Prompt prefixes whose KV blocks are kept for reuse (`None`: prefix caching off).
     radix: Option<RadixCache>,
     saved: SavedStates,
+    /// The conversation cold tier (`--conv-disk`): whole blocks and block-aligned saved
+    /// states written behind the engine ([`conv_tier`]); `None`: off.
+    conv: Option<conv_tier::ConvTier>,
+    /// [`Executor::conv_block_template`], taken once at load: where a block id's bytes
+    /// live in every pool, block by block.
+    conv_tmpl: Vec<crate::model::core::ConvBlockBase>,
+    /// Saved-state stores whose copies the step has still to make: (saved slot, chain of
+    /// its block-aligned prefix, prefix tokens); flushed after [`Executor::copy_states`].
+    conv_saves: Vec<(usize, String, u64)>,
     /// [`LmConfig::prefix_cache_interval`].
     prefix_interval: usize,
     /// [`LmConfig::deterministic_gather`].
@@ -7738,6 +7799,57 @@ impl Worker {
         }
     }
 
+    /// Queue cold-tier dumps of the whole blocks of `tokens`, held by the block ids of
+    /// `blocks` (a sequence's table order). Chains the tier already stores or has
+    /// queued skip the slice build; the dumped blocks are referenced until the writer
+    /// has flushed them, and [`Self::step`] gives the references back on its acks.
+    /// Content-addressed (the chain is the token prefix's hash), so it is safe to call
+    /// for the same prompt again: the tier dedups.
+    fn conv_dump_blocks(&mut self, tokens: &[u32], blocks: &[BlockId]) {
+        let Some(tier) = self.conv.clone() else {
+            return;
+        };
+        let n = (tokens.len() / KV_BLOCK).min(blocks.len());
+        if n == 0 {
+            return;
+        }
+        let chains = conv_tier::block_chains(&tokens[..n * KV_BLOCK], KV_BLOCK);
+        let mut jobs = Vec::new();
+        for bi in 0..n {
+            if tier.have(&chains[bi]) {
+                continue;
+            }
+            let b = blocks[bi].0 as usize;
+            let slices = self
+                .conv_tmpl
+                .iter()
+                .map(|e| match e.host {
+                    Some(h) if b >= e.hbm => conv_tier::Slice {
+                        ptr: h + (b - e.hbm) * e.stride,
+                        len: e.stride,
+                        mem: conv_tier::Mem::Host,
+                    },
+                    _ => conv_tier::Slice {
+                        ptr: e.dev + b * e.stride,
+                        len: e.stride,
+                        mem: conv_tier::Mem::Dev(e.device),
+                    },
+                })
+                .collect();
+            jobs.push(conv_tier::BlockJob {
+                id: b as u32,
+                slices,
+                tokens: tokens[bi * KV_BLOCK..(bi + 1) * KV_BLOCK].to_vec(),
+                chain: chains[bi].clone(),
+                prev: bi.checked_sub(1).map(|p| chains[p].clone()),
+            });
+            self.pool.incref(blocks[bi]);
+        }
+        if !jobs.is_empty() {
+            tier.queue_blocks(jobs);
+        }
+    }
+
     /// Saves finished `seq`'s state, which holds its first `state_at` tokens (prompt and reply),
     /// for the next turn of its chat, which resends them ([`super::saved_states`]): their full
     /// blocks go into the radix tree, and the saved entry keeps the partly filled block after
@@ -7765,6 +7877,7 @@ impl Worker {
             return;
         }
         radix.insert(&mut self.pool, tokens, seq.table.blocks());
+        self.conv_dump_blocks(tokens, seq.table.blocks());
         // Past the prompt's partial block (which the radix tree never holds), so only this
         // sequence holds it.
         let tail = (!state_at.is_multiple_of(KV_BLOCK)).then(|| {
@@ -7778,6 +7891,10 @@ impl Worker {
                     self.pool.decref(b);
                 }
                 copies.push((Pool::Seq, seq.slot, Pool::Saved, s.slot));
+                // The cold tier snapshots block-aligned saves once the step's copy lands.
+                if self.conv.is_some() && state_at % KV_BLOCK == 0 {
+                    self.conv_saves.push((s.slot, conv_tier::chain_of(tokens), state_at as u64));
+                }
             }
             None => {
                 if let Some(b) = tail {
@@ -8272,6 +8389,11 @@ impl Worker {
         prefilling: &mut Vec<Seq<'t>>,
     ) -> Result<(), String> {
         let batch = decoding.len();
+        // Blocks the cold tier's writer has flushed may go back to the pool.
+        let acks = self.conv.as_ref().map(|t| t.drain_acks()).unwrap_or_default();
+        for id in acks {
+            self.pool.decref(BlockId(id));
+        }
         let mut at = Instant::now();
         let Some(plan) = self.plan_step(decoding, prefilling, batch)? else {
             return Ok(());
@@ -8942,6 +9064,11 @@ impl Worker {
                         self.pool.decref(b);
                     }
                     copies.push((Pool::Seq, seq.slot, Pool::Saved, s.slot));
+                    // The cold tier snapshots block-aligned prompt saves too.
+                    if self.conv.is_some() && seq.n_past % KV_BLOCK == 0 {
+                        let chain = conv_tier::chain_of(&seq.cache_key()[..seq.n_past]);
+                        self.conv_saves.push((s.slot, chain, seq.n_past as u64));
+                    }
                 }
             }
             // A checkpoint of the ring inside the prompt's last part, where the next prompt of
@@ -8965,6 +9092,7 @@ impl Worker {
             if let Some(radix) = &mut self.radix {
                 radix.insert(&mut self.pool, seq.cache_key(), seq.table.blocks());
             }
+            self.conv_dump_blocks(seq.cache_key(), seq.table.blocks());
             // The ring at the end of the prompt, for the next turn of a chat (which resumes
             // there: the reply's reasoning is not in its prompt) once the reply has gone
             // past what the ring holds.
@@ -9431,6 +9559,17 @@ impl Worker {
         }
         self.clock.lap(host_time::Phase::Finish, &mut at);
         let copied = self.exec.copy_states(&copies).map_err(|e| e.to_string());
+        // Block-aligned saved states the step just copied: snapshot and queue them.
+        if copied.is_ok() {
+            for (slot, chain, tokens) in std::mem::take(&mut self.conv_saves) {
+                let bytes = self.exec.conv_state_snapshot(slot);
+                if let Some(tier) = &self.conv {
+                    tier.queue_state(conv_tier::StateJob { bytes, tokens, chain });
+                }
+            }
+        } else {
+            self.conv_saves.clear();
+        }
         if self.state_digests && copied.is_ok() {
             for &(_, _, to, s) in &copies {
                 if to == Pool::Saved

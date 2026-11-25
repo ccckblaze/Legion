@@ -893,6 +893,19 @@ impl<'a> Tensor<'a> {
         out
     }
 
+    /// The tensor's data address: host bytes for host buffers and a tiered buffer's
+    /// host part, a device virtual address for CUDA buffers. The conversation cold
+    /// tier reads host ranges directly and device ranges through `cudaMemcpyAsync`;
+    /// never dereference the returned pointer as a slice unless the buffer is host.
+    ///
+    /// # Safety
+    /// The caller guarantees the tensor is allocated and its memory outlives the use
+    /// of the address, and upholds the exclusivity rule of [`Self::host_bytes_mut`]
+    /// for host ranges.
+    pub unsafe fn data_addr(self) -> *mut u8 {
+        unsafe { (*self.raw()).data.cast::<u8>() }
+    }
+
     /// Copies the tensor's first `n` bytes out (host or device): the first rows of a matrix.
     pub fn bytes_prefix(self, n: usize) -> Vec<u8> {
         assert!(

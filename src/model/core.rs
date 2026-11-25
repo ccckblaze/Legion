@@ -130,7 +130,9 @@ pub use spec::{
     set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
     tp_commit_in_verify_min_seqs,
 };
-pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
+pub use state::{
+    ConvBlockBase, KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a,
+};
 
 use crate::ggml::{
     Backend, BufferType, ComputeAllocator, Context, GgmlError, Graph, Tensor, types,

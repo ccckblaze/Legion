@@ -32,6 +32,19 @@ impl StatePool {
         out.push(("tokens".to_string(), fnv1a(&bytes)));
         out
     }
+
+    /// Appends `slot`'s state tensor bytes, in [`Self::slot_digests`]'s tensor order
+    /// (without the token history, which the cold tier keeps as the snapshot's chain):
+    /// the conversation cold tier's state snapshot shape. Reads each tensor back (from
+    /// the device) on the calling thread; the caller orders this after the copies that
+    /// wrote the slot.
+    pub fn append_slot_bytes(&self, slot: usize, out: &mut Vec<u8>) {
+        assert!(slot < self.n_slots, "slot {slot} out of range");
+        for t in self.tensors() {
+            let per = t.nb()[3];
+            out.extend_from_slice(&t.bytes_at(slot * per, per));
+        }
+    }
 }
 
 #[cfg(test)]

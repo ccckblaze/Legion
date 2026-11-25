@@ -22,7 +22,7 @@ use crate::ggml::{
 use super::kv_type::KvTypes;
 use super::mtp::MtpOutput;
 use super::spec::SpecPool;
-use super::state::{KvPool, KvRing, KvTier, StatePool};
+use super::state::{ConvBlockBase, KvPool, KvRing, KvTier, StatePool};
 use super::{
     GRAPH_SIZE, Group, GroupShape, Hparams, InputParts, Inputs, KV_BLOCK, Logits, Model,
     ModelError, SeqInput, StepOpts, StepOutput, batch_shape, graph_size, shape_diff, with_kv,
@@ -1170,6 +1170,57 @@ impl Executor {
             .map(|s| s.kv.bytes_per_block())
             .chain(self.mtp_kv.as_ref().map(KvPool::bytes_per_block))
             .sum()
+    }
+
+    /// The conversation cold tier's dump geometry over every pool (the stages' and the
+    /// MTP head's own), in [`Self::kv_block_bytes`]'s order and tensors' (`cell` order
+    /// of [`Self::kv_cell_tensor_bytes`]). A block's bytes are these bases advanced by
+    /// `block × stride`; the tier writes and hydrates them in this exact order.
+    pub fn conv_block_template(&self) -> Vec<ConvBlockBase> {
+        let n = self.stages.len();
+        self.stages
+            .iter()
+            .enumerate()
+            .flat_map(|(si, s)| s.kv.block_template(self.conv_device(si)))
+            .chain(
+                self.mtp_kv
+                    .as_ref()
+                    .map(|m| m.block_template(self.conv_device(n.saturating_sub(1))))
+                    .unwrap_or_default(),
+            )
+            .collect()
+    }
+
+    /// A saved slot's recurrent state bytes, every stage's saved pool in order: the
+    /// conversation cold tier's state snapshot shape. Reads back from the device on the
+    /// calling (engine) thread, after the step's [`Self::copy_states`] wrote the slot.
+    pub fn conv_state_snapshot(&self, slot: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in &self.stages {
+            s.saved.append_slot_bytes(slot, &mut out);
+        }
+        out
+    }
+
+    /// Whether the cold tier can address every pool's host tier: a tensor-parallel
+    /// tier's host part lives in per-GPU meta slices the dump cannot name, so the
+    /// tier stays off there.
+    pub fn conv_tiers_addressable(&self) -> bool {
+        self.kv_tiers.iter().flatten().all(|t| t.split.is_none())
+    }
+
+    /// The CUDA index a stage's blocks live on, for the cold tier's device copies.
+    fn conv_device(&self, si: usize) -> u32 {
+        if let Some(Some(t)) = self.kv_tiers.get(si) {
+            return t.device as u32;
+        }
+        self.stages[si]
+            .backend
+            .device()
+            .name()
+            .strip_prefix("CUDA")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
     }
 
     /// The KV host tier's staging slots, in blocks (0 without a tier or staging).
