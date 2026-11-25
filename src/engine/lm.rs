@@ -6265,8 +6265,8 @@ impl LmEngine {
                     st.bytes as f64 / (1u64 << 30) as f64,
                     st.missing,
                     st.foreign,
+                    st.migrated,
                     if disk.restore { "on" } else { "off" },
-                    st.migrated
                 );
                 Some(conv_tier::ConvTier::start(disk, blocks, sig))
             }

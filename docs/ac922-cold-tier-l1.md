@@ -263,3 +263,68 @@ and the answer sha must equal the cold-computed sha.
   production `gate.sh` (det×3, IMG, undecl) instead, run on the same tier.
 - Adopted: `lane.env LEGION_BIN=/data/work/legion/bin-D1fix`, prod boot 01:44
   (`legion-4-20261126-014405.log`), tier lines and warmup hydrations normal.
+
+## L2: the oMLX convergence pass (2026-11-26, `aa1b25d`)
+
+The audit against oMLX main (`12a577be`) found the cold tier already carries most of the
+mechanisms: chain-keyed block identity, boot scan revival, the global capped LRU (#5497),
+link-or-refuse staging (#5543), the signature gate, TTL, state sidecars (C6 stride),
+write-through at prompt completion, and the stats surface. Four real gaps remained, all
+closed in L2. None of them touches the numerics: key hygiene, write-side flow control,
+crash consistency, and one hash-library bug.
+
+### Mechanism matrix (oMLX → Legion)
+
+| oMLX mechanism                    | pre-L2 Legion                                  | post-L2                                   |
+| --------------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| chain-hash block keys             | had it                                         | unchanged                                 |
+| boot scan revive                  | had it                                         | + `N v3 migrated` in the live line        |
+| global cap LRU eviction           | had it                                         | unchanged                                 |
+| bounded pending writer (#5543)    | unbounded queue                                | `--conv-disk-pending-gib` (default 64)    |
+| signature gate                    | model/digest/quant/dims only                   | + pack content fingerprint (FORMAT=4)     |
+| key hygiene on pack swap          | stale tier trusted                             | v3 re-signed once, v4 foreign on mismatch |
+| fsync on publish                  | rename without sync                            | `sync_file` before, `sync_dir` after      |
+| interrupted-write residue         | `pending/` orphans left forever                | boot clears them, logged                  |
+| pooling-delta dumps               | considered, rejected (shape mismatch)          | unchanged                                 |
+
+### Pack fingerprint (FORMAT 3 → 4)
+
+`Signature.pack` is `pack_fingerprint(model_path)`: over the GGUF and its `-NNNNN-of-NNNNN`
+shard siblings, per file name+size+mtime+first 64 KiB+last 64 KiB, sha256-aggregated. The
+gate it closes: previously a re-quantized or re-exported pack at the same path kept serving
+old blobs whose KV bytes no longer match the new weights - silently wrong continuations.
+Migration is read-side: a v3 manifest's `pack`-less entries that otherwise agree with the
+live signature enter the index re-signed (durable at the next shard flush), so the 45.7 GiB
+production tier survives the upgrade at zero recompute. The legacy trust is scoped to the
+v3 *format*: a v4 entry with an empty pack is corruption or a downgrade attempt, counted
+foreign. A v4 scan against the same model but different pack bytes is foreign too - the
+fingerprint test pins head/tail sensitivity.
+
+### Write-side backpressure
+
+`Inner.pending` counts staged dump bytes; over `pending_gib` a revive order steps aside
+(ids acked, chain not occupied, `dumps_backpressured++` in `/health`) rather than piling
+an unbounded writer queue during a big eviction storm. `0` restores the unbounded shape.
+
+### The Sha256 tail bug (found here, largest quality win of the pass)
+
+`Sha256::update` reset `buf_len` to the remainder instead of adding to it, so a stream
+ending with a partly-filled block after a prior non-empty buffer dropped the tail bytes -
+`sha256(b"abc")` was wrong. It is unreachable for the product paths: chain hashes run on
+256-byte token blocks and blob keys on word-aligned byte counts, both multiples of the
+64-byte block, so the buffer is never partly filled at finish. Verified: identical digests
+before/after the fix across those producers - existing tier data stays valid, nothing
+needs re-signing. It only becomes live the moment a new caller hashes arbitrary lengths,
+which the added `sha256_vectors` test (FIPS vectors incl. the "abc" and multi-block cases)
+now guarantees.
+
+### L2 verification sequence (server)
+
+1. `cargo test --release --features cuda --lib conv_tier` - all green (6 tests incl. the
+   two new: `sha256_vectors`, `pack_fingerprint_tracks_content`; `scan_migrates_v3_and_gates_by_pack`
+   pins the re-sign + v4-foreign semantics).
+2. dev :8092 reboot: `conv tier: live ... (0 missing, 0 foreign, 18461 v3 migrated)`
+   expected on the dev2 tier, plus the pending-clear line; one par revive round, wall in
+   the 66 s band, errs 0.
+3. prod 4-card cutover to the new binary, `gate.sh 4` (det×3, acc, IMG, undecl) before
+   handback.
