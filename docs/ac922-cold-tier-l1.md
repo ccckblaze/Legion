@@ -78,9 +78,11 @@ Eviction: LRU over entries by `last_used`, `--conv-disk-ttl-min` (0: keep), and 
 4. Space gate: refuse writes past the cap; report bytes/parked-session at /health stats.
 
 Gate 1 note from implementation: `usage.cached_tokens` does not report hydrated or
-even RAM-radix hits on this engine (observed 0 on every repeat), so the live gate is
-the `conv tier: hydrated blocks=N tokens=M` INFO line plus wall plus the sha
-equality. N and M must both be > 0 and the answer sha must equal the warm sha.
+even RAM-radix hits on this engine when the harness was written (observed 0 on every
+repeat). It does report them now: a 261,917-token repeat after a restart logged
+`cached_tokens=261888`. Keep all three signals anyway - the `conv tier: hydrated
+blocks=N tokens=M` INFO line, the wall, and the sha equality; N and M must both be > 0
+and the answer sha must equal the cold-computed sha.
 
 ## Cut plan
 
@@ -121,7 +123,31 @@ equality. N and M must both be > 0 and the answer sha must equal the warm sha.
   predicts, while GPU-arm repeats are bit-identical (3x dev, 2x prod) and image
   encode is ~2.7 s vs ~32 s on CPU. Per-image cost is a one-time prefill, and the
   image prefix itself is radix-cached (`cached_tokens` on the repeat).
+- **4-card revive verification (2026-11-25 18:20-19:05, `eval/ct-revive.py`, four
+  distinct 261,917-token sessions, q8 KV, `--conv-disk-gib 200`)**:
+  - cold compute, sequential: 133.2-231.1 s per session (pp 1,179-2,073 tok/s), answers
+    and spans recorded as the reference.
+  - restart (RAM empty), then the same four sessions one at a time: 4/4 answer sha equal
+    to the cold reference - revive-det passes on the production geometry. Engine-side
+    `prefill_seconds` 0.3-0.5 s and 5.4-6.2 s of decode at 35.6-40.4 tok/s, but 51-53 s
+    of end-to-end span, because each request waits ~46 s in `queue_ms`.
+  - that ~46 s is the per-blob sha256 verification of the chain, not the read: 5.05 GiB
+    per session at ~112 MB/s single-threaded. Dropping the page cache beforehand changed
+    nothing measurable (54.6 s vs 52.7 s, `prefill_seconds` 0.361 both times), so the NVMe
+    is not the wall. Parallel or cheaper verification is the next cut and would take a
+    full-window revive from ~46 s to single-digit seconds.
+  - capacity price per parked full-window session: ~5.05 GiB of blocks plus ~3.6 GiB of
+    state checkpoints, so the 200 GiB cap holds about 23 of them (/data free went
+    620 to 576 GiB over four sessions).
+  - C=4 revival burst: 267.6 s wall, 3.3 tok/s aggregate, per stream 1.8-40.5 tok/s.
+    Repeating that burst with everything already RAM-resident reproduced it (264.5 s,
+    3.3 tok/s, same collapse), and only one of four streams kept single-stream speed -
+    the tier is not the cause, this is the decode-window composition issue tracked in
+    [ac922-perf-seconddev.md](ac922-perf-seconddev.md). Greedy answers are not repeatable
+    between two identical C=4 bursts (3 of 4 shas moved), while every C=1 answer was
+    bit-identical to its cold reference: cite the C=1 numbers as the correctness gate.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
-  hydrated bytes/parked-session stats at `/health`; batched reader I/O; 4-card
-  revive-det once real sessions churn.
+  hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
+  tag (verification is the ~112 MB/s floor above, reads are not); the ~45 s wait a
+  full-window session pays before its first window even when nothing is being hydrated.
