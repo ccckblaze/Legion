@@ -28,6 +28,7 @@ LONG_ALONE=${LEGION_LONG_ALONE:-}
 LONG_MICRO=${LEGION_LONG_MICRO:-1024}
 SPEC_K=${LEGION_SPEC_K:-}
 MAX_SEQS=${LEGION_MAX_SEQS:-16}
+MAXB=${LEGION_MAX_BATCH:-4096}
 EXTRA=${LEGION_EXTRA:-}
 STATE=${LEGION_STATE:-/tmp/legion-lane.state}
 PIDF=${LEGION_PIDF:-/tmp/legion-lane.pid}
@@ -99,7 +100,7 @@ start() {
     --long-dataflow --long-dataflow-peer \
     --cache-type-k q8_0 --cache-type-v q8_0 \
     --kv-cache-tokens "$KV_VRAM" --kv-host-tokens "$KV_HOST" \
-    --expert-heat-pass-cap 1 --max-batch-tokens 4096 \
+    --expert-heat-pass-cap 1 --max-batch-tokens ${LEGION_MAX_BATCH:-4096} \
     --model-name qwen3.8-flash-next \
     "${FLAGS[@]}" $EXTRA >> "$LOG" 2>&1 </dev/null &
   echo $! > "$PIDF"
