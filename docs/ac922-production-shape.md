@@ -92,18 +92,25 @@ stamp; `touch build.rs` before building when you need the stamp to prove the bin
 ## Every boot, before traffic
 
 ```sh
+. /data/work/legion/lane.env       # LB_API_KEY and PROBE_KEY both derive from LEGION_API_KEY
+export LB_URL=http://127.0.0.1:8090 PROBE_BASE=$LB_URL
 L=$(ls -t /data/work/legion/logs/legion-4-*.log | head -1)
 grep -acE 'WARN|ERROR' "$L"                                    # expect 0
 grep -aE 'conv tier: live|memory plan part="host"|listening' "$L"
-python3 /data/work/legion/eval/qualLegion.py det               # three runs, same content sha
-python3 /data/work/vl-probe.py img                             # same amount, same answer sha
-python3 /data/work/legion/eval/undecl_probe.py call            # drifted names leave on the tool channel
+python3 /data/work/legion/eval/qualLegion.py det       # three runs, six per-prompt shas, identical
+python3 /data/work/vl-probe.py img                   # same amount, same answer sha
+python3 /data/work/legion/eval/undecl_probe.py call  # drifted names leave on the tool channel
 ```
+
+The probes read `PROBE_BASE`/`LB_URL` plus their own key variable, so a gate against a port other
+than the default 8097 needs both lines above. Compare one prompt's sha across the three runs *and*
+across boots: a boot that moves a sha is a numeric change, not a restart.
 
 A healthy boot says, in this order: `model loaded ... stages=[0..12, 12..24, 24..36, 36..48]
 experts=Cache ... kv_bytes_per_token=19200`, `conv tier: live N blocks M states ... restore on`
 followed by `hydrated`, `warmup shapes done ... seconds=7`, `listening on http://0.0.0.0:8090`,
-and about 42 seconds from process start to serving. The host line of the memory plan is the one to
+and serving 33 seconds after the log's first line (45 s from the launcher's stop to health). The
+host line of the memory plan is the one to
 read after any change to the cache flags: on this shape it reports `kv_host_tier_mib=14400
 saved_states_mib=453 expert_host_mib=73450 ngram_table_mib=27465 host_available_mib=150295`, and
 `VRAM after load` leaves 1.3-2.0 GiB free per card, so nothing else may be added to a card.
