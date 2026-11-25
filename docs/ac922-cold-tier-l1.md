@@ -220,3 +220,46 @@ and the answer sha must equal the cold-computed sha.
   (+130,944 tokens, +2,046 blobs), answer sha bit-identical, zero mismatches. Parked cost
   per full-window conversation: 8.6 GiB -> ~6.5 GiB (~30 sessions inside the 200 GiB cap).
   Production boot 22:5x CST carries it; gates (det x3, image, undeclared) all pass.
+
+## D1: hydrate off the engine thread (2026-11-25 late night)
+
+- The C6 numbers above are one conversation at a time. A C=4 burst paid an engine-thread
+  wall instead: pre-D1, `place()` read and sha-verified the disk run inside the step, so
+  four parked full-window resumes serialized ~10 s of disk+hashing each, head-blocking
+  every other stream's decode (§366: the burst's 4x10 s stall, agg ~4 while one stream ran).
+- D1 (`3f0999b`): a revival job gets a `HydrateTask` - a producer thread walks the chain
+  run (the same `plan()` the inline path used), reads and verifies blobs in bounded windows
+  (cap 2 windows ~ 1.2 GiB RAM per task), and holds the result. Each `place()` attempt
+  uploads what is ready, up to `--conv-disk-hydrate-budget` blocks (default 256 ~ 0.3 GiB
+  of engine-thread memcpy per window), parks the pool refs it took, and returns Wait; the
+  rest arrives across following windows. Disk and hashing therefore overlap decode instead
+  of stopping it, and different conversations' hydrations overlap each other. `0` = whole
+  plan in one attempt (the pre-D1 one-shot shape); `--conv-disk-hydrate-tasks` (default 4)
+  caps concurrent tasks - over-cap jobs place on memory alone, as before.
+- Dead jobs (client gone, plan aborted mid-drain) are swept at the step head: their parked
+  blocks are decref'd, their producers aborted. Bitwise: the bytes and their sha checks are
+  unchanged from C6, only the thread doing them moved - verified against the same tier
+  with the cold-baseline sha comparison in `eval/ct-revive.py` (bit-identical, see below).
+
+### D1 verification (2026-11-26): the idle-sleep bug, then the A/B
+
+- Boot hang (budget=0 twice, default once): D1 made `place()` park a job that advances at
+  the step head, but the `decoding/prefilling both empty` branch of the worker loop still
+  assumed the only cause was KV shortage - "which an idle engine never is" - and blocked
+  the worker in `rx.recv()`. The boot warmup's first revive has no next request to wake
+  it; the producer delivers its windows and exits, and nobody takes them. Signature: the
+  log's last line is `conv tier: live`, 182 threads all futex, no producer. `tasks=0`
+  booted because no task is ever born, which pinned the regression to the D1 path.
+- Fix (`25a8678`): `Waiting::awaits_hydrate` + a read-only `WaitQueue::any`; the idle
+  branch sleeps 5 ms on a hydrate in flight instead of sleeping on the channel.
+- A/B (dev 2-card :8092, the 4×131K seeded tier, par burst after each reboot):
+  pre-D1 C6 `wall 102.6 s` (spans 102.6/93.7/82.9/82.9) → D1 default (budget 256,
+  tasks 4) `wall 66.0 s` (−35.7%, spans 54.3/59.9/66.0/47.2) → D1 budget=0 (one-shot
+  upload) `wall 79.0 s` (−23%). The one-shot gain is the producers running ahead across
+  jobs; the per-step budget adds ~16% more of streaming uploads on top.
+- The burst's outputs are not bit-identical between the arms, nor between two par rounds
+  on the same binary (`exact:false` throughout): the revive-vs-cold drift predates D1
+  (§369's cold/cache asymmetry) and is not D1's doing; the adoption gate is the 4-card
+  production `gate.sh` (det×3, IMG, undecl) instead, run on the same tier.
+- Adopted: `lane.env LEGION_BIN=/data/work/legion/bin-D1fix`, prod boot 01:44
+  (`legion-4-20261126-014405.log`), tier lines and warmup hydrations normal.
