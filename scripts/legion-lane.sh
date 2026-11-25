@@ -7,6 +7,8 @@
 #   prefix cache ON (states 4, interval 8192).  123K C4 reburst agg 129.4,
 #   full-window 262K C4 agg 86.2, poison55 uniform, needle x3 + acc 6/6 + det sha equal.
 # Every tunable is an env override so a wave can boot arms without editing the file.
+LANE_ENV=${LEGION_LANE_ENV:-/data/work/legion/lane.env}
+[ -r "$LANE_ENV" ] && . "$LANE_ENV"
 set -uo pipefail
 
 BIN=${LEGION_BIN:-/data/work/legion-src/target/release/legion}

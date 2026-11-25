@@ -2,11 +2,12 @@
 # engine-agnostic quality gate: det x2 on 6 fixed prompts + accuracy checks + optional 123K needle.
 import hashlib, json, os, random, re, sys, time, urllib.request
 URL = os.environ.get("LB_URL", "http://127.0.0.1:8090")
+KEY = os.environ.get("LB_API_KEY", "")
 def ask(pt, mt=512, timeout=2400):
     body = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": pt}],
             "max_tokens": mt, "temperature": 0}
     req = urllib.request.Request(URL + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **({"x-api-key": KEY} if KEY else {})})
     with urllib.request.urlopen(req, timeout=timeout) as x:
         d = json.loads(x.read().decode())
     m = d["choices"][0]["message"]
