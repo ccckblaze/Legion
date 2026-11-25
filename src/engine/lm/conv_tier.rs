@@ -1301,7 +1301,10 @@ impl HydrateTask {
             match read_state_verified(&self.dir, &chain, &key, bytes) {
                 Some(b) => self.inner.lock().unwrap().state = Some(b),
                 None if tier.state(&chain).is_none() => return fail(&self, HydrateFault::Gone),
-                None => return fail(&self, HydrateFault::State),
+                None => {
+                    tracing::warn!("conv tier: revive aborted, state sidecar verification failed for {chain}");
+                    return fail(&self, HydrateFault::State);
+                }
             }
         }
         let mut at = 0usize;
