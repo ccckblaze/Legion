@@ -145,9 +145,10 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
             st_count += 1;
         }
     }
+    let found = blocks.len();
     (
         blocks,
-        Scanned { blocks: blocks.len(), states: st_count, bytes, missing, foreign },
+        Scanned { blocks: found, states: st_count, bytes, missing, foreign },
     )
 }
 
