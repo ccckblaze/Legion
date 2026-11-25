@@ -17,7 +17,30 @@ at the AC922's measured 2.2 GB/s write / 2.4 GB/s O_DIRECT read, one 123K sessio
 - `src/engine/lm/host_tier.rs` — pinned host tier, block bytes read by the GPU in place
   over NVLink2; a hydrated edge written into host-tier blocks is warm, no promotion step.
 
-## Design
+## Design (aligned to oMLX main @ 6ff0b269, 2026-11-25 pull)
+
+Keying is **content-addressed per KV block** (oMLX `PagedSSDBlockMetadata` shape), not
+per session: blob key = `sha256(block bytes)`, and the header metadata carries the
+compatibility signature (model digest, dims, quant, cache class, format version) —
+a block whose signature mismatches never matches, and identical blocks shared by
+several sessions are stored once (cross-session dedup is free at this granularity).
+
+Four write disciplines oMLX learned the hard way (their fixes: #5543, #5544, #5497,
+#5255) go into the spec up front:
+1. superseded async writes must never replace a newer file (write to `pending/`, then
+   link-or-refuse if the final path exists; a content-hash key is write-once);
+2. an inline write-through that lands makes the entry clean (no double queue);
+3. the size cap is **global across models** (`--conv-disk-gib` bounds the whole dir,
+   LRU trim over blocks, `touch()` O(1) via an intrusive list, not per-model ledgers);
+4. restart scan must re-register existing blobs and keep chains reachable in the hot
+   index, or a long shared prefix half-restores and the cold storm returns.
+
+Recurrent state is NOT sliceable, so it follows oMLX's `GDNCheckpointIndex` shape: a
+sidecar keyed by (chain hash, token position) written at every
+`--prefix-cache-interval` boundary; a restore needs the state blob for the deepest
+chain boundary the block set can satisfy, else the restore stops earlier.
+
+## Design (original sketch, superseded by the above where they differ)
 
 Restore = allocate pool blocks, write the file bytes into them, `RadixCache::insert`,
 `SavedStates::store` for the boundary state. From there the normal warm path runs.
