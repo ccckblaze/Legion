@@ -85,9 +85,12 @@ export CMAKE_CUDA_ARCHITECTURES=70
 CARGO_TARGET_DIR=/data/work/legion-ct-target cargo build --release --features cuda
 ```
 
-`legion --version` prints the commit (`legion 0.1.0 (649eb40, ggml unknown, cuda on)`). The stamp
-comes from build-time git metadata, so a rebuild that changes no Rust file can print the previous
-stamp; `touch build.rs` before building when you need the stamp to prove the binary.
+`legion --version` prints the commit (`legion 0.1.0 (be91f3b, ggml unknown, cuda on)`), taken from
+git metadata by `build.rs` at the start of the build. A docs-only commit changes nothing `build.rs`
+declares as an input, so `cargo build` finishes in under a second and the binary keeps the previous
+stamp: `touch build.rs` before building when the stamp has to prove the source, and note that this
+makes the whole ggml/CUDA side rebuild too (about 9 minutes here). A stamp one docs commit behind
+its source is not a functional gap, so no restart is spent on the stamp alone.
 
 ## Every boot, before traffic
 
