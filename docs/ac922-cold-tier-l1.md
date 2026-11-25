@@ -171,6 +171,12 @@ and the answer sha must equal the cold-computed sha.
     identical fixtures, different run lengths, so the short run was likely a walk stopping
     early (a state-boundary or trim-race condition), not missing blobs. Worth chasing
     against the saved boot logs before quoting revive spans as the tier's floor.
+  - largely resolved the same evening: the C=1 rounds' own `prefill_seconds` 0.33-0.52 s
+    already prove they served the full prefix from the tier (a walk stopping at 3,254 would
+    have prefilled the 53K-token gap cold), so 3,254 was a file-count taken mid async-dump,
+    never a walk stop. The true parked cost is 4,092 blocks (5.03 GiB) + 32 states
+    (3.53 GiB) = ~8.6 GiB per full-window session, ~23 of them inside the 200 GiB cap;
+    the earlier 3.72 GiB / 27-session numbers in this doc's footprint notes are superseded.
 - **Open**: C4 eviction-time spill beyond the behind-the-step queue (TTL/LRU trim is
   implemented; the churn-vs-cap behaviour under production mix is not yet measured);
   hydrated bytes/parked-session stats at `/health`; batched reader I/O, now with a price
