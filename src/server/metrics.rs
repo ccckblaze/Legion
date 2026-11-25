@@ -478,6 +478,10 @@ impl Engine for MeteredEngine {
         self.inner.models()
     }
 
+    fn conv_stats(&self) -> Option<crate::engine::lm::conv_tier::StatsSnapshot> {
+        self.inner.conv_stats()
+    }
+
     fn stats(&self) -> EngineStats {
         self.inner.stats()
     }
