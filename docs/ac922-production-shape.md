@@ -96,7 +96,9 @@ its source is not a functional gap, so no restart is spent on the stamp alone.
 
 ```sh
 . /data/work/legion/lane.env       # LB_API_KEY and PROBE_KEY both derive from LEGION_API_KEY
-export LB_URL=http://127.0.0.1:8090 PROBE_BASE=$LB_URL
+export LB_URL=http://127.0.0.1:8090
+export PROBE_BASE=$LB_URL          # its own statement: bash expands `export A=x B=$A`
+                                   # before A takes effect, so chaining them leaves PROBE_BASE empty
 L=$(ls -t /data/work/legion/logs/legion-4-*.log | head -1)
 grep -acE 'WARN|ERROR' "$L"                                    # expect 0
 grep -aE 'conv tier: live|memory plan part="host"|listening' "$L"
