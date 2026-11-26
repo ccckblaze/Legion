@@ -116,8 +116,11 @@ the fix shapes so the CV-wave data can select one immediately.
   rows in flight is consistent with (b) ping-ponging against parked 4092-block hydrates.
   Distinguisher without new code: the CV `NR` arm (no parked hydrate ⇒ no trim competition) plus
   a `/metrics` delta check for `phase=decode` being *nonzero* under NR at the same wall clock.
-  The P1-A step-timing patch (Strata `STRATA_DECODE_TIMING` analogue, ~1 file) stays the first
-  dev-lane deliverable either way.
+  **Correction (same audit pass)**: the step-timing brick already exists — `HostClock`
+  (`src/engine/lm/host_time.rs`) times Plan/Pack/Exec/Sample/Device/Finish/Loop per step and logs
+  µs-per-step window sums at debug level (`RUST_LOG=legion::engine::lm::host_time=debug`, 5 s
+  windows; also per-step on the dashboard hub). No patch needed for attribution; the dev-lane
+  job is to reproduce the lesion with this logger on and read which phase owns the 3-4 s ITL.
 
 - **F1 · plan-fit admission gate (preferred if candidate 1 holds)**: before spawning a hydrate,
   require `resumed/KV_BLOCK + chains.len() + kv_keep <= free - reserved`; otherwise the job
