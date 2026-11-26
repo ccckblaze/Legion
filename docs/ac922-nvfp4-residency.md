@@ -1,8 +1,33 @@
 # NVFP4 expert residency: the scale-pool design (AC922 secondary development)
 
-Status: design, not yet implemented. Owner thread: the AC922 Strata↔Legion pack line
+Status: implemented on `coldtier` (commit `2130b13`, `LEGION_NVFP4_CACHE=1`); the gates
+(§5) run on the AC922 dev lane. Owner thread: the AC922 Strata↔Legion pack line
 (runbook §372). Target: let an NVFP4 checkpoint's experts enter the VRAM expert cache,
 bitwise, so the NVFP4 pack decodes at (close to) the UD pack's rate.
+
+Implementation notes (what the code survey added to the design):
+
+* The tiered branch of the MoE builder (`src/model/core.rs`) builds its products without
+  ever consulting `.scale` — today's rejection is what keeps that true. So the pool rides
+  through `TieredLayer::scale(k)` and the scaled products call
+  `Linear::mul_mat_id` (the plain path's function): its dispatch on sm_70 lands on
+  `ctx.mul_mat_id` + the Q8/BF16 hint + the exact `reshape/repeat/get_rows/mul` tail,
+  with the POOL as the scale tensor and the remapped ids. No kernel, no ggml change.
+* Subpaths that compute without consulting a scale gate out for scaled layers: the fused
+  `moe_ffn` op (`supported_as`' type list already excludes NVFP4; the guard says it out
+  loud), `expert_mv`/pad/skip rows (their `fits_as` is a Q4_K-family type list too), the
+  host's `cpu_share`, and the overlap `glu_down_tiered` split.
+* Staging is off for a scaled cache (`ExpertResidency::scaled` gates `stages_entry`):
+  prompt steps read the tiered tensors in place (cached slots from VRAM, the rest over
+  the link), which is the PP-can-yield trade. The staged closures' bare `mul_mat_id`
+  never runs, so no staged-id scale view is needed (phase 2 may revisit).
+* A layer whose pool cannot exist (bounded host tier, `Fetch::Copy`, CPU placement, a
+  missing/non-F32 scale) is dropped from the cache entirely at `new()`, with one warn
+  line: its reads stay exactly today's. No partially-scaled layer can exist.
+* The pool is `[n_slots + n_expert]` F32 per kind, in a small device context per layer;
+  the tail rows are the checkpoint's values (static), the slot rows are rewritten from
+  the table inside `upload_tables` — the same call that makes a slot nameable, so ids
+  and scalars always move together.
 
 ## 1. The block
 
