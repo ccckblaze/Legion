@@ -180,3 +180,59 @@ Acceptance for whichever shape is adopted: same CV harness — `ct-revive.py rev
 at 262K×4 with disk hits, zero `retire this hydrate`-class lines in the boot window, cold-entry
 wall not worse by >3%, det-suite identical (the fix is on placement order, so bit-parity holds
 against CTL by construction).
+
+## §394 · The root cause: a hydrate plan double-counted a prefix the RAM match advanced
+
+The pure-revive discriminator (dev lane, 2 cards, GPU 2/5, `bin-nvscale`, full-window C4 with
+every order already in the cold tier) did not measure a slow decode: it **killed the worker**.
+
+```
+thread 'legion-qwen35' panicked at src/engine/lm.rs:8725:38:
+range start index 417536 out of range for slice of length 261947
+```
+
+`8725` is `tokens: &s.prompt[s.n_past..end]`, so a prefilling sequence stood at
+`n_past = 417536` on a 261947-token prompt. Both numbers are block multiples of `KV_BLOCK = 64`:
+417536 = 6524 blocks, 261888 = 4092 blocks, and the RAM-side resume had advanced to
+2432 blocks = 155648 tokens = 19 × `--prefix-cache-interval 8192`.
+
+    417536 = (2432 + 4092) × 64        # resumed = (resumed/KV_BLOCK + ext) × KV_BLOCK
+
+That is the completion branch of `place()` verbatim. `HydratePlan` stores an **absolute** run
+(`chains = chains[start..j]`, i.e. blocks `[start, start + chains.len())`), but the update treats
+`ext` as a delta on top of the *current* `resumed`, which every attempt re-derives from the radix
+and warm match. When a saved state landed while the producer was reading the blobs, the plan's
+first 2432 blocks were already in the table, and they got appended a second time.
+
+Consequences, in increasing severity:
+
+- Overflow past the prompt → worker panic → every in-flight request 500s ("engine stream ended
+  without finishing", then "the model worker stopped"). Reproduced twice on the dev lane.
+- Without the overflow the same overlap is **silent**: `n_past` no longer matches the table's
+  block count, so the row re-enters prompt phase to repair and samples once per prompt step -
+  exactly the 0.26-0.8 tok/s collapse shape measured on the 4-card NV lane and in dev C4, and the
+  "one fast lane, the rest watching" GPU-utilisation signature (one stage carrying the replay).
+- The disk state is copied over whatever the RAM match had reached, so an advanced resume can be
+  rewound to a shallower recurrent state.
+
+Two earlier readings of this file need correcting:
+
+- `/health states_ok` is **not** zero on the dev lane: 14 with `states_bad = 0`. States are found
+  and consumed; the `states_ok=0` note came from reading a lane before any revive. The tier is
+  doing its dump/index job - the defect is in how the engine *applies* the result.
+- Candidate 1 (`hydrate_abort` from pool pressure) stays refuted, and for the same reason:
+  `revive_aborts = 0`, `alloc_fails = 0`.
+
+The fix (`c709085`, coldtier) makes the run's overlap explicit in three places: `ext` counts only
+blocks memory does not resume yet; at completion the duplicated blocks go back to the pool and
+`resumed` becomes the plan's absolute end; a state deeper than the plan's end is not rewound. A
+plan that would leave a *hole* (memory resumed less than the plan assumed) is handed back and
+re-planned, counted as the new `states_stale`. Finally a resume at or past the prompt's last whole
+block truncates the table and warns instead of panicking, so no future miscount can take the lane
+down.
+
+Side finding, separate bug (not fixed here): the kernel log on this box carries four
+`conv-tier[...]: unhandled signal 11` entries - the cold tier's verify/hydrate producer threads
+segfault out of process. The engine survives them (a failed read just aborts that plan), but it is
+a memory-safety bug in the tier's own threads and deserves its own pass with `RUST_BACKTRACE` and
+`valgrind`/ASan on a dev boot.
