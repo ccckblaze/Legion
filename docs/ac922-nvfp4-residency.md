@@ -148,3 +148,21 @@ footprint unchanged. No new pinned memory (the tail copy lands in the device poo
 * Folding the scalar at load into the E4M3 block scale bytes of the staged VRAM copy:
   exact only for pow2 scalars; also makes the staged bytes differ from the arena's,
   breaking the "staged == host bytes" invariant the swap validator leans on.
+
+## Validation record (AC922, 2026-11-26)
+
+Two GPUs, `LEGION_NVFP4_CACHE=1` vs `0` on one binary, boots apart: the six
+det hashes are identical (`e523274d…5309bdcf…`), equal to the pre-patch
+NVFP4 baseline — the pool is bit-exact by construction and in measurement.
+Throughput with the pool: 2K single 32.1 tok/s (20.3 without), 2K×2 mean
+27.1 (14.6), 65K 25.6 with pp 203 (14.3/145).
+
+Four GPUs at production shape (cache 6.5 GiB/card, KV_VRAM 274432,
+max-batch 4096): 262144-token windows, four concurrent, eight streams —
+wall 62.7 s, aggregate 16.3 rows/s, per-row decode median 11.5, zero
+errors. The default shape (cache fill, batch 8192, KV 262144) collapses
+at C4 deep: cudaMalloc failures until the cache is capped, then a
+revive storm until the KV pool clears 4×262144 with slack. Per-row decode
+falls at three rows (24 → 20.6 → 11.6 → 11.5 for C1..C4): the Volta
+multi-row QSA cost, unchanged by the pool. Vision gate and the 6/6
+accuracy battery pass on the same boot.
