@@ -101,6 +101,20 @@ the fix shapes so the CV-wave data can select one immediately.
   (fast decode, slow wall). Positive control for "revive path is the lesion".
 - `CTL`: reproduces §390.
 
+> **Dev-lane double capture (2-card, bin 2130b13, `host_time` on, boot 060732):**
+> (1) C2/C3 revived rows are *healthy* (tg 10.3-19.7) even though 3×262K **oversubscribes** the
+> ~541K-token device pool (rows run host-tier streamed) — the streaming decode path itself is
+> fine; (2) a C4 run collapsed to tg 1.26/0.43/0.26 — but that batch contained two genuinely cold
+> prompts, and the collapse window's `host_time` shows `steps=2/exec_us≈4.1-4.3e6/host_us≈230`
+> with GPU util 0%/84%: those are **prefill-storm steps starving co-resident decode** (the same
+> shape as the production "decode+PP concurrent, both crawl" complaint). The NV 4-card arm's
+> f262c4 had *no* cold rows (all `cached=261888`), so its collapse has a second trigger;
+> the leading theory is now **near-full resident-pool thrash** (4×262K = 99.2% of the 1057088
+> pool: `back_slot`'s trim/demote cascade ping-pongs between co-resident revived rows).
+> Discriminator armed (devf4c): re-run C4 after all 8 ordinals are primed — pool oversubscribed
+> 194% (pure host-stream, no near-fit demote race). Healthy ⇒ NV lesion = resident-edge thrash
+> (fixes F1/F3 pool hygiene); collapse ⇒ revived-row window ineligibility per se (fix F1b).
+
 ## Fix shapes (all keep numeric outputs bit-identical: they move *when* work happens, not *what*)
 
 > Post-revision priority (field data above): **F1b first** — the lesion is window eligibility of
