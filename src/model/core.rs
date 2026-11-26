@@ -4830,6 +4830,7 @@ impl Model {
             let mv_rows = rows.filter(|r| {
                 r.ne()[0] == selected.ne()[1]
                     && fused.is_none()
+                    && !t.scaled()
                     && !t.gathers(n)
                     && !t.stages(n)
                     && t.cpu_share(n).is_none()
@@ -4845,7 +4846,9 @@ impl Model {
                 down: w[2],
                 table: None,
             };
-            let ok = |w: [Tensor<'a>; 3]| fused.is_some() && moe_ffn::supported(&refs(w));
+            let ok = |w: [Tensor<'a>; 3]| {
+                fused.is_some() && !t.scaled() && moe_ffn::supported(&refs(w))
+            };
             let tiered = [t.weight(0), t.weight(1), t.weight(2)];
             // A big step reads uncached experts from staged VRAM copies.
             if ok(tiered) {
@@ -4918,6 +4921,24 @@ impl Model {
                         // Small steps: Legion's expert matvec reads the misses at the link rate.
                         let mm = |k: usize, x: Tensor<'a>| {
                             let w = t.weight(k);
+                            if let Some(s) = t.scale(k) {
+                                // NVFP4 with a scale pool: the plain path's op, hint and
+                                // scale tail, the pool read with the remapped ids.
+                                return self
+                                    .linear
+                                    .mul_mat_id(
+                                        ctx,
+                                        &format!(
+                                            "blk.{il}.{}.weight",
+                                            crate::residency::experts::KINDS[k]
+                                        ),
+                                        w,
+                                        Some(s),
+                                        x,
+                                        ids,
+                                    )
+                                    .expect("tiered NVFP4 experts");
+                            }
                             if !t.gathers(n) && expert_mv::fits(w, x, ids) {
                                 expert_mv::mul_mat_id_tiered(ctx, w, x, ids, t.n_slots())
                             } else if !t.gathers(n) && mmq_ids::usable(w, x, ids) {
@@ -4946,7 +4967,7 @@ impl Model {
                             cpu_share::ops::glu_down(ctx, w, (x, ids, xq), t.share_ids()?, layer)
                         });
                         let split = shared.or_else(|| {
-                            (!t.gathers(n))
+                            (!t.gathers(n) && !t.scaled())
                                 .then(|| {
                                     expert_mv::overlap::glu_down_tiered(ctx, w, x, ids, t.n_slots())
                                 })

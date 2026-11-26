@@ -139,6 +139,7 @@ fn two_stage(dir: &std::path::Path, overlap: bool, second: BufferType, mtp: bool
         hp.n_expert as usize,
         hp.n_expert_used as usize,
         |n| model.tensor(n),
+        |_| None,
         |il| {
             Some(LayerPlace {
                 cuda: None,

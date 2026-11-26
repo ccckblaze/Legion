@@ -3589,9 +3589,13 @@ fn build_expert_cache(
         };
         let name = name.as_str();
         let t = model.tensor(name)?;
-        // Per-expert scales would need remapping too: those models keep plain experts.
+        // Per-expert scales need the cache's scale pool: with `LEGION_NVFP4_CACHE=1` the
+        // residency builds it (`residency::experts::nvfp4_cache`, the design:
+        // `docs/ac922-nvfp4-residency.md`); without the flag those models keep plain experts.
         let scale = name.strip_suffix(".weight").map(|b| format!("{b}.scale"));
-        if scale.is_some_and(|s| model.tensor(&s).is_some()) {
+        if scale.is_some_and(|s| model.tensor(&s).is_some())
+            && !crate::residency::experts::nvfp4_cache()
+        {
             return None;
         }
         (!gpu || crate::residency::arena_node_of(t).is_some()).then_some(t)
@@ -3610,11 +3614,25 @@ fn build_expert_cache(
             buft,
         })
     };
+    // The scale source of a kind stack, by (entry) layer name: the same id map `find` runs,
+    // read as the checkpoint keeps it (the pool copies its values; no arena condition).
+    let fscale = |name: &str| {
+        let name = match name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(i, rest)| Some((real.get(i.parse::<usize>().ok()?)?, rest)))
+        {
+            Some((il, rest)) => format!("blk.{il}.{rest}"),
+            None => name.to_string(),
+        };
+        model.tensor(&name)
+    };
     let mut r = ExpertResidency::new(
         real.len(),
         hp.n_expert as usize,
         hp.n_expert_used as usize,
         find,
+        fscale,
         place,
         budget,
         cfg,

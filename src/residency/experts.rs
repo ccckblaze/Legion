@@ -42,6 +42,15 @@ const REPORT_EVERY: u64 = 512;
 /// The expert tensors of a MoE layer, in the order [`TieredLayer::weight`] takes.
 pub const KINDS: [&str; 3] = ["ffn_up_exps", "ffn_gate_exps", "ffn_down_exps"];
 
+/// `LEGION_NVFP4_CACHE=1`: let an NVFP4 checkpoint's expert stacks (per-expert `.scale`
+/// companions) into the cache, each kind with a scale pool the remapped ids read ([`Layer`]'s
+/// `scale_pool`). Without it, such stacks stay plain experts: read from the host every window,
+/// the only shape these models had before the pool.
+/// The design and its gates: `docs/ac922-nvfp4-residency.md`.
+pub fn nvfp4_cache() -> bool {
+    std::env::var("LEGION_NVFP4_CACHE").is_ok_and(|v| v == "1")
+}
+
 /// Where one MoE layer's tiered tensors and tables go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerPlace {
@@ -182,6 +191,13 @@ struct Layer {
     slots: LayerSlots,
     /// One context per kind, each holding the tiered tensor (and, for CUDA, its range).
     tensors: Vec<Context>,
+    /// Per kind, the NVFP4 scale pool's context: an F32 `[n_slots | n_expert]` tensor named
+    /// after the kind, read by the remapped ids beside the tiered weights. `None` for stacks
+    /// without per-expert scales ([`Self::scaled`]).
+    scale_pool: [Option<Context>; 3],
+    /// The checkpoint's scale values per kind: the pool's tail rows, and the slot rows' source
+    /// at every [`Self::upload_scale`]. `None` for unscaled stacks.
+    scale_tail: Option<[Vec<f32>; 3]>,
     /// Bytes of one expert per kind.
     expert_bytes: [usize; 3],
     /// Routed (token, expert) pairs per expert since the start, for the saved profile.
@@ -429,6 +445,44 @@ impl Parts {
 impl Layer {
     fn tensor(&self, k: usize) -> Tensor<'_> {
         self.tensors[k].tensor(KINDS[k]).expect("tiered tensor")
+    }
+
+    /// The scale pool of kind `k`: the tensor to pass as the per-expert scale of a matmul of
+    /// [`Self::tensor`]'s, whose ids reach every row the table names. `None` for unscaled
+    /// stacks.
+    fn scale(&self, k: usize) -> Option<Tensor<'_>> {
+        self.scale_pool[k].as_ref().and_then(|c| c.tensor(KINDS[k]))
+    }
+
+    /// Whether this layer's experts are NVFP4 with a scale pool: its products must take the
+    /// scale of the remapped ids, not the bare `mul_mat_id` an unscaled stack runs.
+    fn scaled(&self) -> bool {
+        self.scale_pool.iter().any(Option::is_some)
+    }
+
+    /// Rewrite the pool's rows from the layer's table: the tail rows keep the checkpoint's
+    /// values; slot row `pos` takes the scalar of the expert sitting in it. Runs beside every
+    /// table upload, so a step's ids and scalars move together.
+    fn upload_scale(&mut self) {
+        let Some(tail) = self.scale_tail.as_ref() else {
+            return;
+        };
+        let n_slots = self.slots.n_slots();
+        let table = self.slots.table();
+        for k in 0..3 {
+            let Some(pool) = self.scale(k) else {
+                continue;
+            };
+            let mut row = vec![0f32; n_slots + tail[k].len()];
+            row[n_slots..].copy_from_slice(&tail[k]);
+            for (e, &pos) in table.iter().enumerate() {
+                let pos = pos as usize;
+                if pos < n_slots {
+                    row[pos] = tail[k][e];
+                }
+            }
+            pool.set_f32(&row);
+        }
     }
 
     /// The copies that fill this layer's staging buffers: every uncached expert's bytes, in
@@ -972,6 +1026,10 @@ pub struct ExpertResidency {
     /// Hits and misses at the last periodic report.
     reported: (u64, u64),
     fetch: Fetch,
+    /// Whether any cached layer took an NVFP4 scale pool (`new`'s scales pass): such a cache
+    /// never stages (a staged product would need the pool read with the staged ids), so
+    /// prompts read the tiered tensors in place.
+    scaled: bool,
     /// While the slots are lent to a long prompt ([`Self::lend`]): per layer, the experts its
     /// slots held, refilled by [`Self::restore`].
     lent: Option<Vec<Vec<u32>>>,
@@ -1196,12 +1254,24 @@ impl<'a> TieredLayer<'a> {
         self.layer.tensor(k)
     }
 
+    /// The tiered tensor's scale pool of kind `k` ([`KINDS`] order): the per-expert scale to
+    /// read with the remapped ids. `None` for unscaled stacks ([`Self::scaled`]).
+    pub fn scale(&self, k: usize) -> Option<Tensor<'a>> {
+        self.layer.scale(k)
+    }
+
+    /// Whether this layer's experts are NVFP4 with a scale pool.
+    pub fn scaled(&self) -> bool {
+        self.layer.scaled()
+    }
+
     /// The host's share of this layer's host-resident experts in a step of `n` tokens
     /// ([`super::cpu_share`], `--cpu-expert-share`): the threshold of
     /// [`super::cpu_share::select`], `None` when the step does not take part (off, the CPU
     /// backend, a step too big for the exchange buffer, or [`Fetch::Copy`] gathering it).
     pub fn cpu_share(&self, n: i64) -> Option<u32> {
         (self.share > 0
+            && !self.layer.scaled()
             && self.dev.place.cuda.is_some()
             && n as usize <= super::cpu_share::ops::MAX_TOKENS
             && !self.gathers(n))
@@ -1588,6 +1658,7 @@ impl ExpertResidency {
         n_expert: usize,
         n_used: usize,
         find: impl Fn(&str) -> Option<Tensor<'w>>,
+        fscale: impl Fn(&str) -> Option<Tensor<'w>>,
         place: impl Fn(usize) -> Option<LayerPlace>,
         budget: impl Fn(Option<usize>) -> u64,
         cfg: &ResidencyConfig,
@@ -1609,6 +1680,60 @@ impl ExpertResidency {
             };
             found.push(entry);
         }
+        // The NVFP4 per-expert scales: with `LEGION_NVFP4_CACHE=1` ([`nvfp4_cache`]), a cached
+        // stack also gets its scale pool: one F32 `[n_slots | n_expert]` row set per kind, the
+        // tail rows the checkpoint's values, the slot rows written beside every table upload
+        // ([`Layer::upload_scale`]). The remapped ids then index weights and scales alike, so
+        // a cached product reads its experts' own scalars. A layer whose scales cannot get a
+        // pool: with the gate off, on the CPU, gathered (`Fetch::Copy`), on the bounded host
+        // tier, or with a scale tensor that is missing, not F32, or not one scalar per expert:
+        // stays out of the cache: read from the host, exactly as without the flag. The design:
+        // `docs/ac922-nvfp4-residency.md`.
+        let nvc = nvfp4_cache();
+        let mut scales: Vec<Option<[Vec<f32>; 3]>> = vec![None; n_layers];
+        let mut warned = false;
+        for (il, entry) in found.iter_mut().enumerate() {
+            let Some((p, ts)) = entry.as_ref() else {
+                continue;
+            };
+            let ss: [Option<Tensor>; 3] =
+                std::array::from_fn(|k| fscale(&format!("blk.{il}.{}.scale", KINDS[k])));
+            if ss.iter().all(Option::is_none) {
+                continue;
+            }
+            let ok = nvc
+                && p.cuda.is_some()
+                && !matches!(cfg.fetch, Fetch::Copy)
+                && super::host_tier::HostTier::of(ts[0]).is_none()
+                && ss.iter().all(|s| {
+                    s.is_some_and(|t| {
+                        t.ty() == types::F32
+                            && t.ne()[1..] == [1, 1, 1]
+                            && t.ne()[0] == n_expert as i64
+                    })
+                });
+            if !ok {
+                if !warned {
+                    tracing::warn!(
+                        layer = il,
+                        gate = nvc,
+                        "expert cache: NVFP4 per-expert scales without a scale pool here, those layers keep plain experts"
+                    );
+                    warned = true;
+                }
+                *entry = None;
+                continue;
+            }
+            scales[il] = Some(std::array::from_fn(|k| {
+                ss[k]
+                    .expect("checked")
+                    .bytes()
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }));
+        }
+        let scaled = scales.iter().any(Option::is_some);
         // The bounded host tier: experts are in RAM slots or read as routed, so nothing may
         // read an expert's host bytes at `n_slots + expert`: no re-pack of the kept slots, and
         // a long prompt's staged passes take every expert from where the tier has it
@@ -1843,6 +1968,7 @@ impl ExpertResidency {
                     let below = cfg.stage_below.unwrap_or(usize::MAX);
                     let reals = ep.map(|e| e.real.as_slice());
                     let stages = |il: usize| stages_entry(reals, il, below, cfg.ep_stage_all);
+                    let stages = |il: usize| !scaled && stages(il);
                     let staged: Vec<usize> =
                         mine.iter().copied().filter(|&il| stages(il)).collect();
                     // In the device's layer order, as a lend unmaps their slots.
@@ -1975,6 +2101,32 @@ impl ExpertResidency {
                     Err(e) => return Err(e.msg),
                 }
             }
+            // The NVFP4 scale pools, allocated with the tiered tensors: a device that runs
+            // out of VRAM here takes the same re-plan as one whose slots found none.
+            let mut scale_pool = [None, None, None];
+            if scales[il].is_some() && no_vram.is_none() {
+                for (k, pool) in scale_pool.iter_mut().enumerate() {
+                    let c = Context::new(1, 0);
+                    c.new_tensor(types::F32, &[(n_slots + n_expert) as i64])
+                        .named(KINDS[k]);
+                    match c.alloc_tensors(p.buft) {
+                        Ok(_) => *pool = Some(c),
+                        Err(e) if n_slots > 0 && failures[d] < MAX_FIT_TRIES => {
+                            no_vram = Some(format!("scale pool: {e}"));
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "the NVFP4 scale pool of layer {il} found no memory: {e}"
+                            ))
+                        }
+                    }
+                }
+                if no_vram.is_some() {
+                    // The re-plan gives these contexts back with the layer's tensors.
+                    scale_pool = [None, None, None];
+                }
+            }
             if let Some(msg) = no_vram {
                 // Every slot of the device given back, then what others took since the plan:
                 // the free VRAM the plan saw less what is free now.
@@ -2054,11 +2206,32 @@ impl ExpertResidency {
             if let Some(prof) = tier_prof.as_ref().filter(|p| il < p.n_layers) {
                 slots.add_heat(&prof.heat(cfg.profile_seed)[il]);
             }
+            // The pools' bytes: the checkpoint's scalars in the tail rows, and the seeded
+            // table's experts in their slot rows (what the first upload will write anyway).
+            let scale_tail = scales[il].take();
+            if let Some(tail) = scale_tail.as_ref() {
+                for (k, pool) in scale_pool.iter().enumerate() {
+                    let Some(pool) = pool.as_ref().and_then(|c| c.tensor(KINDS[k])) else {
+                        continue;
+                    };
+                    let mut row = vec![0f32; n_slots + tail[k].len()];
+                    row[n_slots..].copy_from_slice(&tail[k]);
+                    for (e, &pos) in slots.table().iter().enumerate() {
+                        let pos = pos as usize;
+                        if pos < n_slots {
+                            row[pos] = tail[k][e];
+                        }
+                    }
+                    pool.set_f32(&row);
+                }
+            }
             layers[il] = Some(Layer {
                 dev: d,
                 row: rows[il],
                 slots,
                 tensors,
+                scale_pool,
+                scale_tail,
                 expert_bytes: [ts[0].nb()[2], ts[1].nb()[2], ts[2].nb()[2]],
                 counts: vec![0; n_expert],
                 traffic: ExpertTraffic::default(),
@@ -2224,6 +2397,7 @@ impl ExpertResidency {
             logged: 0,
             reported: (0, 0),
             fetch: cfg.fetch,
+            scaled,
             lent: None,
             #[cfg(feature = "cuda")]
             restoring: None,
@@ -2808,6 +2982,7 @@ impl ExpertResidency {
                     for (_, l) in mine {
                         l.slots
                             .write_table(&mut table[l.row * n_expert..][..n_expert]);
+                        l.upload_scale();
                         l.dirty = false;
                     }
                     dev.table().set_i32(&table);
@@ -2827,12 +3002,14 @@ impl ExpertResidency {
                         for (_, l) in inside {
                             l.slots
                                 .write_table(&mut table[(l.row - lo) * n_expert..][..n_expert]);
+                            l.upload_scale();
                             l.dirty = false;
                         }
                         dev.table().set_i32_at(lo * n_expert, &table);
                     } else {
                         for (_, l) in inside.into_iter().filter(|(_, l)| l.dirty) {
                             dev.table().set_i32_at(l.row * n_expert, &l.slots.table());
+                            l.upload_scale();
                             l.dirty = false;
                         }
                     }
@@ -3667,7 +3844,8 @@ impl ExpertResidency {
     /// layer's own entry computes every expert in prompts: [`stages_entry`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn stages_entry(&self, il: usize) -> bool {
-        stages_entry(
+        !self.scaled
+            && stages_entry(
             self.ep_real.as_deref(),
             il,
             self.stage_limit,
