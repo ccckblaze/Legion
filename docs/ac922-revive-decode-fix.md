@@ -64,6 +64,17 @@ the fix shapes so the CV-wave data can select one immediately.
 > then decode at 13-36, the lesion is specific to hydrated-row window eligibility; if they also
 > collapse, it is pool-depth window formation itself. `B0/B2048/T8` predictions written under
 > candidate 1 should be re-read through this lens.
+>
+> **Cross-lane contrast (06:10, waves v4, same 4-card shape, same bench, three arms each):**
+> the UD lane (bin L2 @6101045: S0/H2/K2) completes `f262c4` at wall 64.2/70.0/53.8 s, errs=0;
+> the NVFP4 lane (bin-nvscale @2130b13: NV0 mb4096, NV1 mb8192, NV3 micro4096) times out
+> (>3000 s) in all three shapes. The lesion is therefore **NVFP4-lane-specific** — pool headroom
+> is exonerated as the trigger (the UD pool 1044800 is *past* 4×262K and survives; the NV pool
+> 1057088 has 0.8% margin and dies). Confounded axes: binary commit, pack (NVFP4 scale-remap +
+> `LEGION_NVFP4_CACHE=1`), expert-cache sizing (25.7 vs 35.4 GiB) and KV_VRAM (274432 vs lane
+> default). The dev-lane `host_time` capture (2 cards, same bin-nvscale @2130b13, C3@262K) is the
+> phase-attribution discriminator: if revived rows' `exec_us` per step explodes while `hit_rate`
+> stays high, the slow thing is the NVFP4 host-stream path itself, not the scheduler.
 
 1. **~~Plan-fit starvation → hydrate_abort~~ (falsified by `revive_aborts=0`) → replaced by:
    hydrated-row rider demotion** — see field revision above. Original argument retained for
