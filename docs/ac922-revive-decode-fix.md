@@ -114,6 +114,22 @@ the fix shapes so the CV-wave data can select one immediately.
 > Discriminator armed (devf4c): re-run C4 after all 8 ordinals are primed — pool oversubscribed
 > 194% (pure host-stream, no near-fit demote race). Healthy ⇒ NV lesion = resident-edge thrash
 > (fixes F1/F3 pool hygiene); collapse ⇒ revived-row window ineligibility per se (fix F1b).
+>
+> **Rider-mechanism closure (dev host_time + per-row byte math):** collapsed rows carry
+> `decode_model_gb/completion ≈ 0.7-7 GB/token` vs healthy `12-14 GB/token` — each token does
+> *less* model work while taking ~100× longer. That is the signature of rows being **sampled once
+> per foreign step**, i.e. `lm.rs:9044` `riders = big && n_stages>1 && kv_ring().is_none()`: while
+> a multi-second prompt-phase step runs (dev: two genuinely cold 262K prompts; NV 4-card: the
+> revived rows' prompt-phase resume replay, evidenced by all-collapse-bytes-on-`phase=prefill`
+> with `phase=decode` Δ=0), every in-window decode row rides it at one sample per step
+> (1/4.1 s ≈ 0.24 ≈ the measured 0.26). The collapse is not slow decode — it is **decode
+> suppressed to rider rate by prompt-phase work sharing the loop**. devf4c (all-cached C4)
+> discriminates the NV trigger: healthy ⇒ replay length was the trigger (cold storm co-residency
+> is the whole story for dev); still collapsing ⇒ parked-row resume keeps riders latched, and the
+> fix is F1b — never let a prompt-phase tail (cold or resumed) put live decode rows into rider
+> mode; gate it behind `Placement::Wait` or finish the replay before windowing. Independent of the
+> NV verdict, the dev capture stands on its own for the production complaint: **co-resident cold
+> prefill costs co-running decode rows ~75× (tg 19.7 → 0.26)** — rider latching, not bandwidth.
 
 ## Fix shapes (all keep numeric outputs bit-identical: they move *when* work happens, not *what*)
 
