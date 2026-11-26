@@ -19,6 +19,10 @@ src/engine/lm.rs:9097   chunk.min(budget).min(ride)
 - 满窗冷入时步时以十秒计 ⇒ 同刻 4 条会话里"一条快道 ~30、其余 0.6-2"的阶梯（§386 实测 max/min ≈ 4.0）；
 - 这不是"批了但批得慢"，是**decode 根本没跟着窗走**。
 
+**适用边界（先钉死，否则验收臂会选错形状）**：4× 阶梯只在 **多条满窗同时冷入**（`eval/run-fw.py`/exactfw）
+时出现；命中态并发（`eval/reburst.py` 的 C4 轮，10 行里 9 行 `prefill_seconds<1.5`）的 tg 散布只有 1.2-1.8×。
+⇒ rider lane 买的是"多用户同时开新长会话"的冷 storm，不是稳态追问；验收必须用冷入形状。
+
 ## 2. 为什么"缩 chunk"不是解药（已判死的反例）
 
 `src/model/core/exec.rs:2988-2993` 的自述就是刹车：
