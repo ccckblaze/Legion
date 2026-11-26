@@ -150,6 +150,9 @@ pub struct ConvStats {
     pub blobs_mismatch: AtomicU64,
     pub states_ok: AtomicU64,
     pub states_bad: AtomicU64,
+    /// Plans handed back because memory resumed less than the plan assumed (a hole would
+    /// stand in the table): the blocks went back and the next attempt re-planned.
+    pub states_stale: AtomicU64,
     pub alloc_fails: AtomicU64,
     pub upload_fails: AtomicU64,
     pub revive_aborts: AtomicU64,
@@ -174,6 +177,7 @@ impl ConvStats {
             blobs_mismatch: g(&self.blobs_mismatch),
             states_ok: g(&self.states_ok),
             states_bad: g(&self.states_bad),
+            states_stale: g(&self.states_stale),
             alloc_fails: g(&self.alloc_fails),
             upload_fails: g(&self.upload_fails),
             revive_aborts: g(&self.revive_aborts),
@@ -194,6 +198,7 @@ pub struct StatsSnapshot {
     pub blobs_mismatch: u64,
     pub states_ok: u64,
     pub states_bad: u64,
+    pub states_stale: u64,
     pub alloc_fails: u64,
     pub upload_fails: u64,
     pub revive_aborts: u64,

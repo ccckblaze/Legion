@@ -7577,11 +7577,20 @@ impl Worker {
             self.parked.insert(key, (Arc::downgrade(&t), Vec::new()));
             *hydrate = Some(t);
         }
-        let ext = match hydrate.as_ref() {
-            Some(t) => t.plan_ref().chains.len(),
-            None => 0,
+        // A plan's run is absolute (`[start, start + chains)`) while `resumed` is re-derived
+        // every attempt: the RAM match can advance while the producer reads, so the run's
+        // first blocks may already stand in the table. `ext` is the run's part memory does
+        // not resume yet - counting the whole run again double-counted the prefix (§394).
+        let (p_start, p_end) = match hydrate.as_ref() {
+            Some(t) => {
+                let p = t.plan_ref();
+                (p.start, p.start + p.chains.len())
+            }
+            None => (0, 0),
         };
-        let mut fresh = take.saturating_sub(resumed / KV_BLOCK + ext);
+        let have = resumed / KV_BLOCK;
+        let ext = p_end.saturating_sub(have.max(p_start));
+        let mut fresh = take.saturating_sub(have + ext);
         // `on-demand` leaves the decoding sequences room to grow (0 under `reserve`).
         let mut want = fresh + self.kv_keep + ext;
         let available = |w: &Self| (w.pool.free_blocks() as usize).saturating_sub(w.reserved);
@@ -7691,18 +7700,42 @@ impl Worker {
                     None => table.release(&mut self.pool),
                 }
                 return Placement::Wait;
+            } else if have < p_start {
+                // Memory resumed *less* than the plan assumed (a warm sequence went away):
+                // the run would leave a hole in the table, so it is stale. Hand the blocks
+                // back and place on memory's resume alone; the next attempt re-plans from
+                // the current resume point.
+                for b in ids {
+                    self.pool.decref(b);
+                }
+                self.parked.remove(&key);
+                *hydrate = None;
+                // Nothing of the run stands in the table now, so the prompt's whole tail is
+                // still to compute: the room booked against `ext` goes back to the reservation.
+                fresh = take.saturating_sub(have);
+                st.states_stale.fetch_add(1, Ordering::Relaxed);
             } else {
-                let ext = t.plan_ref().chains.len();
                 if d.state.is_some() {
                     st.states_ok.fetch_add(1, Ordering::Relaxed);
                 }
+                // The run covers blocks `[p_start, p_end)`; the table already holds the
+                // prefix up to `have`, so the run's first `have - p_start` uploaded blocks are
+                // duplicates. Appending them again pushed `resumed` past the prompt - the
+                // §394 panic sliced `prompt[417536..]` of a 261947-token prompt.
+                let skip = have.saturating_sub(p_start).min(ids.len());
+                for b in ids.drain(..skip) {
+                    self.pool.decref(b);
+                }
                 table.extend_owned(&ids, KV_BLOCK as u32);
-                resumed = (resumed / KV_BLOCK + ext) * KV_BLOCK;
-                conv_state_bytes = d.state;
-                st.tokens_hydrated.fetch_add(ext as u64 * KV_BLOCK as u64, Ordering::Relaxed);
+                resumed = p_end.max(have) * KV_BLOCK;
+                // The disk state is the resume point's state only while the run is the
+                // deepest thing we hold; a RAM state past `p_end` must not be rewound.
+                conv_state_bytes = if p_end > have { d.state } else { None };
+                st.tokens_hydrated
+                    .fetch_add(ids.len() as u64 * KV_BLOCK as u64, Ordering::Relaxed);
                 self.parked.remove(&key);
                 *hydrate = None;
-                tracing::info!(blocks = ext, tokens = resumed, "conv tier: hydrated");
+                tracing::info!(blocks = ids.len(), tokens = resumed, "conv tier: hydrated");
             }
         }
         self.reserved += fresh;
@@ -7750,6 +7783,16 @@ impl Worker {
         }
         if self.state_digests && from.is_some() {
             self.log_state_digest(Pool::Seq, slot, resumed, "resumed from");
+        }
+        // Defense in depth: a resume standing at or past the prompt's last whole block would
+        // leave nothing to compute the reply's first logits from, and `step` slices
+        // `prompt[n_past..]` (lm.rs:8725's panic). Truncate the table to the cap instead of
+        // crashing the worker, and say so loudly.
+        let cap = (len - 1) / KV_BLOCK * KV_BLOCK;
+        if resumed > cap {
+            tracing::warn!(resumed, cap, "conv tier: resume past the prompt clamped");
+            table.truncate(&mut self.pool, cap as u32);
+            resumed = cap;
         }
         Placement::Placed(Placed {
             table,
