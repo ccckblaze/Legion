@@ -76,3 +76,28 @@ pp 代价。**
 - 毒入：`eval/mixedpoison55.py base|poison`（8×8K 稳态 + t+55s 一条 262K 冷入，同 boot 对比）。
 - 观测：引擎日志 `request done` 行（queue_ms/prefill_seconds/decode_tok_s/*_roofline_pct）+
   `expert cache ... hit_rate=` 行；全程只打印数字与 hash。
+
+## 6. 命中态并发的"专家并集税"（与 lend 无关的第二病灶）
+
+§1-§2 的 `lend`→rider 只解释**冷入并发**（满窗 4 条同时冷算时 tg 0.82，roofline 22.6%）。
+另有一条独立病灶：**命中态并发**（追问轮，9/10 行 `prefill_seconds<1.5`）里每行每 token 读的模型字节
+随并发上升——n=5 → 9.6 GB、n=7 → 11.6 GB、n=8 → 15.2 GB（`decode_model_gb / completion_tokens`，60 s 聚簇近似）。
+同时 `decode_mem_roofline_pct` 只有 **32%**，即**不是带宽不够，是没把带宽用满**。
+
+两件事合起来的含义：
+
+- 聚合 tg 的税是"**同窗各行的路由专家集互不相干，且互相把对方的槽位挤出去**"，
+  所以加行不摊薄读量，反而抬高每行读量。
+- 单流深窗 30 tok/s 时 roofline 只有 7.6% ⇒ 单窗时间大部分花在**串行开销**（跨 stage 的图 launch、
+  专家 staging、host 等待），不是算/读不动。
+
+对应的二开方向（与 `docs/ac922-rider-lane-plan.md` 并列，不是替代）：
+
+1. **窗口专家亲和调度**：把"路由集重叠度高"的序列排进同一个窗，让并集变小。
+   只改准入/组窗，不改路由与权重 ⇒ 数值路径不变，但同窗行集合变了，仍需过 `det×3 + acc + divprobe`。
+2. **per-sequence 缓存分区 / heat 加权**：让每层的槽位按序列亲和度保留，减少互相驱逐（`bytes/row-token` 持平即算赢）。
+3. **热专家 NUMA 冗余**（空间换时间）：两个 NUMA 岛各留一份热专家，砍掉跨岛 host 读；
+   与 1/2 正交，先做 1/2 的记账，再决定要不要花这份 RAM。
+
+**验收指标（三条共用）**：`bytes/row-token` 随并发**持平或下降** + `roofline_pct` 上升 + 满窗冷算墙钟不劣化 >3%。
+只看 tg 单指标会重蹈 Wave18b W1 的覆辙。
