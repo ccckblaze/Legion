@@ -30,7 +30,44 @@ the fix shapes so the CV-wave data can select one immediately.
 
 ## Ranked candidates (fitted to the observed shape)
 
-1. **Plan-fit starvation → hydrate_abort** (`7578-7600`): the first deep revive(s) park most of
+> **FIELD REVISION 2026-11-27 05:00 (supersedes the ranking below where they conflict).**
+> The NV0/NV1 `f262c4` arms (bin 2130b13, two separate boots) produced a deterministic, byte-identical
+> collapse table that falsifies candidate 1 *as written*:
+>
+> - Eight rows (4 prompts × 2 rounds), every row `prompt_tokens=261940 cached_tokens=261888`
+>   (full prefix hit, `prefill_seconds≈0.7`), every row `completion_tokens=205`. Per-row
+>   `decode_tok_s` on completion: **35.2, 36.3, 13.9, 3.5, 0.53, 0.26, (row7/8 still in flight at
+>   timeout)**. Both boots: identical sequence. Same shape on the UD lane (S0) finished all 8 rows
+>   in wall 64.2 s, tg_med 17.1, errs=0.
+> - During the collapse, conv-tier counters are *healthy*: `revive_aborts=0`, `alloc_fails=0`,
+>   `blobs_ok=41903` frozen (all hydration completed), `pending_bytes=0`,
+>   `tokens_hydrated=2616256` ≈ 10 full rows. **The abort branch at `7578-7600` never fires.**
+> - Engine-side counters during the collapse (`/metrics`, two 40 s windows): `kv_preemptions=0`,
+>   `waiting=0`, `blocks_used≈10504/16517`. Differential sampling of `model_kind_bytes` shows
+>   **all step traffic attributed to `phase="prefill"` — `phase="decode"` deltas are exactly zero**
+>   while rows still emit tokens at 0.26-0.53 tok/s (ITL mean 0.271 s, tail multi-second).
+> - No engine log lines exist between request boundaries during the collapse — there is **no
+>   step-level window telemetry** in this build, which is what the P1-A arm (decode timing points,
+>   the Strata `STRATA_DECODE_TIMING` analogue) is for.
+>
+> Revised mechanism (working): hydrated rows never enter a *decode* window. They are carried as
+> **riders on prompt-phase steps** — each token costs a host-streamed forward over the parked
+> context rather than a window decode step — which reproduces both the multi-second ITL and the
+> all-prefill-phase byte attribution. The same demotion explains the intra-window gradient in
+> round 1 (rows admitted 7/7/7/14 s after boot decode at 36 → 36 → 14 → 3.5 as pool occupancy
+> climbs). Expert-cache `lend` to KV (`lm.rs` ~7903) remains the suspected trigger; `hit_rate`
+> recovered to 0.979 during the collapse, so expert misses are *not* the rate limiter.
+>
+> Consequences for this document: candidate 1 is downgraded (the *abort* path is exonerated; the
+> *placement/window-eligibility* path upstream of it is the new lesion). CV arm `NR`
+> (`--conv-disk-no-restore`) is still the discriminator: if NR rows revive as cold prefill and
+> then decode at 13-36, the lesion is specific to hydrated-row window eligibility; if they also
+> collapse, it is pool-depth window formation itself. `B0/B2048/T8` predictions written under
+> candidate 1 should be re-read through this lens.
+
+1. **~~Plan-fit starvation → hydrate_abort~~ (falsified by `revive_aborts=0`) → replaced by:
+   hydrated-row rider demotion** — see field revision above. Original argument retained for
+   provenance: the first deep revive(s) park most of
    the pool; every later revive's `want` (whole-plan ext) exceeds `available` even after evicting
    everything evictable, so it **aborts hydration and decodes from memory alone** — which on
    sm70 + host-tier KV is exactly 0.2-0.8 tok/s. Monotonic degradation = parked refs and
@@ -54,6 +91,33 @@ the fix shapes so the CV-wave data can select one immediately.
 - `CTL`: reproduces §390.
 
 ## Fix shapes (all keep numeric outputs bit-identical: they move *when* work happens, not *what*)
+
+> Post-revision priority (field data above): **F1b first** — the lesion is window eligibility of
+> deep rows, not hydration aborts. F1/F2/F3 remain queue hygiene that F1b likely subsumes.
+
+- **F1b · no-rider demotion for parked rows (preferred)**: a row whose KV lives on the host tier
+  must not be sampled via prompt-phase forwards. Gate it into the decode-window admission set
+  only when its window-resident share clears the `can` test (anchor: the `lend`/eligibility path
+  near `lm.rs:7903`); otherwise it stays `Placement::Wait` in the queue and the caller sees queue
+  latency instead of a 3-4 s ITL. Pair with a queue fairness bound so a parked row cannot starve
+  behind an in-pool stream. Bit-parity holds: sampling points and token order are unchanged.
+
+  **P0 code audit (2026-11-27 05:1x, coldtier ea17f0d)**: the `/metrics` phase split is per-step
+  bookkeeping (`src/server/metrics/bandwidth.rs:229` maps step records to `st.prefill`/`st.decode`),
+  so "zero `phase=decode` deltas while rows emit tokens" means the in-flight rows are literally
+  *driven by prompt steps*, not decode steps. The two code shapes that can do that:
+  (a) the pipeline-riders path (`lm.rs:9041-9137`): `big = lead.prompt.len() - lead.n_past` over
+  threshold, multi-stage, `kv_ring().is_none()` — a revived row re-entering as a "lead" runs its
+  262K as micro-chunks and shares graphs with decode rows;
+  (b) the slot-backing churn (`back_slot` → `plan.trim/demote` → `exec.trim_kv_slot`,
+  `lm.rs:7944-7975` + `free_ring_and_slot`'s `lends()` return path): a running row's KV slot room
+  is trimmed to seat another row's hydrate, and if the trim lands between its decode steps its
+  progress forces prompt-phase re-entry. The observed `blocks_used≈10504/16517` plateau with two
+  rows in flight is consistent with (b) ping-ponging against parked 4092-block hydrates.
+  Distinguisher without new code: the CV `NR` arm (no parked hydrate ⇒ no trim competition) plus
+  a `/metrics` delta check for `phase=decode` being *nonzero* under NR at the same wall clock.
+  The P1-A step-timing patch (Strata `STRATA_DECODE_TIMING` analogue, ~1 file) stays the first
+  dev-lane deliverable either way.
 
 - **F1 · plan-fit admission gate (preferred if candidate 1 holds)**: before spawning a hydrate,
   require `resumed/KV_BLOCK + chains.len() + kv_keep <= free - reserved`; otherwise the job
