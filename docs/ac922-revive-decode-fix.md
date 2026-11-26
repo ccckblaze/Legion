@@ -21,6 +21,12 @@ the fix shapes so the CV-wave data can select one immediately.
 - Boot sizing on this machine (4-card lane): `kv_pool_tokens=1044800`, host tier `786432`
   (`memory plan part="context"`), i.e. **four 262K windows ≈ 1048576 tokens > pool** — a
   four-way full-window revive is structurally past the device pool even before `kv_keep`.
+  The NVFP4 lane measures `kv_pool_tokens=1057088` - headroom over 4x262K is **0.8%**: any
+  parked hydrate plus `kv_keep` tips `want > available`, so the abort branch fires with even one
+  revive overlapping the others. The UD lane (pool 1044800) is past capacity outright, yet its
+  f262c4 survived (8 rows, agg 25.5) - consistent with abort-to-memory being *survivable* on
+  the shallower geometry and *catastrophic* on the NV lane's deep-window expert streaming;
+  the CV wave decides whether that split holds.
 
 ## Ranked candidates (fitted to the observed shape)
 
