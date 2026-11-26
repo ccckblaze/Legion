@@ -353,6 +353,7 @@ The equivalent environment variables are `LEGION_TLS_CERT` and `LEGION_TLS_KEY`.
 - [docs/ac922.md](docs/ac922.md): running on the IBM AC922: RHEL 8, NVLink 2.0, the kernel and driver it needs (550.54.15, the power9-nvidia-nvlink2 patches), gcc-toolset-12, build and run
 - [docs/ac922-decode-window-anatomy.md](docs/ac922-decode-window-anatomy.md): AC922 field notes - how a decode window is formed on a layer-split pipeline, cache lending, rider sampling, and the measured signatures they explain
 - [docs/ac922-aggregate-tg-configmap.md](docs/ac922-aggregate-tg-configmap.md): AC922 field notes - the config layer for aggregate decode: which flags actually bite, the prerequisites they need, the clamps that silently cap them
+- [docs/ac922-rider-lane-plan.md](docs/ac922-rider-lane-plan.md): AC922 field notes - sampling decode rows once per micro-chunk instead of once per lending step: the anchors, the counter-example that rules out shrinking chunks, the discriminating arms
 - [docs/ac922-production-shape.md](docs/ac922-production-shape.md): AC922 field notes - the 4/6-GPU lane shape in production: ports, full-window concurrency, cold tier, quality gates
 - [docs/serving.md](docs/serving.md): guide to running the server and connecting clients
 - [docs/clients.md](docs/clients.md): curl, open-webui, openai-python, anthropic-python and Claude Code against `legion serve`
