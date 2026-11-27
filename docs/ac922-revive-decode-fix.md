@@ -314,3 +314,52 @@ silent branch (one sample per step, tg 0.26-0.8), no request ever completes insi
 the client is killed before it writes a line. Those three cells must be **re-measured on the fixed
 binary** (the paired A/B's `FIX` arm is exactly `262144 4`) before any conclusion about batch shape
 on 4 cards is drawn from them.
+
+## §396 · Ten poisoned states in the production tier: two engines, one directory (fixed)
+
+Symptom in the log, repeated on every deep revive:
+
+```
+conv tier: revive aborted, state sidecar verification failed for b73140c2a3a1...
+```
+
+Audit of `/data/cache/conv-tier-prod` (read-only, file hashes and sizes only): 35 state entries
+indexed, **25 verify, 10 do not** - same 118,038,536-byte size, different `sha256`. Every other
+tier on the box is clean (`nv4` 205/205, `cvCTL` 21/21, `devq` 5/5), so this is not the writer
+thread from §395 and not a hashing bug: it is a second writer.
+
+Mechanism:
+
+- Blobs are write-once: `link_once` refuses to replace an existing file (#5543), which is right -
+  keys are content addresses and a superseded writer must not rewrite history.
+- Manifest shards are **not**: `flush` rebuilds a shard from the live index and renames it over.
+- `legion-lane.sh restart` is `stop; sleep 5; start`, and `stop` is graceful: the old engine keeps
+  draining its last request (a 185 s deep-window one was measured in §394.2) while the new boot has
+  already scanned the directory and is queueing into the same files.
+- The old boot then flushes its shard, containing a `key` for bytes *it* wrote - into a file the new
+  boot had already linked with different bytes. Index says one thing, disk holds another, forever.
+
+Consequence: those chains cost a full 112 MiB sidecar read on every revive and then abort to the
+blocks-only path, so the recurrent state is recomputed. Safe, slow, and self-perpetuating: nothing in
+the tier ever forgets or repairs a poisoned entry.
+
+Fix, three parts:
+
+- `take_writer`: an exclusive non-blocking `flock` on `<dir>/writer.lock`, held for the tier's life,
+  retried for up to 30 s (the normal holder is the boot being restarted). A boot that cannot claim
+  the directory runs with the **cold tier off** and says so, instead of writing a second index over
+  one directory.
+- `link_once` now returns `Linked::{Ours, Already}`. On `Already` the dump keeps the index honest: the
+  surviving entry's `last_used_ms` moves, an orphan blob is adopted by hashing the file it actually
+  holds, and the loser's key/size are never written into the manifest. Counted as `index_conflicts`.
+- `repair_state` / `repair_block` on the read path's verification failure: drop the entry, free the
+  chain so the next completion re-dumps it honestly, delete the blob, and queue the shard for flush
+  through `extra_dirty` (only the writer thread renames a shard). Without this the ten poisoned
+  entries would keep their verdict until the directory is wiped by hand.
+
+Follow-ups filed, not done: `close()` (the §395 join) waits for the writer, so a boot holding the
+full `--conv-disk-pending-gib` 64 GiB queue could take longer to stop than `legion-lane.sh stop`'s
+60 s ceiling and get `SIGKILL`ed - the tier then loses exactly those dumps. Either bound the close
+with a deadline that abandons the queue, or raise the stop ceiling. And the same double-writer window
+applies to any two lanes pointed at one `--conv-disk` directory: the lock makes it loud, but lane
+templates should keep one directory per lane (they mostly do).
