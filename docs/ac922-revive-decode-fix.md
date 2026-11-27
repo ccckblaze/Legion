@@ -236,3 +236,81 @@ Side finding, separate bug (not fixed here): the kernel log on this box carries 
 segfault out of process. The engine survives them (a failed read just aborts that plan), but it is
 a memory-safety bug in the tier's own threads and deserves its own pass with `RUST_BACKTRACE` and
 `valgrind`/ASan on a dev boot.
+
+## §395 · The shutdown race behind `conv-tier: unhandled signal 11` (fixed, `b4a26a4`)
+
+The side finding in §394 was not a verify/hydrate producer: it is the tier's own **writer**
+thread, and it is a lifetime bug on the stop path. Six entries in the kernel log, and every one of
+them sits 3-5 s after an engine process stopped (crash 08:25:26 / log ends 08:25:21; 08:28:48 /
+08:28:43; 05:57:49 / 05:57:44; 02:29:15 / boot boundary 02:29:12; 02:05:06 / 02:05:00; and 23:08:47
+the previous evening). A racing dump, not a corrupt file: it fires at teardown, on the way out.
+
+Four facts make it inevitable:
+
+- `Inner` owns the `Sender<Job>`, and the writer's closure owns `Arc<Inner>`: a reference cycle,
+  so the channel can never disconnect and `Disconnected` can never end the loop.
+- Nothing ever joins the thread. `ConvTier::start` documented the opposite ("the thread exits when
+  the last `ConvTier` handle drops"), and `gather`'s comment repeated it ("pool tensors outlive it").
+- `Worker` declares `exec` (which owns the KV pools and the pinned host arena) **before** `conv`, so
+  dropping the worker frees the arena first.
+- A queued `BlockJob` is a list of raw addresses into that arena, dereferenced whenever the writer
+  gets to it.
+
+So the engine thread exits, frees the arena, and a dump still sitting in the queue is gathered from
+unmapped pages: SIGSEGV on POWER9 (`nip` always at libc's `memcpy`+0xeb7c, `code 2` = access error
+past a valid mapping's last page). The corruption path is the worse half: when the read *does* land
+in memory the next tenant already owns, the blob is written and its `sha256` recorded over bytes
+that were never the block, so a later hydrate serves it as valid - the hash attests the garbage.
+
+The fix is a real shutdown protocol, not a guard:
+
+- `Job::Quit` ends the writer after landing what it already holds and flushing the shards.
+- `ConvTier::close()` sets `closed`, sends `Quit`, and joins. `queue_blocks` hands its pool
+  references straight back once `closed` is set (nothing may queue behind the join), and
+  `queue_state` drops.
+- `impl Drop for Worker` calls `close()` in its body, which runs before field drops, so the writer is
+  gone while `exec` still owns the arena.
+
+Durability improves as a side effect: dumps queued by the last requests of a session now reach the
+disk before the process exits instead of being lost with it. What it does not fix: a process killed
+by `SIGKILL` still drops the queue (that is what the `pending/` + rename order is for), and the
+`states_stale`/re-plan work in §394 is unaffected.
+
+Validation (dev lane, two boots of the same tree, only the binary differing): stop the engine
+gracefully with blocks in the queue, count new `unhandled signal 11` entries in the 30 s window
+after the stop. `bin-revive` (§394 fix, this bug present) is the control; `bin-ctquit` is the arm.
+
+## Wave CV / NV accounting (the measurements behind §394)
+
+CV wave - 4-card eval lane, one fresh tier directory and two boots per arm, `REV_N=2`,
+131072-token conversations, 64 generated tokens; the cold pass runs the two sessions
+sequentially, the revive pass runs them concurrently.
+
+| arm (`--conv-disk-*`)   | revive tg | revive span | cold span | speedup | `sha_all_match` |
+| ----------------------- | --------- | ----------- | --------- | ------- | --------------- |
+| CTL (defaults)          | 33.8/22.4 | 16.5/10.2   | 119.8/186.6 | 7.3-18× | true            |
+| `hydrate-budget 0`      | 22.6/34.0 | 10.0/15.8   | 119.8/185.1 | 11.7-12× | true            |
+| `hydrate-budget 2048`   | 18.8/34.0 | 10.6/15.9   | 119.8/186.1 | 11.3-17× | true            |
+| `hydrate-tasks 8`       | (same cell as above; repeated boot) | | | | true |
+| `--conv-disk-no-restore` | 0.80/23.7 | 159.8/160.3 | 119.7/185.8 | 0.75-1.2× | **false**       |
+
+Two conclusions:
+
+- The hydrate-upload throttling hypothesis is **dead**. Budget 0 (one shot), the default budget,
+  2048, and `tasks 8` all revive in the same 10-16 s band with identical outputs. Whatever made
+  the 00:39 boot's revives collapse to 0.21-0.82 tg was not how the blocks were uploaded; it was
+  §394's miscount of where the resumed prefix ends.
+- The `no-restore` arm is the control, not a defect: with the tier read disabled a revive is a full
+  re-prefill, so its span equals the cold pass and its tg is the cold-storm number. Its
+  `sha_match = false` is the deep-window greedy fork between a sequential cold pass and a
+  concurrent revive (the same shape sensitivity the DRIFT probes already track), not cold-tier
+  corruption - the four arms that *did* read the tier all match bit for bit.
+
+NV wave correction (changes a verdict): `NV0`/`NV1`/`NV3` `f262c4` were logged as PARSE-FAIL and
+carried as "this shape does not work". The output files are **0 bytes**, the harness `timeout` is
+1500 s, and all three boots show `panic=0` / `out of range=0`. So the failure is not the §394
+overflow branch and not a harness parsing bug: at 262144 x 4 the un-revived rows drop to the
+silent branch (one sample per step, tg 0.26-0.8), no request ever completes inside the window, and
+the client is killed before it writes a line. Those three cells must be **re-measured on the fixed
+binary** (the paired A/B's `FIX` arm is exactly `262144 4`) before any conclusion about batch shape
+on 4 cards is drawn from them.
