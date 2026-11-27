@@ -11,7 +11,7 @@ where they are: the author's shapes in [`run/ac922/`](run/ac922/), our campaign 
 
 | | |
 |---|---|
-| Box | IBM AC922, POWER9 ppc64le, 256 GiB host RAM, RHEL 8 |
+| Box | IBM AC922, POWER9 ppc64le, **597.2 GiB host RAM** (DIMMs filled 2026-11-27; this paper's pre-11-27 numbers were taken on 256 GiB), RHEL 8 |
 | GPUs | 4x Tesla V100-SXM2-16GB, physical cards `0,1,3,4` = two NVLink pairs, one pair per NUMA socket |
 | Kernel | 4.18 plus the [power9-nvidia-nvlink2](https://github.com/eelgaev/power9-nvidia-nvlink2) patches, driver 550.54.15 |
 | Model | Qwen3.8-Flash-Next UD-Q4_K_XL, 4-shard GGUF, BF16 checkpoint converted on load |
@@ -54,6 +54,27 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 legion serve \
 | `--conv-disk ... --conv-disk-gib 200` | The cold tier: content-addressed KV blocks and state checkpoints on NVMe, so a restart or an eviction resumes from a disk read instead of a prefill storm. |
 | `--mmproj ...` | Image input on the same endpoint. GPU tower on sm_70; the reference-image probe below is what makes this acceptable rather than assumed. |
 | `--undeclared-tool-calls call` | A well-formed call that names a tool the request did not declare goes to the client on the tool channel instead of staying in the reply text. See [serving.md](serving.md#constrained-output-json-and-strict-tool-calls). |
+
+## Binary of record (2026-11-27 10:45 CST)
+
+`/data/work/legion/bin-ctlock`, sha256 `24f72fdccb49`, adopted into `lane.env` with a dated
+`# ADOPTED` header and a timestamped backup beside it. `legion --version` stamps it `b4a26a4`, one
+commit behind its source, for the reason described under Building: `build.rs` reads HEAD when the
+build starts, and this build started before the commit that made it. The stamp is not the evidence
+that the code is in the binary - the runtime is: the boot created `/data/cache/conv-tier-prod/writer.lock`,
+which only the single-writer code path can create, and the tier's own counters plus `devq3`/`devq4`/
+`devq6` in [ac922-revive-decode-fix.md](ac922-revive-decode-fix.md) reproduce all three fixes.
+
+What it buys, each verified separately rather than assumed:
+
+| fix | how it was proven | effect measured |
+|---|---|---|
+| S395 shutdown race | `bin-revive` vs `bin-ctlock` on the same shutdown shape | old: 1 SIGSEGV, backlog landed +2 of ~18; new: 0 SIGSEGV, +302 |
+| S396 two writers | unit test 7/7, plus a real `kill -9` mid-load | after the kill: 7/7 states and 221/221 blocks match their index; next boot agrees |
+| S394 revive decode | `armud UD2` vs `UD1`, production shape, same night | neutral: 8k -0.1%, 122880x4 0.0%, 262144x4 wall -1.1% / tg +0.7%, det same |
+
+The NV-scale lane keeps `bin-nvscale` on purpose: it is the reproducibility baseline for the
+NV-scale arms, and its own tier scanned clean (205/205).
 
 ## Launching
 
@@ -105,7 +126,18 @@ grep -aE 'conv tier: live|memory plan part="host"|listening' "$L"
 python3 /data/work/legion/eval/qualLegion.py det       # three runs, six per-prompt shas, identical
 python3 /data/work/vl-probe.py img                   # same amount, same answer sha
 python3 /data/work/legion/eval/undecl_probe.py call  # drifted names leave on the tool channel
+bash /data/work/legion/eval/plogarch.sh 4            # archive this boot, then hand back traffic
 ```
+
+Every round is archived, not just read: `plogarch.sh` writes
+`logs/archive/<boot-ts>-c<cards>.tar.gz` holding the raw engine log, both lane envs, the binary path
+and sha, the argv flags, `nvidia-smi`, `meminfo`, and a derived summary (geometry, conv-tier scan and
+live counts, NUMA failure lines, panic count, revive aborts, requests done, mean and slow-row decode
+rate, tier footprint, and the index-vs-blob gap). Keys are redacted on the way in and the archive is
+checked for leftovers, because a `lane.env` copy would otherwise put `LEGION_API_KEY` into every
+archive. The last field is the one that has been wrong silently: on the adopted boot it printed
+`indexed_blocks=4388 blobs_on_disk=111605 orphan_blobs=107217 orphan_pct=96.1` next to
+`decode_rows=27 decode_mean=46.62 decode_slow_lt5=0` - a healthy decoder on a starved cold tier.
 
 The probes read `PROBE_BASE`/`LB_URL` plus their own key variable, so a gate against a port other
 than the default 8097 needs both lines above. Compare one prompt's sha across the three runs *and*
@@ -134,3 +166,15 @@ a managed boot; 262K at four: 86.2 aggregate. A cold 4x123K prefill storm costs 
 sessions resumed from RAM 16.9 s, and the cold tier turns the eviction case into the read path.
 Both numbers carry the boot-to-boot caveat written up in the perf doc; read the deltas, not the
 last digit.
+**The same cell has two honest values, 35x apart, and the difference is page cache.** `262144 x 4`
+measured 18.9 s wall / 87.0 agg when it ran 90 s after another boot had already touched those
+chains, and 645-652 s / 2.5 agg when it did not, with `tg_med` staying ~22-26 throughout. With
+597 GiB of RAM and a 212 GiB tier sitting inside a 301 GiB page cache, a "revive" is usually a RAM
+read, not an NVMe read. Quote the warmth next to the number or the number means nothing.
+
+**Why a chain goes missing:** `tools/convtier_gc.py` (dry-run) reports, on the live tier, 4,388
+indexed keys against 111,605 block files - **107,932 unreachable blobs, 201.3 GiB** - because the
+pre-S396 binaries let a second writer rename a manifest shard holding its own smaller index over
+the first writer's blobs. TTL is ruled out: 111,471 of those blobs were written in the last 24 h.
+The token list lives only in the manifest entry, so an orphaned blob cannot be reused, only deleted;
+nothing has been deleted, since 516 G is free and the set is the physical evidence.
