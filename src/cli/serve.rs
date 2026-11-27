@@ -656,6 +656,26 @@ pub(super) struct ModelArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub pipeline_min_group: usize,
+    /// Ceiling on the summed window tokens of the admitted rows (AC922 #418): a request whose
+    /// full length (prompt + max_tokens, capped at the context) would pass it queues instead
+    /// of entering the window - the full-window four-way split collapsed to 1.5 tok/s a row
+    /// when a third 262144 window entered beside two; with a budget of two, two rows hold
+    /// 15.8-17.6 each and the rest wait their turn instead of a 400. Small requests pack into
+    /// the gaps the ceiling leaves. 0 (default): off. Good value on a layer split: 2x the
+    /// context. `--resident-window-starve` bounds the wait.
+    #[arg(long, default_value_t = 0, value_name = "TOKENS", env = "LEGION_RESIDENT_WINDOW_BUDGET")]
+    pub resident_window_budget: usize,
+    /// With --resident-window-budget: how long a blocked request may wait before it enters
+    /// past the budget anyway (liveness; default 90 s). A preempted sequence returning to the
+    /// queue is never budget-blocked.
+    #[arg(
+        long,
+        default_value_t = legion::engine::lm::DEFAULT_WINDOW_STARVE_SECS,
+        value_name = "SECS",
+        env = "LEGION_RESIDENT_WINDOW_STARVE",
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+    )]
+    pub resident_window_starve: u64,
     /// With --pipeline-groups and the MTP head (--spec mtp), and no --layer-split: after
     /// loading, decode a short synthetic run as groups, measure each stage's time per layer and
     /// the last stage's extra work per round (output head, sampling, commit, MTP drafts), and if
@@ -2318,6 +2338,8 @@ pub async fn run(
                 split_batches: e.model.split_batches,
                 pipeline_groups: e.model.pipeline_groups,
                 pipeline_min_group: e.model.pipeline_min_group,
+                resident_window_budget: e.model.resident_window_budget,
+                resident_window_starve: std::time::Duration::from_secs(e.model.resident_window_starve),
                 pipeline_mtp_split: e.model.pipeline_mtp_split,
                 split_last_extra: e.model.split_last_extra,
                 node: e.model.node_rank.map(|rank| legion::node::NodeConfig {

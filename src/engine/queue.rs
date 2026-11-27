@@ -58,6 +58,20 @@ impl std::fmt::Display for ShareKey {
     }
 }
 
+/// What admission decided about a queued job under `--resident-window-budget`
+/// ([`WaitQueue::pop_fit`], AC922 #418): the scheduler-side ceiling on the summed window
+/// tokens, decided by the caller, which knows the running sequences' lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Its window fits the budget: an ordinary admission candidate.
+    Fits,
+    /// It does not fit; it stays queued until room opens or it ages into [`Fit::Starved`].
+    Blocked,
+    /// It does not fit but earned admission anyway: the liveness guard, so no request
+    /// starves behind smaller ones, and a preempted sequence returns before fresh work.
+    Starved,
+}
+
 /// A request's place in the scheduler's order (see the module docs).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Scheduling {
@@ -294,6 +308,40 @@ impl<J> WaitQueue<J> {
         } else {
             self.pick(max_seqs, keyed, running)?
         };
+        self.take(i)
+    }
+
+    /// The next job to admit among those `fit` calls [`Fit::Fits`] ([`Self::pop`]'s order);
+    /// when none fits, the best-ordered [`Fit::Starved`] one, so an aged request is admitted
+    /// anyway rather than starving behind smaller ones. `None` (nothing removed) when every
+    /// candidate is [`Fit::Blocked`]: the budget made the engine wait, not fail - the request
+    /// stays queued and retries at the next step's head (AC922 #418, `--resident-window-budget`).
+    /// The fit filter composes with the policy order; it is not a new priority.
+    pub fn pop_fit(
+        &mut self,
+        max_seqs: usize,
+        running: impl IntoIterator<Item = Option<ShareKey>>,
+        mut fit: impl FnMut(&J) -> Fit,
+    ) -> Option<(J, Ticket)> {
+        let keyed = self.by_key.len() > 1;
+        let i = (if !keyed && self.policy == SchedulingPolicy::Fcfs {
+            // One key, arrival order: the oldest job that fits, else the oldest that aged in.
+            self.entries
+                .iter()
+                .position(|e| fit(&e.job) == Fit::Fits)
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .position(|e| fit(&e.job) == Fit::Starved)
+                })
+        } else {
+            self.pick_fit(max_seqs, keyed, running, &mut fit)
+        })?;
+        self.take(i)
+    }
+
+    /// Removes entry `i` and updates the queue's counts (what [`Self::pop`] does with its pick).
+    fn take(&mut self, i: usize) -> Option<(J, Ticket)> {
         let e = self.entries.remove(i)?;
         self.count(&e.ticket, false);
         self.admitted += 1;
@@ -311,6 +359,18 @@ impl<J> WaitQueue<J> {
         max_seqs: usize,
         keyed: bool,
         running: impl IntoIterator<Item = Option<ShareKey>>,
+    ) -> Option<usize> {
+        self.pick_fit(max_seqs, keyed, running, &mut |_| Fit::Fits)
+    }
+
+    /// [`Self::pick`] with the budget filter: the best-ordered entry `fit` calls `Fits`,
+    /// else the best-ordered one it calls `Starved`, else none.
+    fn pick_fit(
+        &self,
+        max_seqs: usize,
+        keyed: bool,
+        running: impl IntoIterator<Item = Option<ShareKey>>,
+        fit: &mut impl FnMut(&J) -> Fit,
     ) -> Option<usize> {
         let mut held: HashMap<Option<ShareKey>, usize> = HashMap::new();
         let mut share = usize::MAX;
@@ -337,10 +397,11 @@ impl<J> WaitQueue<J> {
             };
             (priority, !e.ticket.requeued, held, turn, e.ticket.arrival)
         };
-        let best = |capped: bool| {
+        let mut best = |capped: bool, want: Fit| {
             self.entries
                 .iter()
                 .enumerate()
+                .filter(|(_, e)| fit(&e.job) == want)
                 .filter(|(_, e)| !capped || held_by(&e.ticket.sched.share_key) < share)
                 .min_by_key(|(_, e)| rank(e))
                 .map(|(i, _)| i)
@@ -348,9 +409,12 @@ impl<J> WaitQueue<J> {
         // With other keys waiting, a key at its share waits; if every waiting key is, the cap
         // would only leave the slot idle.
         if keyed {
-            best(true).or_else(|| best(false))
+            best(true, Fit::Fits)
+                .or_else(|| best(false, Fit::Fits))
+                .or_else(|| best(true, Fit::Starved))
+                .or_else(|| best(false, Fit::Starved))
         } else {
-            best(false)
+            best(false, Fit::Fits).or_else(|| best(false, Fit::Starved))
         }
     }
 

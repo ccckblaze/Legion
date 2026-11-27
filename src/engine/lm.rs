@@ -71,7 +71,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use super::queue::{Scheduling, SchedulingPolicy, Ticket, WaitQueue};
+use super::queue::{Fit, Scheduling, SchedulingPolicy, Ticket, WaitQueue};
 use super::ring_checkpoints::{self, RingCheckpoints};
 use super::sampling::Sampler;
 use super::saved_states::{Kind as SaveKind, SavedStates, save_points};
@@ -95,6 +95,9 @@ use crate::spec::{
 };
 use crate::tokenizer::Tokenizer;
 pub use pipe::DEFAULT_MIN_GROUP as DEFAULT_PIPELINE_MIN_GROUP;
+/// `--resident-window-starve`: the default wait after which a budget-blocked job enters
+/// anyway (the liveness guard for `--resident-window-budget`, AC922 #418).
+pub const DEFAULT_WINDOW_STARVE_SECS: u64 = 90;
 pub use preempt::KvAdmission;
 use preempt::Waiting;
 pub use slo::SloTargets;
@@ -1351,6 +1354,18 @@ pub struct LmConfig {
     /// sequences make fewer groups. Default [`DEFAULT_PIPELINE_MIN_GROUP`]; 1 lets four
     /// sequences run as four groups over four stages (#752).
     pub pipeline_min_group: usize,
+    /// `--resident-window-budget` (AC922 #418): the ceiling, in tokens, over the summed
+    /// windows of admitted sequences ([`Seq::window`] of the running ones; prompt +
+    /// `max_tokens` capped at the context for a new job). A job that would pass it stays
+    /// queued instead of entering the window and collapsing every row's decode rate:
+    /// the measured full-window cliff was 2 rows at 15.8-17.6 tok/s each vs a 3rd row
+    /// dragging all rows to 1.5. 0 (default): off, today's admit-what-VRAM-fits behaviour.
+    pub resident_window_budget: usize,
+    /// `--resident-window-starve`: how long a job [`Self::resident_window_budget`] blocks
+    /// may wait before it is admitted past the budget anyway (the liveness guard; a
+    /// preempted sequence returning to the queue is never budget-blocked, its window was
+    /// already paid for once).
+    pub resident_window_starve: std::time::Duration,
     /// `--pipeline-mtp-split` (#765): with [`Self::pipeline_groups`] and the MTP head, measure
     /// the rounds' stage times ([`LmEngine::mtp_split_hint`], [`pipe_split`]) for a split that
     /// gives the last stage fewer layers. Off: no measuring.
@@ -1737,6 +1752,8 @@ impl LmConfig {
             split_batches: false,
             pipeline_groups: 0,
             pipeline_min_group: DEFAULT_PIPELINE_MIN_GROUP,
+            resident_window_budget: 0,
+            resident_window_starve: std::time::Duration::from_secs(DEFAULT_WINDOW_STARVE_SECS),
             pipeline_mtp_split: false,
             split_last_extra: 0.0,
             node: None,
@@ -6401,6 +6418,10 @@ impl LmEngine {
             pipeline_prompt,
             pipeline_groups,
             pipeline_min_group: cfg.pipeline_min_group.max(1),
+            window_budget: cfg.resident_window_budget,
+            window_starve: cfg
+                .resident_window_starve
+                .max(std::time::Duration::from_secs(1)),
             split_probe: split_probe.clone(),
             lent: false,
             lent_short: false,
@@ -6871,6 +6892,10 @@ struct Worker {
     pipeline_groups: usize,
     /// Fewest sequences per group ([`LmConfig::pipeline_min_group`]).
     pipeline_min_group: usize,
+    /// `--resident-window-budget` ([`LmConfig::resident_window_budget`]; 0: off).
+    window_budget: usize,
+    /// `--resident-window-starve` ([`LmConfig::resident_window_starve`]).
+    window_starve: std::time::Duration,
     /// `--pipeline-mtp-split`: each round's stage times and exiting work (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
     /// Whether the expert cache's VRAM is lent to a long prompt now.
@@ -7012,6 +7037,13 @@ impl Seq<'_> {
         self.media.as_ref().map(|(m, _)| &**m)
     }
 
+    /// The tokens of context this sequence holds in the window now: its prompt from
+    /// admission, its cached prefix once prefill has run past it. The unit of
+    /// `--resident-window-budget` (AC922 #418, [`LmConfig::resident_window_budget`]).
+    fn window(&self) -> usize {
+        self.n_past.max(self.prompt.len())
+    }
+
     /// What the prefix cache knows its prompt by: the prompt, each image's tokens told apart by
     /// the image ([`vision`]).
     fn cache_key(&self) -> &[u32] {
@@ -7093,6 +7125,13 @@ impl Drop for Worker {
 impl Worker {
     fn run(mut self, rx: std::sync::mpsc::Receiver<Job>) {
         let tokenizer = self.tokenizer.clone();
+        if self.window_budget > 0 {
+            tracing::info!(
+                budget = self.window_budget,
+                starve_s = self.window_starve.as_secs(),
+                "resident window budget on: rows past it queue instead of entering (AC922 #418)"
+            );
+        }
         let mut waiting: WaitQueue<Waiting<'_>> = WaitQueue::new(self.scheduling);
         let queue = |waiting: &mut WaitQueue<Waiting<'_>>, job: Job| {
             let sched = job.sched;
@@ -7235,12 +7274,65 @@ impl Worker {
                     let slot = (self.max_seqs..self.max_seqs + self.prefill_slots)
                         .find(|s| prefilling.iter().all(|q| q.slot != *s))
                         .expect("a free prefill slot");
-                    let running = decoding
-                        .iter()
-                        .chain(pipe.seqs())
-                        .chain(prefilling.iter())
-                        .map(|s| s.ticket.scheduling().share_key);
-                    let (item, ticket) = waiting.pop(self.max_seqs, running).unwrap();
+                    let (item, ticket) = if self.window_budget == 0 {
+                        let running = decoding
+                            .iter()
+                            .chain(pipe.seqs())
+                            .chain(prefilling.iter())
+                            .map(|s| s.ticket.scheduling().share_key);
+                        waiting.pop(self.max_seqs, running).unwrap()
+                    } else {
+                        // AC922 #418: the summed window of the admitted rows is capped. A
+                        // job that would pass the cap stays queued - it retries at the next
+                        // step's head - instead of entering the window and collapsing every
+                        // row's decode rate. Past `--resident-window-starve` it enters anyway.
+                        let budget = self.window_budget;
+                        let starve = self.window_starve;
+                        let max_ctx = self.max_ctx;
+                        let resident = decoding
+                            .iter()
+                            .chain(pipe.seqs())
+                            .chain(prefilling.iter())
+                            .map(Seq::window)
+                            .sum::<usize>();
+                        let fit = |w: &Waiting| match w {
+                            Waiting::New(job) => {
+                                let cost =
+                                    (job.prompt.len() + job.max_tokens as usize).min(max_ctx);
+                                if resident + cost <= budget {
+                                    Fit::Fits
+                                } else if job.queued_at.elapsed() >= starve {
+                                    Fit::Starved
+                                } else {
+                                    Fit::Blocked
+                                }
+                            }
+                            // A preempted row is not new load: its window was paid for once,
+                            // so it is never budget-Blocked; the queue's order returns it.
+                            Waiting::Preempted(seq) => {
+                                if resident + seq.window() <= budget {
+                                    Fit::Fits
+                                } else {
+                                    Fit::Starved
+                                }
+                            }
+                        };
+                        match waiting.pop_fit(
+                            self.max_seqs,
+                            decoding
+                                .iter()
+                                .chain(pipe.seqs())
+                                .chain(prefilling.iter())
+                                .map(|s| s.ticket.scheduling().share_key),
+                            fit,
+                        ) {
+                            Some(jt) => jt,
+                            None => {
+                                short = true;
+                                break;
+                            }
+                        }
+                    };
                     let admitted = match item {
                         Waiting::New(job) => match self.admit(&tokenizer, job, ticket, slot) {
                             Admission::Admitted(seq) => Ok(seq),

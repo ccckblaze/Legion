@@ -311,3 +311,58 @@ fn requeued_jobs_lead_under_fair_share_within_the_share() {
     let a = Some(ShareKey::of("A"));
     assert_eq!(q.pop(16, [a]).unwrap().0, "a1");
 }
+
+#[test]
+fn pop_fit_skips_blocked_admits_aged_and_removes_nothing_when_all_wait() {
+    let mut q = WaitQueue::new(SchedulingPolicy::Fcfs);
+    for j in ["big", "small", "aged"] {
+        q.push(j, Scheduling::default());
+    }
+    // The oldest that fits goes first; a Blocked one stays queued (nothing popped twice).
+    let (j, _) = q
+        .pop_fit(16, [], |x| match *x {
+            "big" => Fit::Blocked,
+            "aged" => Fit::Starved,
+            _ => Fit::Fits,
+        })
+        .unwrap();
+    assert_eq!(j, "small");
+    assert_eq!(q.len(), 2);
+    // Nothing fits now, but the aged one enters ahead of the older blocked one.
+    let (j, _) = q
+        .pop_fit(16, [], |x| {
+            if *x == "aged" {
+                Fit::Starved
+            } else {
+                Fit::Blocked
+            }
+        })
+        .unwrap();
+    assert_eq!(j, "aged");
+    // Everything blocked: the queue keeps its work for the next step.
+    assert!(q.pop_fit(16, [], |_| Fit::Blocked).is_none());
+    assert_eq!(q.len(), 1);
+    assert_eq!(q.pop(16, []).unwrap().0, "big");
+}
+
+#[test]
+fn pop_fit_keeps_priority_and_fair_share_ordering_among_the_fitting() {
+    let mut q = WaitQueue::new(SchedulingPolicy::Priority);
+    q.push("k1-small", sched(1, Some("a")));
+    q.push("k2-small", sched(1, Some("b")));
+    q.push("urgent-big", sched(0, Some("c")));
+    let fits = |x: &&str| {
+        if *x == "urgent-big" {
+            Fit::Blocked
+        } else {
+            Fit::Fits
+        }
+    };
+    // The best rank (priority 0) is blocked: the fitting priority-1 ones go, round-robin
+    // between their keys.
+    assert_eq!(q.pop_fit(16, [], fits).unwrap().0, "k1-small");
+    assert_eq!(q.pop_fit(16, [], fits).unwrap().0, "k2-small");
+    // With nothing fitting left, the urgent-big one stays too: waiting, not failed.
+    assert!(q.pop_fit(16, [], |_| Fit::Blocked).is_none());
+    assert_eq!(q.pop(16, []).unwrap().0, "urgent-big");
+}

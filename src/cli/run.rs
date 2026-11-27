@@ -89,6 +89,8 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     cfg.split_batches = m.split_batches;
     cfg.pipeline_groups = m.pipeline_groups;
     cfg.pipeline_min_group = m.pipeline_min_group;
+    cfg.resident_window_budget = m.resident_window_budget;
+    cfg.resident_window_starve = std::time::Duration::from_secs(m.resident_window_starve.max(1));
     cfg.ngram = m.ngram_options()?;
     cfg.residency = residency;
     cfg.mmproj = m.mmproj.clone();
