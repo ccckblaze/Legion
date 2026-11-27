@@ -318,6 +318,7 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
                 && state_path(&cfg.dir, &s.chain).exists();
             if keep {
                 st_keep += 1;
+                bytes += s.bytes;
                 let mut s = s;
                 if let Some(l) = live {
                     if s.sig != *l {
@@ -1135,9 +1136,13 @@ fn trim(inner: &Inner, dirty: &mut HashSet<String>) {
         let s = inner.states.lock().unwrap();
         let mut v: Vec<(&String, u64)> = s.iter().map(|(k, e)| (k, e.last_used_ms)).collect();
         v.sort_by_key(|&(_, t)| t);
+        let mut sheld = *inner.bytes.lock().unwrap();
         for (k, t) in v {
-            if age_ms.map_or(true, |a| now.saturating_sub(t) <= a) {
+            if (!over || sheld <= cap) && age_ms.map_or(true, |a| now.saturating_sub(t) <= a) {
                 break;
+            }
+            if let Some(e) = s.get(k) {
+                sheld = sheld.saturating_sub(e.bytes);
             }
             svictims.push(k.clone());
         }
