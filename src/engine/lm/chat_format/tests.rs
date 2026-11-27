@@ -41,12 +41,15 @@ fn check_parsers(format: &ChatFormat, reasoning: &str, call: &str) {
     assert_eq!(thought, "plan");
     assert_eq!(answer, "answer");
 
-    let mut parser = format.tool_parser(&[Tool {
-        name: "lookup".into(),
-        description: None,
-        parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
-        strict: false,
-    }]);
+    let mut parser = format.tool_parser(
+        &[Tool {
+            name: "lookup".into(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+            strict: false,
+        }],
+        false,
+    );
     let mut events = Vec::new();
     for c in call.chars() {
         events.extend(parser.push(&c.to_string()));
@@ -232,7 +235,7 @@ fn inkling_markup_is_shown_and_parsed_on_every_reply() {
     }
     // Reasoning, then the framed answer, through both parsers.
     let mut reasoning = format.reasoning_parser(false);
-    let mut parser = format.tool_parser(&[]);
+    let mut parser = format.tool_parser(&[], false);
     let mut events = Vec::new();
     let reply = "<|message_model|><|content_thinking|>plan<|end_message|>\
                  <|message_model|><|content_text|>answer<|end_message|>";
@@ -280,7 +283,7 @@ fn muse_markup_is_shown_and_parsed_on_every_reply() {
         format.prompt_reasoning("<|start|>user<|message|>Hi<|eot|><|start|>assistant"),
         None
     );
-    let mut parser = format.tool_parser(&[]);
+    let mut parser = format.tool_parser(&[], false);
     let mut events = Vec::new();
     let reply = " to=self<|message|>plan<|eom|><|start|>assistant to=user<|message|>answer";
     for c in reply.chars() {
