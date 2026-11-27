@@ -1841,6 +1841,12 @@ mod tests {
             block_bytes: 64,
             block_tokens: 64,
         };
+        // `ConvTier::start` deliberately does not create its layout: production builds the
+        // config through the opener that does. Mirror that here, because a missing `pending/`
+        // makes every dump fail in the silent `Err` arm instead of in the assertions below.
+        for sub in ["blocks", "states", "pending"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
         let tier = ConvTier::start(cfg, HashMap::new(), sig).expect("free directory");
         let chain = chain_of(&[7u32; 64]);
         let on_disk = state_path(&dir, &chain);

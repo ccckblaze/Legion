@@ -363,3 +363,89 @@ full `--conv-disk-pending-gib` 64 GiB queue could take longer to stop than `legi
 with a deadline that abandons the queue, or raise the stop ceiling. And the same double-writer window
 applies to any two lanes pointed at one `--conv-disk` directory: the lock makes it loud, but lane
 templates should keep one directory per lane (they mostly do).
+
+## 397 - Verification of S395/S396 and the adoption decision (2026-11-27, 4-card + 2-card lanes)
+
+### S395 (shutdown race) - confirmed, and the trigger is narrower than the fix assumes
+
+The dmesg counter (`unhandled signal 11` with `conv-tier` in the fault line) moved exactly once, on
+the arm that had work in flight at shutdown, and only on the pre-fix binary:
+
+| arm | binary | in flight at stop | SEGV delta | blobs landed after stop |
+|---|---|---|---|---|
+| devq3 Q1 | `bin-revive` (S394 only) | channel jobs, `pending/` empty | **1** | **+2** |
+| devq3 Q2 | `bin-ctlock` (S394+395+396) | same shape | **0** | **+302** |
+| devq4 R1 | `bin-revive` | nothing (burst drained first) | 0 | 0 |
+| devq4 R2 | `bin-ctlock` | nothing | 0 | 0 |
+
+Two conclusions the earlier draft did not have:
+
+- **`pending/` is not the indicator.** Q1 crashed with `pending=0`. A `BlockJob` sitting in the mpsc
+  channel already carries raw pool addresses, so the disk directory can be empty while the race is
+  live. The observable that matters is *work that lands after the stop* - Q1 lost it (2 of ~18),
+  Q2 kept it (302).
+- **The crash is conditional, not a background rate.** devq4 is the control: when the writer has
+  caught up before shutdown, both binaries are clean. So the 6 historical faults were all
+  "shutdown with a live queue", and the fix removes that class.
+
+### S396 (two writers, one directory) - confirmed by test and by a real SIGKILL
+
+- `cargo test --release --features cuda --lib conv_tier`: **7 passed, 0 failed**. The new
+  `a_late_writer_keeps_the_index_on_disk` asserts the loser of a `link_once` race cannot rename its
+  own key over a blob it did not write, and that the read path retires an entry that stopped
+  matching its bytes.
+  (First run failed for a test-harness reason, not a code reason: `ConvTier::start` deliberately does
+  not create its directory layout - production builds the config through the opener that does - so a
+  hand-rolled `ConvDiskCfg` made every dump fail in the silent `Err` arm. The test now creates
+  `blocks/states/pending` itself.)
+- `devq6`: boot a `bin-ctlock` tier, burst 8 x ~12k, then `kill -9` the engine mid-load. Independent
+  re-scan (not the engine's own report): `states_indexed 7 ok 7 sha_mismatch 0 missing 0`,
+  `blocks_scanned 221 ok 221 sha_mismatch 0 size_mismatch 0 missing 0`. A second boot on the same
+  directory agrees (`221 blocks 7 states, 0 missing, 0 foreign`) and the revive completes. A killed
+  writer can lose unindexed work; it cannot leave an index that misdescribes its bytes.
+- Production baseline before adoption: `conv-tier-prod` = 111,600 blocks / 255 states / 212 GiB with
+  **exactly 10 poisoned states**, all `want_bytes == file_bytes` and a differing sha, each with the
+  manifest shard mtime *later* than the blob mtime - the signature in S396. Post-adoption gate:
+  the boot log must show `states_repaired` reaching 10 and a re-scan must return `total_bad 0`.
+  Do not hand-clean: the read path is the thing under test.
+
+### S394 on the production shape - neutral, so it is safe to ship with the two tier fixes
+
+`armud UD2` (`bin-revive`, `lane.env`, same cells, same night as `UD1` = `bin-ctl394`):
+
+| cell | UD1 | UD2 | delta |
+|---|---|---|---|
+| 8192 x 4 conc - agg / tg_med | 82.6 / 36.97 | 82.5 / 36.75 | -0.1% / -0.6% |
+| 122880 x 4 conc - wall / agg / tg_med | 276.1 / 7.4 / 29.92 | 275.4 / 7.4 / 29.83 | -0.3% / 0 / -0.3% |
+| 262144 x 4 conc - wall / agg / tg_med | 652.4 / 2.5 / 22.09 | 645.4 / 2.5 / 22.24 | -1.1% / 0 / +0.7% |
+| det | same, panic 0 | same, panic 0 | - |
+
+These cells do not exercise the S390 pathology they were meant to cure (a *follow-up after eviction*
+degrading to 0.2-0.8 tok/s), so read them as "no regression", not as "no benefit". The benefit is
+already measured separately in the CV wave.
+
+### Not a S394 result: the NV-scale lane's `262144 x 4` cell
+
+`arm CTL`/`arm FIX` source `lane-nvfp4-4.env` (`MAX_BATCH=4096`, `KV_VRAM=274432`,
+`EXPERT_CACHE_GIB=6.5`, tier-nv4), which is **not** the production shape. There, the same binary that
+completes the cell in 652 s on the production lane produces **zero records** in 1500 s
+(`reburst-abCTL-f.jsonl` and `reburst-abFIX-f.jsonl` do not exist at all - not a parse failure).
+Both arms failing identically means the cell is a lane/VRAM-shape limit (same family as retry3's
+`out of VRAM for a step's compute buffer ... need_mib=3035` -> `cudaMemcpy: invalid argument`),
+not a property of the code under test. Rule: diff the two arms' lane envs before quoting any A/B.
+
+### Adopted
+
+`lane.env` -> `LEGION_BIN=/data/work/legion/bin-ctlock` (sha256 `24f72fdccb49`), dated `# ADOPTED`
+header, backup kept. `lane-nvfp4-4.env` intentionally left on `bin-nvscale` (reproducibility baseline
+for the NV-scale arms; its tier scanned 205/205 clean).
+
+Filed for the next iteration, not folded into this one:
+
+- `close()` joins the writer unboundedly, while `legion-lane.sh stop()` waits 60 s and then
+  `kill -9`. Measured drain rate is >= 5 blocks/s, and a worst-case production queue is 8 x 4096 =
+  32,768 blocks (~109 min), so a restart right after a heavy burst loses ~99.7% of the queue silently.
+  The structural fix is to make `BlockJob` own an `Arc` of the KV arena instead of a raw address -
+  then dropping the writer mid-flight is merely lost work, and shutdown never has to block.
+- `--conv-disk-gib` counts blocks only, so the production tier reached 212 GiB against a 128 GiB
+  nominal cap. Patch exists and `--check`s clean; it is not in the adopted binary.
