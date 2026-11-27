@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -167,6 +168,12 @@ pub struct ConvStats {
     pub bytes_hydrated: AtomicU64,
     /// Dumps that stepped aside at the writer queue's ceiling (`--conv-disk-pending-gib`).
     pub dumps_backpressured: AtomicU64,
+    /// A blob we queued was already on disk under the same chain, so ours was dropped and the
+    /// index kept the older bytes: the cost of sharing one tier directory across boots.
+    pub index_conflicts: AtomicU64,
+    /// Entries retired because their blob's bytes no longer matched the key the index held.
+    pub blobs_repaired: AtomicU64,
+    pub states_repaired: AtomicU64,
 }
 
 impl ConvStats {
@@ -191,6 +198,9 @@ impl ConvStats {
             tokens_hydrated: g(&self.tokens_hydrated),
             bytes_hydrated: g(&self.bytes_hydrated),
             dumps_backpressured: g(&self.dumps_backpressured),
+            index_conflicts: g(&self.index_conflicts),
+            blobs_repaired: g(&self.blobs_repaired),
+            states_repaired: g(&self.states_repaired),
             pending_bytes: 0,
         }
     }
@@ -212,6 +222,11 @@ pub struct StatsSnapshot {
     pub tokens_hydrated: u64,
     pub bytes_hydrated: u64,
     pub dumps_backpressured: u64,
+    /// See [`ConvStats::index_conflicts`] / [`ConvStats::blobs_repaired`] /
+    /// [`ConvStats::states_repaired`].
+    pub index_conflicts: u64,
+    pub blobs_repaired: u64,
+    pub states_repaired: u64,
     /// Bytes in the writer queue right now (filled by `ConvTier::stats_snapshot`).
     pub pending_bytes: u64,
 }
@@ -227,6 +242,11 @@ pub fn blob_path(dir: &Path, chain: &str) -> PathBuf {
 pub fn state_path(dir: &Path, chain: &str) -> PathBuf {
     let shard = chain.get(..2).unwrap_or("00");
     dir.join("states").join(shard).join(format!("{chain}.bin"))
+}
+
+/// The manifest shard holding a chain's entry: the same first-byte pair the paths shard by.
+fn shard_of(chain: &str) -> String {
+    chain.get(..2).unwrap_or("00").to_string()
 }
 
 fn shard_name(shard: &str) -> String {
@@ -452,8 +472,15 @@ struct Inner {
     /// Bytes in the writer queue (materialized or promised): the backpressure gauge
     /// against `pending_max()` (oMLX's bounded pending buffer).
     pending: AtomicU64,
+    /// Held for the tier's whole life: the exclusive `flock` that makes this boot the only
+    /// writer of `cfg.dir`. See [`take_writer`].
+    _lock: fs::File,
     /// [`ConvTier::close`]: the engine's pools are going away, so queue nothing else.
     closed: AtomicBool,
+    /// Shards a repair retired an entry from: the writer merges these into its own dirty set,
+    /// so a hydrate-side retirement reaches the manifest without a second thread renaming a
+    /// shard file the writer may be writing at the same moment.
+    extra_dirty: Mutex<HashSet<String>>,
     /// The writer's handle, taken and joined by [`ConvTier::close`].
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     stats: ConvStats,
@@ -468,7 +495,10 @@ impl ConvTier {
     /// The thread only ends at [`ConvTier::close`], which joins it: dropping every handle
     /// cannot disconnect the channel, because the thread itself holds the `Arc<Inner>` that
     /// owns the sender.
-    pub fn start(cfg: ConvDiskCfg, scanned: HashMap<String, BlockEntry>, sig: Signature) -> ConvTier {
+    /// Returns `None` when another live engine owns the directory (see [`take_writer`]): the
+    /// boot runs without the cold tier rather than corrupting the owner's index.
+    pub fn start(cfg: ConvDiskCfg, scanned: HashMap<String, BlockEntry>, sig: Signature) -> Option<ConvTier> {
+        let lock = take_writer(&cfg.dir)?;
         let (tx, rx) = mpsc::channel();
         let total: u64 = scanned.values().map(|e| e.bytes).sum();
         let mut state_chains = HashSet::new();
@@ -504,7 +534,9 @@ impl ConvTier {
             acks: Mutex::new(Vec::new()),
             bytes: Mutex::new(total),
             pending: AtomicU64::new(0),
+            _lock: lock,
             closed: AtomicBool::new(false),
+            extra_dirty: Mutex::new(HashSet::new()),
             join: Mutex::new(None),
             stats: ConvStats::default(),
         });
@@ -514,7 +546,7 @@ impl ConvTier {
             .spawn(move || writer(me, rx))
             .expect("spawn conv-tier");
         *inner.join.lock().unwrap() = Some(join);
-        ConvTier { inner }
+        Some(ConvTier { inner })
     }
 
     pub fn sig(&self) -> &Signature {
@@ -660,6 +692,35 @@ impl ConvTier {
             }
         }
     }
+
+    /// Retire a block the index attests wrongly (its blob is not those bytes), and free the
+    /// chain so the next prompt ending here re-dumps it under a key the file really holds.
+    /// The read refused it already; leaving it named makes every future revive pay that read
+    /// to be told no again.
+    pub fn repair_block(&self, chain: &str) {
+        let e = self.inner.blocks.lock().unwrap().remove(chain);
+        self.inner.chains.lock().unwrap().remove(chain);
+        let Some(e) = e else { return };
+        let _ = fs::remove_file(blob_path(&self.inner.cfg.dir, chain));
+        let mut b = self.inner.bytes.lock().unwrap();
+        *b = b.saturating_sub(e.bytes);
+        drop(b);
+        self.inner.extra_dirty.lock().unwrap().insert(shard_of(chain));
+        self.inner.stats.blobs_repaired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Self::repair_block`] for a state sidecar: the `revive aborted` path's other half.
+    pub fn repair_state(&self, chain: &str) {
+        let e = self.inner.states.lock().unwrap().remove(chain);
+        self.inner.state_chains.lock().unwrap().remove(chain);
+        let Some(e) = e else { return };
+        let _ = fs::remove_file(state_path(&self.inner.cfg.dir, chain));
+        let mut b = self.inner.bytes.lock().unwrap();
+        *b = b.saturating_sub(e.bytes);
+        drop(b);
+        self.inner.extra_dirty.lock().unwrap().insert(shard_of(chain));
+        self.inner.stats.states_repaired.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Read `job`'s slices into one buffer: host ranges by direct copy, device ranges on the
@@ -759,25 +820,79 @@ mod cuda {
 }
 
 /// Link a freshly written file into place: never over an existing one (#5543).
-fn link_once(tmp: &Path, to: &Path) -> std::io::Result<()> {
-    let Some(p) = to.parent() else { return Ok(()) };
+/// The older file wins, so `Already` means our bytes lost: the index must then keep
+/// describing what is on disk, not what we just gave up on.
+enum Linked {
+    Ours,
+    Already,
+}
+
+fn link_once(tmp: &Path, to: &Path) -> std::io::Result<Linked> {
+    let Some(p) = to.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "blob path has no parent directory",
+        ));
+    };
     fs::create_dir_all(p)?;
     if to.exists() {
         let _ = fs::remove_file(tmp);
-        return Ok(());
+        return Ok(Linked::Already);
     }
     // oMLX's durability order (`_fsync_parent_dir`): the manifest may name a file only
     // once the bytes and the directory entry are both on the platter.
     sync_file(tmp);
     fs::rename(tmp, to)?;
     sync_dir(p);
-    Ok(())
+    Ok(Linked::Ours)
 }
 
 fn sync_file(path: &Path) {
     if let Ok(f) = fs::File::open(path) {
         let _ = f.sync_all();
     }
+}
+
+/// Claim the tier directory for this process: one exclusive `flock` on `writer.lock`, held for
+/// as long as the tier lives. Without it two engines can own one index - `legion-lane.sh
+/// restart` is `stop; sleep 5; start`, and a graceful stop is still draining its last request
+/// while the next boot has already scanned and is queueing into the same files. Blobs are
+/// write-once, but the manifest is renamed over, so the second flush leaves the index
+/// attesting a key the first writer's bytes do not hold: `state sidecar verification failed`,
+/// permanently, for every chain that collided (10 of 35 in the production tier).
+/// `None` means somebody else is writing here: run with the cold tier off, not with two indexes.
+fn take_writer(dir: &Path) -> Option<fs::File> {
+    if let Err(e) = fs::create_dir_all(dir) {
+        tracing::warn!("conv tier: {dir:?}: {e}: off for this boot");
+        return None;
+    }
+    let path = dir.join("writer.lock");
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("conv tier: {path:?}: {e}: off for this boot");
+            return None;
+        }
+    };
+    // Wait rather than fall over: the usual holder is the boot this one is restarting, still
+    // draining its last request. Boot takes minutes, so a bounded wait here is free.
+    for attempt in 0..10 {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Some(file);
+        }
+        if attempt == 0 {
+            tracing::info!("conv tier: {path:?} is held, waiting for the other engine to leave");
+        }
+        std::thread::sleep(Duration::from_millis(3_000));
+    }
+    tracing::warn!("conv tier: {path:?} is still held after 30 s, cold tier off for this boot");
+    None
 }
 
 fn sync_dir(dir: &Path) {
@@ -791,6 +906,10 @@ fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
     let mut dirty: HashSet<String> = HashSet::new();
     let mut last_flush = Instant::now();
     loop {
+        let retired = std::mem::take(&mut *inner.extra_dirty.lock().unwrap());
+        if !retired.is_empty() {
+            dirty.extend(retired);
+        }
         let first = match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(j) => j,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -858,24 +977,46 @@ fn dump_block(
     let dir = &inner.cfg.dir;
     let tmp = dir.join("pending").join(format!("{}.bin", &j.chain));
     let to = blob_path(dir, &j.chain);
-    if fs::write(&tmp, &bytes).and_then(|_| link_once(&tmp, &to)).is_err() {
+    let linked = match fs::write(&tmp, &bytes).and_then(|_| link_once(&tmp, &to)) {
+        Ok(l) => l,
+        Err(_) => {
         tracing::warn!("conv tier: block write failed");
         inner.chains.lock().unwrap().remove(&j.chain);
         return ack(inner);
-    }
-    let n = bytes.len() as u64;
-    let entry = BlockEntry {
-        chain: j.chain.clone(),
-        key,
-        prev: j.prev,
-        tokens: j.tokens,
-        bytes: n,
-        sig: inner.sig.clone(),
-        last_used_ms: now_ms(),
+        }
     };
-    inner.blocks.lock().unwrap().insert(j.chain.clone(), entry);
-    *inner.bytes.lock().unwrap() += n;
-    dirty.insert(j.chain[..2].to_string());
+    let n = bytes.len() as u64;
+    match linked {
+        Linked::Ours => {
+            let entry = BlockEntry {
+                chain: j.chain.clone(),
+                key,
+                prev: j.prev,
+                tokens: j.tokens,
+                bytes: n,
+                sig: inner.sig.clone(),
+                last_used_ms: now_ms(),
+            };
+            inner.blocks.lock().unwrap().insert(j.chain.clone(), entry);
+            *inner.bytes.lock().unwrap() += n;
+            dirty.insert(j.chain[..2].to_string());
+        }
+        // An earlier boot - typically the one `restart` is still draining while this one is
+        // already scanning the same directory - owns these bytes. The manifest may not be
+        // left attesting a key the blob does not hold, so index the file, not our buffer.
+        Linked::Already => {
+            inner.stats.index_conflicts.fetch_add(1, Ordering::Relaxed);
+            let mut b = inner.blocks.lock().unwrap();
+            if let Some(e) = b.get_mut(&j.chain) {
+                e.last_used_ms = now_ms();
+            } else if let Some(e) = adopt_block(inner, &j, &to) {
+                let got = e.bytes;
+                b.insert(j.chain.clone(), e);
+                *inner.bytes.lock().unwrap() += got;
+                dirty.insert(j.chain[..2].to_string());
+            }
+        }
+    }
     ack(inner);
 }
 
@@ -884,23 +1025,74 @@ fn dump_state(inner: &Inner, j: StateJob, dirty: &mut HashSet<String>) {
     let dir = &inner.cfg.dir;
     let tmp = dir.join("pending").join(format!("s-{}.bin", &j.chain));
     let to = state_path(dir, &j.chain);
-    if fs::write(&tmp, &j.bytes).and_then(|_| link_once(&tmp, &to)).is_err() {
+    let linked = match fs::write(&tmp, &j.bytes).and_then(|_| link_once(&tmp, &to)) {
+        Ok(l) => l,
+        Err(_) => {
         tracing::warn!("conv tier: state write failed");
         inner.state_chains.lock().unwrap().remove(&j.chain);
         return;
+        }
+    };
+    match linked {
+        Linked::Ours => {
+            let n = j.bytes.len() as u64;
+            let entry = StateEntry {
+                chain: j.chain.clone(),
+                key,
+                tokens: j.tokens,
+                bytes: n,
+                sig: inner.sig.clone(),
+                last_used_ms: now_ms(),
+            };
+            inner.states.lock().unwrap().insert(j.chain.clone(), entry);
+            *inner.bytes.lock().unwrap() += n;
+            dirty.insert(j.chain[..2].to_string());
+        }
+        // Recurrent states are the case this was written for: the same chain genuinely can
+        // carry two different bodies (a sequential cold pass and a concurrent revive put
+        // different bytes behind the same token prefix), so a second writer here is normal -
+        // and the first writer's file is the one the index must describe.
+        Linked::Already => {
+            inner.stats.index_conflicts.fetch_add(1, Ordering::Relaxed);
+            let mut s = inner.states.lock().unwrap();
+            if let Some(e) = s.get_mut(&j.chain) {
+                e.last_used_ms = now_ms();
+            } else if let Some(e) = adopt_state(inner, &j, &to) {
+                let got = e.bytes;
+                s.insert(j.chain.clone(), e);
+                *inner.bytes.lock().unwrap() += got;
+                dirty.insert(j.chain[..2].to_string());
+            }
+        }
     }
-    let n = j.bytes.len() as u64;
-    let entry = StateEntry {
+}
+
+/// Index a blob this boot did not write: its key is the hash of its own bytes, so reading
+/// them is the only honest way to name them. `None` when the file cannot be read at all,
+/// which leaves the chain unindexed (hydrate then treats it as gone instead of serving it).
+fn adopt_block(inner: &Inner, j: &BlockJob, path: &Path) -> Option<BlockEntry> {
+    let raw = fs::read(path).ok()?;
+    Some(BlockEntry {
         chain: j.chain.clone(),
-        key,
-        tokens: j.tokens,
-        bytes: n,
+        key: sha256_hex(&raw),
+        prev: j.prev.clone(),
+        tokens: j.tokens.clone(),
+        bytes: raw.len() as u64,
         sig: inner.sig.clone(),
         last_used_ms: now_ms(),
-    };
-    inner.states.lock().unwrap().insert(j.chain.clone(), entry);
-    *inner.bytes.lock().unwrap() += n;
-    dirty.insert(j.chain[..2].to_string());
+    })
+}
+
+fn adopt_state(inner: &Inner, j: &StateJob, path: &Path) -> Option<StateEntry> {
+    let raw = fs::read(path).ok()?;
+    Some(StateEntry {
+        chain: j.chain.clone(),
+        key: sha256_hex(&raw),
+        tokens: j.tokens,
+        bytes: raw.len() as u64,
+        sig: inner.sig.clone(),
+        last_used_ms: now_ms(),
+    })
 }
 
 /// The cap is the hard wall (oMLX #5497): drop least-recently-used entries, blocks first,
@@ -1359,6 +1551,9 @@ impl HydrateTask {
                 None if tier.state(&chain).is_none() => return fail(&self, HydrateFault::Gone),
                 None => {
                     tracing::warn!("conv tier: revive aborted, state sidecar verification failed for {chain}");
+                    // Named but wrong: retire it, or this chain costs a full sidecar read on
+                    // every future revive and never gets a body that verifies.
+                    tier.repair_state(&chain);
                     return fail(&self, HydrateFault::State);
                 }
             }
@@ -1375,10 +1570,15 @@ impl HydrateTask {
             }
             let got = read_verified_window(&self.dir, &items, self.threads);
             let mut blobs = Vec::with_capacity(end - at);
-            for g in got {
+            for (i, g) in got.into_iter().enumerate() {
                 match g {
                     Some(b) => blobs.push(b),
-                    None => return fail(&self, HydrateFault::Blob),
+                    None => {
+                        // Same contract as the state side: a blob that is not its own key is
+                        // retired, not left to fail every future revive.
+                        tier.repair_block(items[i].0);
+                        return fail(&self, HydrateFault::Blob);
+                    }
                 }
             }
             let mut i = self.inner.lock().unwrap();
@@ -1614,6 +1814,67 @@ mod tests {
         assert_eq!(c[0], chain_of(&t[..64]));
         assert_eq!(c[2], chain_of(&t[..192]));
         assert_ne!(c[0], c[1]);
+    }
+
+    /// The invariant the production tier was violating: a blob is write-once, so the entry
+    /// must always attest the bytes that are actually on disk. A second body under one chain
+    /// used to rename the shard with *its* key over a file it never wrote, and every later
+    /// revive of that chain then died in verification - permanently, and silently for the
+    /// 10 of 35 states already poisoned this way.
+    #[test]
+    fn a_late_writer_keeps_the_index_on_disk() {
+        let dir = std::env::temp_dir().join(format!("ct-test-{}", uuid::Uuid::new_v4()));
+        let cfg = ConvDiskCfg {
+            dir: dir.clone(),
+            gib: 1.0,
+            ttl_min: 0,
+            restore: true,
+            verify_threads: 1,
+            state_stride: 8,
+            pending_gib: 64.0,
+        };
+        let sig = Signature {
+            model: "test".into(),
+            pack: "p".into(),
+            digest: "d".into(),
+            quant: "q".into(),
+            block_bytes: 64,
+            block_tokens: 64,
+        };
+        let tier = ConvTier::start(cfg, HashMap::new(), sig).expect("free directory");
+        let chain = chain_of(&[7u32; 64]);
+        let on_disk = state_path(&dir, &chain);
+        let first = vec![1u8; 4096];
+        dump_state(
+            &tier.inner,
+            StateJob { bytes: first.clone(), tokens: 64, chain: chain.clone() },
+            &mut HashSet::new(),
+        );
+        let key_first = sha256_hex(&first);
+        assert_eq!(tier.inner.states.lock().unwrap()[&chain].key, key_first);
+
+        dump_state(
+            &tier.inner,
+            StateJob { bytes: vec![2u8; 4096], tokens: 64, chain: chain.clone() },
+            &mut HashSet::new(),
+        );
+        let e = tier.inner.states.lock().unwrap()[&chain].clone();
+        assert_eq!(e.bytes as usize, first.len(), "the loser's size may not be indexed");
+        assert_eq!(e.key, key_first, "the index must keep describing the bytes on disk");
+        assert_eq!(sha256_hex(&fs::read(&on_disk).unwrap()), e.key, "and match them");
+        assert_eq!(tier.inner.stats.index_conflicts.load(Ordering::Relaxed), 1);
+
+        // The read path's half: an entry that stopped matching its blob is retired, file and
+        // all, so the chain is free to be re-dumped instead of failing every future revive.
+        fs::write(&on_disk, vec![3u8; 4096]).unwrap();
+        tier.inner.states.lock().unwrap().get_mut(&chain).unwrap().key = "stale".into();
+        tier.repair_state(&chain);
+        assert!(tier.inner.states.lock().unwrap().get(&chain).is_none());
+        assert!(!tier.inner.state_chains.lock().unwrap().contains(&chain));
+        assert!(!on_disk.exists(), "the blob that cannot be attested goes with the entry");
+        assert_eq!(tier.inner.stats.states_repaired.load(Ordering::Relaxed), 1);
+        assert!(tier.inner.extra_dirty.lock().unwrap().contains(&chain[..2].to_string()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -6276,17 +6276,23 @@ impl LmEngine {
                     block_tokens: KV_BLOCK as u32,
                 };
                 let (blocks, st) = conv_tier::scan(&disk, Some(&sig));
-                tracing::info!(
-                    "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign, {} v3 migrated), restore {}",
-                    st.blocks,
-                    st.states,
-                    st.bytes as f64 / (1u64 << 30) as f64,
-                    st.missing,
-                    st.foreign,
-                    st.migrated,
-                    if disk.restore { "on" } else { "off" },
-                );
-                Some(conv_tier::ConvTier::start(disk, blocks, sig))
+                let restore = disk.restore;
+                let tier = conv_tier::ConvTier::start(disk, blocks, sig);
+                // Said only once the directory is ours: `take_writer` warns and runs the boot
+                // without the cold tier when a second engine is still writing it.
+                if tier.is_some() {
+                    tracing::info!(
+                        "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign, {} v3 migrated), restore {}",
+                        st.blocks,
+                        st.states,
+                        st.bytes as f64 / (1u64 << 30) as f64,
+                        st.missing,
+                        st.foreign,
+                        st.migrated,
+                        if restore { "on" } else { "off" },
+                    );
+                }
+                tier
             }
         };
         let conv_handle = conv.clone();
