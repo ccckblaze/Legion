@@ -1824,6 +1824,19 @@ fn cuda_rms_keeps_the_bits() {
     rms_keeps_the_bits(&mut gpu_backend());
 }
 
+/// #1221 r10: `LEGION_DEBUG_INK_Q8_DEEP`'s values.
+#[test]
+fn q8_deep_layouts() {
+    let d = |rows, loads| Some(glm_ops::DeepQ8 { rows, loads });
+    assert_eq!(q8_deep_of(None), d(1, 4));
+    assert_eq!(q8_deep_of(Some("x")), d(1, 4));
+    assert_eq!(q8_deep_of(Some(" 0 ")), None);
+    assert_eq!(q8_deep_of(Some("r1u2")), d(1, 2));
+    assert_eq!(q8_deep_of(Some("r1u4")), d(1, 4));
+    assert_eq!(q8_deep_of(Some("r2u2")), d(2, 2));
+    assert_eq!(q8_deep_of(Some("r2u4")), d(2, 4));
+}
+
 /// #1221 r6: `ink_conv` with the residual gives `glm_add(res, ink_conv(..))`'s bits and leaves
 /// the same history, at decode steps (one token, 1-4 sequences) and prompt steps, with and
 /// without dynamic taps.
@@ -2181,14 +2194,18 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
             .collect()
     };
     let mut bad = Vec::new();
-    let shapes: [(i64, &[i64]); 3] = [
+    let mut shapes: Vec<(i64, &[i64])> = vec![
         (2304, &[3072, 384, 3072]),
         (2304, &[1024, 1024]),
         (64, &[8, 36, 4]),
     ];
+    if ty == types::Q8_0 {
+        // Odd row counts and short rows for the deeper-load kernel's last rows and blocks (r10).
+        shapes.extend([(96, &[7, 1, 9][..]), (1536, &[33, 2304][..])]);
+    }
     for (k, ms) in shapes {
         for &n in toks {
-            let ctx = Context::new(32, 32);
+            let ctx = Context::new(256, 256);
             let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
             let ws: Vec<_> = ms
                 .iter()
@@ -2199,12 +2216,25 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 .map(|&w| glm_ops::linear_h(&ctx, w, x, None, 1.0, None).as_output())
                 .collect();
             let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
-            let new: Vec<_> = glm_ops::linear_set(&ctx, &set)
-                .into_iter()
-                .map(|t| ctx.cont(t).as_output())
-                .collect();
-            let mut graph = ctx.new_graph(16);
-            for t in old.iter().chain(&new) {
+            let outs =
+                |v: Vec<_>| -> Vec<_> { v.into_iter().map(|t| ctx.cont(t).as_output()).collect() };
+            // The set; Q8_0 also on each deeper-load layout (#1221 r10), all of it and a
+            // product alone.
+            let mut news = vec![("set".to_string(), outs(glm_ops::linear_set(&ctx, &set)))];
+            if ty == types::Q8_0 {
+                for (rows, loads) in [(1, 2), (1, 4), (2, 2), (2, 4)] {
+                    let d = glm_ops::DeepQ8 { rows, loads };
+                    let all = outs(glm_ops::linear_set_deep(&ctx, &set, d));
+                    news.push((format!("deep r{rows}u{loads}"), all));
+                    let one = set
+                        .iter()
+                        .flat_map(|s| glm_ops::linear_set_deep(&ctx, std::slice::from_ref(s), d))
+                        .collect();
+                    news.push((format!("deep r{rows}u{loads}, one product"), outs(one)));
+                }
+            }
+            let mut graph = ctx.new_graph(256);
+            for t in old.iter().chain(news.iter().flat_map(|n| &n.1)) {
                 graph.expand(*t);
             }
             ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
@@ -2223,13 +2253,15 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 }
             }
             b.compute(&graph).unwrap();
-            for (j, &m) in ms.iter().enumerate() {
-                let (p, q) = (old[j].to_f32(), new[j].to_f32());
-                assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
-                let what = format!("glm_linear_set part {j}, {m} x {k}, {n} tokens");
-                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
-                    eprintln!("first mismatch: {line}");
-                    bad.push(line);
+            for (label, new) in &news {
+                for (j, &m) in ms.iter().enumerate() {
+                    let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                    assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
+                    let what = format!("glm_linear_set ({label}) part {j}, {m} x {k}, {n} tokens");
+                    if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
                 }
             }
         }
@@ -2244,7 +2276,8 @@ fn linear_set_keeps_the_cpu_bits() {
     linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
-/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
+/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` and `linear_set_q8d` (each
+/// deeper-load layout, a set and one product alone; #1221 r10) against `linear_mv_q8`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
