@@ -1893,6 +1893,8 @@ struct Job {
     /// extension lands or aborts. A job that dies parked keeps its uploaded blocks until
     /// the step-head sweep returns them.
     hydrate: Option<Arc<conv_tier::HydrateTask>>,
+    /// This job already spent its one retry on a [`Placement::Retry`] collision.
+    place_retry: bool,
 }
 
 /// One place in the waiting queue; frees itself when dropped.
@@ -6693,6 +6695,7 @@ impl LmEngine {
                 queued_at: Instant::now(),
                 _queued: queued,
                 hydrate: None,
+                place_retry: false,
             })
             .map_err(|_| {
                 Refused::Failed(EngineError::Internal("the model worker stopped".into()))
@@ -6999,6 +7002,8 @@ struct Seq<'t> {
     /// A resumed preemption's live cold-tier hydration ([`Job::hydrate`], D1): a preempted
     /// sequence re-places through [`Worker::resume`], which may still owe uploads.
     hydrate: Option<Arc<conv_tier::HydrateTask>>,
+    /// This sequence already spent its one re-place retry on a [`Placement::Retry`] collision.
+    place_retry: bool,
     started: Instant,
     /// The engine's model bytes when the sequence was admitted (#391): the request-done line
     /// reports the steps since.
@@ -7071,6 +7076,10 @@ enum Placement {
     Placed(Placed),
     /// Not enough free KV blocks yet.
     Wait,
+    /// The placement unwound cleanly but a device copy lost the race (a concurrent
+    /// preemption squeezing `copy_states`): the caller may re-queue the job and try again,
+    /// once. A 400 for a transient collision is not an answer for the client.
+    Retry(String),
     Failed(String),
 }
 
@@ -7505,6 +7514,20 @@ impl Worker {
                 job.hydrate = hydrate;
                 return Admission::Wait(job);
             }
+            Placement::Retry(e) => {
+                if job.place_retry {
+                    if hydrate.is_some() {
+                        self.hydrate_abort(&mut hydrate, false);
+                    }
+                    return Admission::Failed(job, e);
+                }
+                // A transient collision with a concurrent preemption: park the job and let
+                // the next step place it again, rather than answering the client with a 400.
+                job.place_retry = true;
+                job.hydrate = hydrate;
+                tracing::warn!("admission: {e}; retrying once");
+                return Admission::Wait(job);
+            }
             Placement::Failed(e) => {
                 if hydrate.is_some() {
                     self.hydrate_abort(&mut hydrate, false);
@@ -7555,6 +7578,7 @@ impl Worker {
                 .then(|| crate::spec::mtp_ngram::MtpNgram::new(self.spec_config.mtp_ngram)),
             draft_ngram: None,
             hydrate: None,
+            place_retry: false,
             ticket,
             need,
             resuming: false,
@@ -7893,7 +7917,7 @@ impl Worker {
             table.release(&mut self.pool);
             self.free_ring_and_slot(ring, kv_slot);
             self.reserved -= fresh;
-            return Placement::Failed(e.to_string());
+            return Placement::Retry(e.to_string());
         }
         if self.state_digests && from.is_some() {
             self.log_state_digest(Pool::Seq, slot, resumed, "resumed from");

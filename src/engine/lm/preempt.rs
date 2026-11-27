@@ -289,6 +289,23 @@ impl Worker {
                 seq.hydrate = hydrate;
                 return Resume::Wait(seq);
             }
+            Placement::Retry(e) => {
+                if seq.place_retry {
+                    if hydrate.is_some() {
+                        self.hydrate_abort(&mut hydrate, false);
+                    }
+                    // Where its text is: on the stream thread the error must follow the text
+                    // queued before the preemption.
+                    seq.active.fail(&mut self.outbox, e);
+                    return Resume::Failed;
+                }
+                // The copy lost the race with another preemption: re-queue it whole and let the
+                // next step place it again, instead of failing a live conversation.
+                seq.place_retry = true;
+                seq.hydrate = hydrate;
+                tracing::warn!("resume: {e}; retrying once");
+                return Resume::Wait(seq);
+            }
             Placement::Failed(e) => {
                 if hydrate.is_some() {
                     self.hydrate_abort(&mut hydrate, false);
