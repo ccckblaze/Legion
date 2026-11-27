@@ -10,6 +10,7 @@
 
 use legion::ggml::{ComputeAllocator, Context, DeviceKind, device_by_kind, types};
 use legion::model::core::expert_mv;
+use legion::residency::cpu_share::ops::{MAX_PAIRS, ShareLayer};
 use legion::residency::cpu_share::{
     CpuShareConfig, DevicePlan, HostExperts, format_of, ops, pool, select, setup, threshold,
 };
@@ -24,7 +25,9 @@ fn host_share_matches_the_gpu() {
         (types::Q4_K, n_embd, n_ff),
         (types::Q5_1, n_ff, n_embd),
     ];
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let mut backend = dev.init().unwrap();
     expert_mv::set_enabled(true);
     let node = caps(0).map_or(0, |c| c.host_numa_id.max(0) as u32);
@@ -77,8 +80,10 @@ fn host_share_matches_the_gpu() {
     };
     let mut layers = vec![None; layer + 1];
     layers[layer] = Some(he);
+    // The fixed share (not the exact one): every expert of the layer in host memory.
     let cfg = CpuShareConfig {
         share: 0.5,
+        auto: false,
         workers: 4,
         smt: 2,
     };
@@ -89,10 +94,22 @@ fn host_share_matches_the_gpu() {
             node,
             layers,
             n_embd: n_embd as usize,
+            exact: false,
+            tiered: false,
         }],
     )
     .unwrap();
     let thr = threshold(cfg.share);
+    let share = ShareLayer {
+        n_slots,
+        n_expert: n_expert as usize,
+        layer,
+        threshold: thr,
+    };
+    // The published ids' places in VRAM, outside the step graph: one per run below.
+    let ids_ctx = Context::new(1, 0);
+    let ids_at = ids_ctx.new_tensor(types::I32, &[2 * MAX_PAIRS as i64]);
+    ids_ctx.alloc_tensors(dev.buffer_type()).unwrap();
     let table: Vec<i32> = (0..n_expert as usize)
         .map(|e| match cached.iter().position(|&c| c == e) {
             Some(s) => s as i32,
@@ -109,9 +126,10 @@ fn host_share_matches_the_gpu() {
         let plain = expert_mv::mul_mat_id_tiered(&ctx, w[2], act, ids, n_slots).as_output();
         // With the host's share, run twice in a row (two layers' worth of sequence numbers).
         let mut shared_outs = Vec::new();
-        for _ in 0..2 {
+        for r in 0..2 {
             let ws = [w[1], w[0], w[2]];
-            let out = ops::glu_down(&ctx, ws, x, ids, n_slots, n_expert as usize, layer, thr)
+            let at = (ids_at, r * MAX_PAIRS * 4);
+            let out = ops::glu_down(&ctx, ws, (x, ids, None), at, share)
                 .expect("the share takes the step");
             shared_outs.push(out.as_output());
         }

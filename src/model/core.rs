@@ -41,7 +41,7 @@ pub use gdn::set_gdn_decode;
 pub use gdn::set_gdn_pad_skip;
 pub use gdn::set_gdn_replay_few;
 pub use gdn::set_gdn_replay_staged;
-pub use gdn_mma::{set_gdn_mma, set_gdn_staged};
+pub use gdn_mma::{set_gdn_ahead, set_gdn_mma, set_gdn_staged};
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};
@@ -64,6 +64,7 @@ pub mod kv_type;
 pub mod l2_prefetch;
 mod linear;
 pub mod media;
+pub mod mma_peak;
 pub mod mmq_ids;
 pub use mmq_ids::set_mmq_ids;
 pub(crate) mod mmq_preq;
@@ -108,6 +109,8 @@ pub use router_mv::set_router_mv;
 pub(crate) mod mmvq_glu;
 pub use mmvq_glu::set_mmvq_glu;
 pub(crate) mod state;
+#[cfg(test)]
+mod step_ops;
 pub mod tp;
 pub(crate) mod tp_ep;
 pub mod traffic;
@@ -3449,8 +3452,21 @@ impl Model {
                         ctx.get_rows(self.w("token_embd.weight")?, inputs.tokens),
                     ),
                 };
-                // Image tokens take their vision rows instead ([`Media`]).
+                // Image tokens take their vision rows instead ([`Media`]); an embedding that
+                // is already a token's residual streams (`[e, hc, n]`, GLM-5.3-Flash) takes
+                // them in every stream, as its tokens' rows are.
                 match inputs.img {
+                    Some((rows, idx)) if x.ne()[1] * x.ne()[2] != n => {
+                        let [e, hc, nt, _] = x.ne();
+                        let k = rows.ne()[1];
+                        let r = ctx.repeat_4d(ctx.reshape_3d(rows, e, 1, k), [e, hc, k, 1]);
+                        let x = ctx.set_rows(
+                            ctx.reshape_2d(x, e * hc, nt),
+                            ctx.reshape_2d(r, e * hc, k),
+                            idx,
+                        );
+                        ctx.reshape_3d(x, e, hc, nt)
+                    }
                     Some((rows, idx)) => ctx.set_rows(x, rows, idx),
                     None => x,
                 }
@@ -5277,6 +5293,10 @@ impl Model {
                 .flatten()
             {
                 Some((gate, up)) => {
+                    // `--dense-fp8-prompt` (#1183): the W8A8 GEMM's F32 gate and up rows go
+                    // out 16 bytes a thread through shared memory (the same bits; plain stores,
+                    // as the SwiGLU's codes read them next). A BF16 GEMM is not marked.
+                    crate::model::fp8::mark_wide_store(gate);
                     let sh = ctx.swiglu_split(gate, up);
                     // `--dense-fp8-prompt` (#1183): the down projection's per-token FP8 codes
                     // from one op reading gate and up in place (the SwiGLU then not computed).

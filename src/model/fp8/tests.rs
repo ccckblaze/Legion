@@ -129,3 +129,613 @@ fn mm_node_finds_the_matmul_under_a_scale() {
     let params = crate::ggml::external_params(unsafe { &*mm.raw() });
     assert_eq!(params[P_SIDE], 0);
 }
+
+/// The default epilogue variant per row length (#1183): k up to 1,024 the staggered first wave
+/// alone, above 1,024 the TMA stores and the staggered first wave; the conv epilogue's TMA
+/// stores whenever the TMA stores are on; the switches and the TP send buffer.
+#[test]
+fn default_gemm_variant_per_k() {
+    let all = (true, true, true, false);
+    for (k, want) in [
+        (640, 0x2000 | 0x1000),
+        (1024, 0x2000 | 0x1000),
+        (1152, 0x2800 | 0x1000),
+        (2560, 0x2800 | 0x1000),
+        (4096, 0x2800 | 0x1000),
+        (6144, 0x2800 | 0x1000),
+        (17408, 0x2800 | 0x1000),
+    ] {
+        assert_eq!(default_gemm_variant(k, 0, all), want, "k {k}");
+        // The streaming route's off bit on top.
+        assert_eq!(default_gemm_variant(k, 0x100, all), want | 0x100, "k {k}");
+    }
+    // --no-fp8-tma-store: no TMA store anywhere, the stagger stays.
+    let no_tma = (false, true, true, false);
+    assert_eq!(default_gemm_variant(640, 0, no_tma), 0x2000);
+    assert_eq!(default_gemm_variant(2560, 0, no_tma), 0x2000);
+    assert_eq!(default_gemm_variant(6144, 0, no_tma), 0x2000);
+    // --no-fp8-conv-tma-store.
+    let no_conv = (true, false, true, false);
+    assert_eq!(default_gemm_variant(640, 0, no_conv), 0x2000);
+    assert_eq!(default_gemm_variant(2560, 0, no_conv), 0x2800);
+    assert_eq!(default_gemm_variant(6144, 0, no_conv), 0x2800);
+    // --no-fp8-wide-stagger, and the TP send buffer (staged): no stagger.
+    for flags in [(true, true, false, false), (true, true, true, true)] {
+        assert_eq!(default_gemm_variant(640, 0, flags), 0x1000, "{flags:?}");
+        assert_eq!(default_gemm_variant(2560, 0, flags), 0x1800, "{flags:?}");
+        assert_eq!(default_gemm_variant(6144, 0, flags), 0x1800, "{flags:?}");
+    }
+    // All off: the old pick.
+    let off = (false, true, false, false);
+    assert_eq!(default_gemm_variant(6144, 0, off), 0);
+}
+
+/// Random E4M3 codes: any sign and mantissa, exponents 3 to 10 (no NaN).
+#[cfg(feature = "cuda")]
+fn e4m3_noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        for b in s.to_le_bytes() {
+            out.push(b & 0x87 | (3 + (b >> 3) % 8) << 3);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// Values in [-1, 1).
+#[cfg(feature = "cuda")]
+fn unit_noise(len: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1;
+    (0..len)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+        })
+        .collect()
+}
+
+/// The GPU of the CUDA tests.
+#[cfg(feature = "cuda")]
+fn test_gpu() -> crate::ggml::Backend {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap()
+}
+
+/// A W8A8 prompt GEMM graph (`--fp8-act a8-dynamic`, a weight scale per row) of `layers`
+/// distinct `[k, m]` weights over one `[k, n]` input (one quantization), with a residual added
+/// in the epilogue where `res`, allocated on `gpu` and filled; `then` gets the graph and the
+/// outputs.
+#[cfg(feature = "cuda")]
+fn gemm8_case(
+    gpu: &mut crate::ggml::Backend,
+    (k, m, n, res): (i64, i64, i64, bool),
+    layers: usize,
+    then: &mut dyn FnMut(&mut crate::ggml::Backend, &crate::ggml::Graph<'_>, &[Tensor<'_>]),
+) {
+    use crate::ggml::ComputeAllocator;
+    let wctx = Context::new(4 * layers, 0);
+    let weights: Vec<_> = (0..layers)
+        .map(|_| {
+            (
+                wctx.new_tensor(types::I8, &[k, m]),
+                wctx.new_tensor(types::F32, &[m]),
+            )
+        })
+        .collect();
+    wctx.alloc_tensors(gpu.buffer_type()).unwrap();
+    for (l, (w, sc)) in weights.iter().enumerate() {
+        w.set_bytes(&e4m3_noise((k * m) as usize, 5 + l as u64 + 7 * k as u64));
+        let scales: Vec<f32> = unit_noise(m as usize, 0x55 + l as u64)
+            .iter()
+            .map(|v| 0.002 + 0.001 * v.abs())
+            .collect();
+        sc.set_f32(&scales);
+    }
+    let ctx = Context::new(16 + 4 * layers, 16);
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input().as_output();
+    let r = res.then(|| ctx.new_tensor(types::F32, &[m, n]).as_input().as_output());
+    let mut graph = ctx.new_graph(16 + 4 * layers);
+    let outs: Vec<Tensor<'_>> = weights
+        .iter()
+        .map(|&(w, sc)| {
+            let y = match r {
+                Some(r) => mul_mat_dynamic_add(&ctx, w, x, Some(sc), r),
+                None => mul_mat_dynamic(&ctx, w, x, Some(sc)),
+            }
+            .as_output();
+            graph.expand(y);
+            y
+        })
+        .collect();
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    x.set_f32(&unit_noise((k * n) as usize, 0x1234 + n as u64));
+    if let Some(r) = r {
+        r.set_f32(&unit_noise((m * n) as usize, 0x4321 + n as u64));
+    }
+    then(gpu, &graph, &outs);
+}
+
+/// The W8A8 prompt GEMM's TMA store epilogue (#1183, variant bit 0x800) and the default pick per
+/// row length ([`default_gemm_variant`]) at
+/// Qwen3.8-Flash-Next's dense shapes (GDN z and out, attention q+gate+k+v and out, the shared
+/// expert's gate+up and down; GDN qkv's GEMM alone) at 12,288 and 8,067 tokens and ragged token
+/// counts (partial token tiles, and the 128-row tile where the wide one makes too few waves),
+/// against the plain epilogue's bits (variant 1): also the pick without the TMA stores (0), the
+/// staged epilogue (0x200, which takes precedence), the staggered first wave (0x2000) and both
+/// (0x2800), and a residual shape (no TMA store there).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU with E4M3 tensor cores"]
+fn cuda_gemm8_tma_store_is_the_plain_bits() {
+    let mut gpu = test_gpu();
+    if !fp8_mma() {
+        eprintln!("no E4M3 tensor cores: skipped");
+        return;
+    }
+    let _lock = VARIANT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // (k, m, n, residual)
+    let shapes: [(i64, i64, i64, bool); 15] = [
+        (2560, 6144, 12288, false),
+        (6144, 2560, 12288, false),
+        (2560, 13312, 12288, false),
+        (2560, 1280, 12288, false),
+        (640, 2560, 12288, false),
+        (2560, 10240, 12288, false),
+        (2560, 6144, 8067, false),
+        (6144, 2560, 8067, false),
+        (2560, 13312, 8067, false),
+        (640, 2560, 8067, false),
+        (2560, 6144, 12289, false),
+        (2560, 10240, 1153, false),
+        (2560, 6144, 1153, false),
+        (640, 2560, 4993, false),
+        (6144, 2560, 8067, true),
+    ];
+    for shape in shapes {
+        gemm8_case(&mut gpu, shape, 1, &mut |gpu, graph, outs| {
+            let y = outs[0];
+            force_gemm_variant(1);
+            let ran = gpu.compute(graph);
+            unforce_gemm_variant();
+            ran.unwrap();
+            let want = y.bytes();
+            for v in [
+                None,
+                Some(0),
+                Some(0x800),
+                Some(0x200),
+                Some(0x2000),
+                Some(0x2800),
+            ] {
+                match v {
+                    Some(v) => force_gemm_variant(v),
+                    None => unforce_gemm_variant(),
+                }
+                let ran = gpu.compute(graph);
+                unforce_gemm_variant();
+                ran.unwrap();
+                let got = y.bytes();
+                let bad = got
+                    .chunks_exact(4)
+                    .zip(want.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(bad, 0, "{shape:?}: variant {v:x?}");
+            }
+        });
+    }
+}
+
+/// `cargo test --release --features cuda -- --ignored --nocapture cuda_gemm8_tma_store_microbench`
+/// (#1183): the W8A8 prompt GEMMs of Qwen3.8-Flash-Next at 12,288 and 8,067 tokens, two
+/// distinct weights a graph (past the L2), the fragments' stores (variant 0) against the TMA
+/// stores (0x800), the staged epilogue (0x200), the staggered first wave (0x2000) and both
+/// (0x2800): 5 rounds taking turns (forward and reverse order alternately), the medians per
+/// GEMM (with half of one quantization of
+/// the input, the same for all).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "microbenchmark, needs a GPU with E4M3 tensor cores"]
+fn cuda_gemm8_tma_store_microbench() {
+    let mut gpu = test_gpu();
+    if !fp8_mma() {
+        eprintln!("no E4M3 tensor cores: skipped");
+        return;
+    }
+    let _lock = VARIANT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const VARIANTS: [i32; 5] = [0, 0x800, 0x200, 0x2000, 0x2800];
+    const ROUNDS: usize = 5;
+    const REPS: usize = 3;
+    const LAYERS: usize = 2;
+    eprintln!("{ROUNDS} rounds of {REPS} runs, the variant order alternates forward/reverse");
+    for n in [12288i64, 8067] {
+        for (k, m) in [
+            (2560, 6144),
+            (6144, 2560),
+            (2560, 13312),
+            (2560, 1280),
+            (640, 2560),
+        ] {
+            gemm8_case(&mut gpu, (k, m, n, false), LAYERS, &mut |gpu, graph, _| {
+                let mut ms: Vec<Vec<f64>> = vec![Vec::new(); VARIANTS.len()];
+                // A warm-up run each.
+                for v in VARIANTS {
+                    force_gemm_variant(v);
+                    gpu.compute(graph).unwrap();
+                    unforce_gemm_variant();
+                }
+                // Odd rounds run the variants in reverse, so no variant always goes first.
+                for round in 0..ROUNDS {
+                    let last = VARIANTS.len() - 1;
+                    for j in 0..=last {
+                        let i = if round % 2 == 0 { j } else { last - j };
+                        let v = VARIANTS[i];
+                        force_gemm_variant(v);
+                        for _ in 0..REPS {
+                            let t = std::time::Instant::now();
+                            gpu.compute(graph).unwrap();
+                            ms[i].push(t.elapsed().as_secs_f64() * 1e3 / LAYERS as f64);
+                        }
+                        unforce_gemm_variant();
+                    }
+                }
+                let med: Vec<f64> = ms
+                    .iter_mut()
+                    .map(|xs| {
+                        xs.sort_by(f64::total_cmp);
+                        xs[xs.len() / 2]
+                    })
+                    .collect();
+                let tf = |t: f64| 2.0 * (k * m * n) as f64 / (t * 1e-3) / 1e12;
+                let row: Vec<String> = VARIANTS
+                    .iter()
+                    .zip(&med)
+                    .map(|(v, t)| format!("{v:#x} {t:.3} ms {:.0} TF {:.3}x", tf(*t), med[0] / t))
+                    .collect();
+                eprintln!("k {k} m {m} n {n}: {}", row.join(" | "));
+            });
+        }
+    }
+}
+
+/// The process-wide [`set_glu_wide_store`] switch: held by the tests that set it.
+static WIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`mark_wide_store`] marks a dynamic W8A8 node without a residual, through a view of its rows
+/// (a member of a joined run) or the node itself, and [`node_variant`] then gives
+/// [`VARIANT_WIDE`] while [`set_glu_wide_store`] is on; a node with a residual, the W8A16
+/// matmul and a ggml matmul stay unmarked (#1183).
+#[test]
+fn wide_store_marks_plain_w8a8_nodes_only() {
+    let _lock = WIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = Context::new(32, 0);
+    let (k, m, n) = (128, 256, 100);
+    let w = ctx.new_tensor(types::I8, &[k, m]);
+    let x = ctx.new_tensor(types::F32, &[k, n]);
+    let params = |t: Tensor<'_>| {
+        // SAFETY: a node of the live context.
+        crate::ggml::external_params(unsafe { &*t.raw() })
+    };
+    // A joined gate / up: the gate's rows a view of the node.
+    let mm = mul_mat_dynamic(&ctx, w, x, None);
+    assert_eq!(params(mm)[P_WIDE_STORE], 0, "a new node is unmarked");
+    assert_eq!(node_variant(&params(mm)), 0);
+    let gate = ctx.view_2d(mm, [m / 2, n], mm.nb()[1], 0);
+    assert!(mark_wide_store(gate));
+    assert_eq!(params(mm)[P_WIDE_STORE], 1);
+    // The other parameters stay: dynamic, no residual, run by its node.
+    assert_eq!(params(mm)[..3], [1, 0, 0]);
+    set_glu_wide_store(true);
+    assert_eq!(node_variant(&params(mm)), VARIANT_WIDE);
+    set_glu_wide_store(false);
+    assert_eq!(node_variant(&params(mm)), 0);
+    set_glu_wide_store(true);
+    // The node itself.
+    let mm2 = mul_mat_dynamic(&ctx, w, x, None);
+    assert!(mark_wide_store(mm2));
+    assert_eq!(node_variant(&params(mm2)), VARIANT_WIDE);
+    // A residual in the epilogue: not taken.
+    let res = ctx.new_tensor(types::F32, &[m, n]);
+    let with_res = mul_mat_dynamic_add(&ctx, w, x, None, res);
+    assert!(!mark_wide_store(with_res));
+    assert_eq!(params(with_res)[P_WIDE_STORE], 0);
+    assert_eq!(node_variant(&params(with_res)), 0);
+    // W8A16 and a ggml matmul (BF16 weights): not W8A8 nodes.
+    let a16 = mul_mat(&ctx, w, x, None);
+    assert!(!mark_wide_store(a16));
+    assert_eq!(params(a16)[P_WIDE_STORE], 0);
+    let wf = ctx.new_tensor(types::BF16, &[k, m]);
+    assert!(!mark_wide_store(ctx.mul_mat(wf, x)));
+}
+
+/// A xorshift generator for the GPU tests' operands.
+#[cfg(feature = "cuda")]
+struct Rng(u64);
+
+#[cfg(feature = "cuda")]
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A value in [-1, 1).
+    fn unit(&mut self) -> f32 {
+        ((self.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+    }
+
+    /// `len` E4M3 codes of any sign and mantissa, exponents 3 to 10 (no NaN).
+    fn e4m3(&mut self, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            for b in self.next().to_le_bytes() {
+                out.push((b & 0x87) | ((3 + (b >> 3) % 8) << 3));
+            }
+        }
+        out.truncate(len);
+        out
+    }
+}
+
+/// A W8A8 shared-expert gate / up graph for the GPU tests: `layers` weights of `m` rows by `k`
+/// (one F32 scale per row, or one per tensor), each a dynamic W8A8 GEMM of the same `n` tokens,
+/// marked as [`Model::shexp`](crate::model::core::Model) marks its gate (through the view of its
+/// first half), followed by the SwiGLU's FP8 codes ([`crate::model::fp8_act::gate`]) where
+/// `codes`. The GEMM outputs are outputs, so every row is read back.
+#[cfg(feature = "cuda")]
+struct WideGraph<'a> {
+    graph: crate::ggml::Graph<'a>,
+    gemms: Vec<Tensor<'a>>,
+    codes: Vec<Tensor<'a>>,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn wide_graph<'a>(
+    gpu: &crate::ggml::Backend,
+    weights: &'a Context,
+    ctx: &'a Context,
+    (k, m, n): (usize, usize, usize),
+    layers: usize,
+    row_scales: bool,
+    codes: bool,
+    seed: u64,
+) -> WideGraph<'a> {
+    use crate::ggml::ComputeAllocator;
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let scale_len = if row_scales { m } else { 1 };
+    let ws: Vec<_> = (0..layers)
+        .map(|_| {
+            (
+                weights.new_tensor(types::I8, &[k as i64, m as i64]),
+                weights.new_tensor(types::F32, &[scale_len as i64]),
+            )
+        })
+        .collect();
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    for (w, s) in &ws {
+        w.set_bytes(&rng.e4m3(k * m));
+        let v: Vec<f32> = (0..scale_len)
+            .map(|_| 0.002 + 0.001 * rng.unit().abs())
+            .collect();
+        s.set_f32(&v);
+    }
+    // The input is an output too, so the allocator places no node over it once read.
+    let x = ctx
+        .new_tensor(types::F32, &[k as i64, n as i64])
+        .as_input()
+        .as_output();
+    let mut graph = ctx.new_graph(16 * layers + 16);
+    let mut gemms = Vec::new();
+    let mut outs = Vec::new();
+    for &(w, s) in &ws {
+        let mm = mul_mat_dynamic(ctx, w, x, Some(s));
+        let half = (m / 2) as i64;
+        let nb1 = mm.nb()[1];
+        let gate = ctx.view_2d(mm, [half, n as i64], nb1, 0);
+        let up = ctx.view_2d(mm, [half, n as i64], nb1, half as usize * 4);
+        assert!(mark_wide_store(gate));
+        let mm = mm.as_output();
+        graph.expand(mm);
+        gemms.push(mm);
+        if codes {
+            assert!(crate::model::fp8_act::gate_fits(gate, up));
+            let q = crate::model::fp8_act::gate(ctx, gate, up, true).as_output();
+            graph.expand(q);
+            outs.push(q);
+        }
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    let xs: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
+    x.set_f32(&xs);
+    WideGraph {
+        graph,
+        gemms,
+        codes: outs,
+    }
+}
+
+/// The shared expert gate / up GEMM's staged 16-byte stores (#1183, [`set_glu_wide_store`])
+/// keep every output bit against the fragments' own stores, at Qwen3.8-Flash-Next's shapes (k
+/// 2560, 640 gate + 640 up rows) at 8,067 tokens (too few waves for the 256-row tile: the
+/// 128-row tile) and 12,288 (on a GB10 the TMA-fed 256-row tile, which ignores the switch and
+/// keeps its own epilogue, the TMA stores at k 2560: a no-op there; elsewhere fp8_gemm8's
+/// 256-row tile), and at shapes that take the other tiles
+/// and tails: 200 tokens (128-row tile, one partial token tile), k 2496 (fp8_gemm8's 256-row
+/// tile of four 64-byte stages), 1,000 rows (a partial row tile, rows not a multiple of 64),
+/// with per-row and per-tensor weight scales. The outputs are filled with a pattern before each run, so a value
+/// the staged epilogue leaves out shows; the SwiGLU's codes read from them match too.
+/// `cargo test --release --features cuda --lib -- --ignored
+/// cuda_fp8_glu_wide_store_keeps_bits --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU with E4M3 tensor cores"]
+fn cuda_fp8_glu_wide_store_keeps_bits() {
+    let _lock = WIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _variants = VARIANT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = test_gpu();
+    assert!(fp8_mma(), "needs compute capability 8.9+");
+    let cases: [(&str, (usize, usize, usize), bool); 7] = [
+        ("flash-next shexp 12288", (2560, 1280, 12288), true),
+        ("flash-next shexp 8067", (2560, 1280, 8067), true),
+        ("shexp 12288, one scale", (2560, 1280, 12288), false),
+        ("flash-next shexp 200", (2560, 1280, 200), true),
+        ("k 2496 (64-byte stages) 12288", (2496, 1280, 12288), true),
+        ("1000 rows 12288", (2560, 1000, 12288), true),
+        ("1000 rows 333", (2560, 1000, 333), false),
+    ];
+    for (name, shape, row_scales) in cases {
+        let weights = Context::new(4, 0);
+        let ctx = Context::new(32, 32);
+        let codes = shape.1 % 2 == 0;
+        let g = wide_graph(&gpu, &weights, &ctx, shape, 1, row_scales, codes, 11);
+        let mut run = |wide: bool| -> (Vec<u8>, Vec<u8>) {
+            set_glu_wide_store(wide);
+            for t in g.gemms.iter().chain(&g.codes) {
+                t.set_bytes(&vec![0xa5; t.nbytes()]);
+            }
+            gpu.compute(&g.graph).unwrap();
+            let bytes =
+                |ts: &[Tensor<'_>]| -> Vec<u8> { ts.iter().flat_map(|t| t.bytes()).collect() };
+            (bytes(&g.gemms), bytes(&g.codes))
+        };
+        let want = run(false);
+        let got = run(true);
+        let again = run(false);
+        set_glu_wide_store(true);
+        assert!(want == again, "{name}: the fragments' stores twice differ");
+        let differ = got
+            .0
+            .chunks(4)
+            .zip(want.0.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differ,
+            0,
+            "{name}: {differ} of {} outputs differ",
+            want.0.len() / 4
+        );
+        assert!(got.1 == want.1, "{name}: the SwiGLU codes differ");
+        eprintln!("{name}: the same bits ({} outputs)", want.0.len() / 4);
+    }
+}
+
+/// The shared expert gate / up GEMM (Qwen3.8-Flash-Next: k 2560, 640 gate + 640 up rows, per-row
+/// weight scales) at 12,288- and 8,067-token prompt steps with the fragments' own 4-byte stores
+/// (old) and the staged 16-byte ones (wide), alone and followed by the SwiGLU's FP8 codes that
+/// read its rows (as in a `--dense-fp8-prompt` layer): microseconds a layer (median and best
+/// of 7 rounds; the variants take turns, forward in even rounds and reversed in odd ones, so
+/// neither always runs first), the speedup against old, and whether the bits are old's. Each
+/// graph quantizes the input once (timed alone and taken out) and runs 4 layers' weights. `*`
+/// marks the default.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_fp8_glu_wide_store_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU with E4M3 tensor cores; a benchmark"]
+fn cuda_fp8_glu_wide_store_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = WIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _variants = VARIANT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = test_gpu();
+    assert!(fp8_mma(), "needs compute capability 8.9+");
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 7;
+    let (k, m) = (2560usize, 1280usize);
+    let variants: [(&str, bool); 2] = [("old (fragments)", false), ("wide", true)];
+    let nv = variants.len();
+    for n in [12288usize, 8067] {
+        // The quantization alone, as the graphs run it.
+        let qctx = Context::new(4, 4);
+        let qx = qctx
+            .new_tensor(types::F32, &[k as i64, n as i64])
+            .as_input()
+            .as_output();
+        let mut qgraph = qctx.new_graph(4);
+        qgraph.expand(quantize_dynamic(&qctx, qx).as_output());
+        qctx.alloc_graph(&qgraph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        for chain in [false, true] {
+            let weights = Context::new(4 * LAYERS, 0);
+            let ctx = Context::new(16 * LAYERS + 16, 16 * LAYERS + 16);
+            let g = wide_graph(&gpu, &weights, &ctx, (k, m, n), LAYERS, true, chain, 3);
+            let outs: Vec<Tensor<'_>> = g.gemms.iter().chain(&g.codes).copied().collect();
+            // A warm-up run of each, its bits against old's.
+            let mut want = Vec::new();
+            let mut same = vec![true; nv];
+            for (vi, &(_, wide)) in variants.iter().enumerate() {
+                set_glu_wide_store(wide);
+                gpu.compute(&g.graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            gpu.compute(&qgraph).unwrap();
+            let mut quant = Vec::with_capacity(ROUNDS);
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                let t = std::time::Instant::now();
+                gpu.compute(&qgraph).unwrap();
+                quant.push(t.elapsed().as_secs_f64());
+                for i in 0..nv {
+                    let vi = if round % 2 == 0 { i } else { nv - 1 - i };
+                    set_glu_wide_store(variants[vi].1);
+                    let t = std::time::Instant::now();
+                    gpu.compute(&g.graph).unwrap();
+                    times[vi].push(t.elapsed().as_secs_f64());
+                }
+            }
+            set_glu_wide_store(true);
+            quant.sort_by(f64::total_cmp);
+            let q_med = quant[quant.len() / 2];
+            let per_layer = |t: f64| ((t - q_med) / LAYERS as f64).max(1e-9);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| per_layer(t[t.len() / 2])).collect();
+            let best: Vec<f64> = times.iter().map(|t| per_layer(t[0])).collect();
+            let out_bytes = (m * n * 4) as f64;
+            let flops = 2.0 * (k * m * n) as f64;
+            let op = ["gate/up", "gate/up + swiglu codes"][chain as usize];
+            eprintln!(
+                "{op} at {n} tokens (k {k}, m {m}: {:.0} MB F32 out a layer; quantize {:.1} us \
+                 a graph, taken out)",
+                out_bytes / 1e6,
+                q_med * 1e6
+            );
+            for (vi, &(name, wide)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {}{name:<16} median {:>8.1} us/layer ({:>5.3}x old), min {:>8.1} \
+                     ({:>5.3}x)  {:>6.1} TFLOPS  {}",
+                    [' ', '*'][wide as usize],
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    flops / median[vi] / 1e12,
+                    if same[vi] { "same bits" } else { "BITS DIFFER" }
+                );
+            }
+            assert!(same.iter().all(|&s| s), "{op} at {n}: bits differ");
+        }
+    }
+}

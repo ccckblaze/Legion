@@ -121,6 +121,69 @@ fn l1_offset(v: Option<&str>) -> i32 {
     }
 }
 
+/// `up_mix_bf16_reg`'s options (#1183, `src/cuda/hc_up_mix.cu`'s `REG_*`): the same products in
+/// the same order and the same mix with any of them, so the same bits. The streams prefetched
+/// into L2 two tiles ahead instead of one.
+pub const REG_PD2: i32 = 1;
+/// The mix's operands of a tile (stream values, scales, lazy streams' inputs) copied into shared
+/// memory by `cp.async` while the tile's matmul runs, instead of loaded from L2 after it.
+pub const REG_XS: i32 = 2;
+/// `lo`'s B fragments loaded with one `ldmatrix.x4` per K step instead of four 32-bit shared
+/// loads (the same words in the same registers).
+pub const REG_LD: i32 = 4;
+/// The L2 prefetch going on past a CTA's run into the next run's first tiles.
+pub const REG_CROSS: i32 = 8;
+/// Every option bit.
+pub const REG_ALL: i32 = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
+/// The options on by default: `ldmatrix.x4` and the mix's operands staged in shared memory
+/// (`legion serve --no-hc-up-mix-ldmatrix` and `--no-hc-up-mix-stage` turn them off; together
+/// 1-12% faster than neither on one GB10, by mode). The prefetch options stay off: both were
+/// slower there.
+pub const DEFAULT_REG_OPTS: i32 = REG_LD | REG_XS;
+
+/// The options the launches run with ([`set_up_mix_ldmatrix`], [`set_up_mix_stage`]).
+static REG_OPTS: AtomicI32 = AtomicI32::new(DEFAULT_REG_OPTS);
+
+/// The options [`force_reg_opts`] forces, or -1.
+static FORCED_REG_OPTS: AtomicI32 = AtomicI32::new(-1);
+
+/// Sets option `bit` of the configured ones on or off.
+fn set_reg_opt(bit: i32, on: bool) {
+    if on {
+        REG_OPTS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        REG_OPTS.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+/// Sets whether `up_mix_bf16_reg` loads `lo`'s B fragments with `ldmatrix.x4` (on by default;
+/// the same bits either way).
+pub fn set_up_mix_ldmatrix(on: bool) {
+    set_reg_opt(REG_LD, on);
+}
+
+/// Sets whether `up_mix_bf16_reg` stages each tile's mix operands in shared memory while its
+/// matmul runs ([`REG_XS`]; on by default; the same bits either way).
+pub fn set_up_mix_stage(on: bool) {
+    set_reg_opt(REG_XS, on);
+}
+
+/// Forces `up_mix_bf16_reg`'s options ([`REG_ALL`] bits) for the launches from now on
+/// (`legion hc-up-mix-bench`, tests); `None` goes back to the configured ones.
+#[doc(hidden)]
+pub fn force_reg_opts(opts: Option<i32>) {
+    FORCED_REG_OPTS.store(opts.map_or(-1, |o| o & REG_ALL), Ordering::Relaxed);
+}
+
+/// The options launches run with now: forced ([`force_reg_opts`]) or configured.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn reg_opts() -> i32 {
+    match FORCED_REG_OPTS.load(Ordering::Relaxed) {
+        o if o >= 0 => o,
+        _ => REG_OPTS.load(Ordering::Relaxed),
+    }
+}
+
 /// Sets whether graphs built from now on run the mixer's up matmul and gated mix as one op for
 /// BF16 `up` weights where it fits (on by default; [`set_up_mix`] off turns it off too); `false`
 /// keeps ggml's cuBLAS `mul_mat` and `hc_pre`.
@@ -359,11 +422,35 @@ pub(super) fn lob_offset(node_bytes: usize, rank: usize, n: usize) -> usize {
 /// # Safety
 /// `lob` is a node made by [`up_mix`] or [`up_mix_rebuilt`] with memory; `rank` and `n` its
 /// `lo`'s.
-unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
+pub(super) unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
     // SAFETY: the caller's; the offset stays within the node.
     unsafe {
         let bytes = ffi::ggml_nbytes(lob);
         (lob.data as *mut u8).add(lob_offset(bytes, rank, n)) as *mut u16
+    }
+}
+
+/// For an `hc_up_lob` node with memory (the BF16 form of [`up_mix`] and [`up_mix_rebuilt`]):
+/// its F32 `lo` (the source it rounds) and the bytes of the node holding `lo` as BF16, the part
+/// its mix reads, `(start, end)`. `None` for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor; its sources valid tensors.
+pub(crate) unsafe fn up_lob(
+    node: *const ffi::ggml_tensor,
+) -> Option<(*mut ffi::ggml_tensor, (usize, usize))> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_LOB))
+            || (*node).data.is_null()
+            || (*node).src[0].is_null()
+        {
+            return None;
+        }
+        let lo = (*node).src[0];
+        let (rank, n) = ((*lo).ne[0] as usize, (*lo).ne[1] as usize);
+        let at = lob_data(&*node, rank, n) as usize;
+        Some((lo, (at, at + rank * n * 2)))
     }
 }
 
@@ -441,6 +528,97 @@ unsafe fn mix_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>
             }
         }
         Some(reads)
+    }
+}
+
+/// What one up-mix node reads and writes, per token, as it will run (for the node fusion's
+/// audit log, #1183).
+pub(crate) struct MixAudit {
+    /// Tokens of the step.
+    pub n: i64,
+    /// The input form, as `legion hc-up-mix-bench` names its modes: `s16` (BF16 streams),
+    /// `f32` (F32 streams), `pre` (F32 streams made from the block's output, lazy), `xn` (the
+    /// F32 normed streams), `q8` (a Q8_0 `up`, `xn` or streams).
+    pub mode: &'static str,
+    /// What it reads: (what, bytes a token). The weights (read once a call) are left out.
+    pub reads: Vec<(&'static str, usize)>,
+    /// What it writes: (what, bytes a token, the tensor whose readers read it; null when not
+    /// written).
+    pub writes: Vec<(&'static str, usize, *mut ffi::ggml_tensor)>,
+    /// The `hc_up_lob` node holding `lo` as BF16 (null for a Q8_0 `up`).
+    pub lob: *mut ffi::ggml_tensor,
+}
+
+/// [`MixAudit`] of `node`, an up-mix node of an allocated graph after the node fusion; `None`
+/// for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor; its sources valid tensors.
+pub(crate) unsafe fn audit(node: *mut ffi::ggml_tensor) -> Option<MixAudit> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX)) {
+            return None;
+        }
+        let t = &*node;
+        let (up, x) = (&*t.src[0], &*t.src[2]);
+        let params = crate::ggml::external_params(t);
+        let hc = params[1] as usize;
+        let rows = up.ne[1] as usize;
+        let n = (*lo_of(up, &*t.src[1])).ne[1];
+        let (rank, e) = (up.ne[0] as usize, rows / hc);
+        let up_bf16 = up.type_ == types::BF16;
+        let rebuilt = !t.src[3].is_null();
+        let lazy = !t.src[LAZY_OUT_SRC].is_null();
+        let x16 = x.type_ == types::BF16;
+        let mode = match (up_bf16, rebuilt, lazy, x16) {
+            (false, ..) => "q8",
+            (true, false, ..) => "xn",
+            (true, true, true, _) => "pre",
+            (true, true, false, true) => "s16",
+            (true, true, false, false) => "f32",
+        };
+        let mut reads = Vec::new();
+        if rebuilt {
+            reads.push((
+                if x16 { "streams BF16" } else { "streams F32" },
+                rows * if x16 { 2 } else { 4 },
+            ));
+            reads.push(("norm scales F32", hc * 4));
+        } else {
+            reads.push(("xn F32", rows * 4));
+        }
+        if lazy {
+            reads.push(("block output F32", e * 4));
+            reads.push(("inject weights F32", hc * 4));
+        }
+        reads.push(if up_bf16 {
+            ("lo BF16", rank * 2)
+        } else {
+            ("lo F32", rank * 4)
+        });
+        let skip_f32 = params[P_SKIP_F32] != 0 || params[P_BY_EXCHANGE] != 0;
+        let mut writes = vec![(
+            "mixed F32",
+            if skip_f32 { 0 } else { e * 4 },
+            if skip_f32 { std::ptr::null_mut() } else { node },
+        )];
+        let cast = t.src[MIX_CAST_SRC];
+        if !cast.is_null() {
+            writes.push(("mixed BF16", e * 2, cast));
+        }
+        let lob = if up_bf16 {
+            t.src[1]
+        } else {
+            std::ptr::null_mut()
+        };
+        Some(MixAudit {
+            n,
+            mode,
+            reads,
+            writes,
+            lob,
+        })
     }
 }
 
@@ -837,6 +1015,8 @@ struct HcUpMix {
     pre_out_ld: i64,
     pre_inj: *const f32,
     pre_inj_ld: i64,
+    /// BF16 `up`, `up_mix_bf16_reg` only: its options ([`REG_ALL`] bits).
+    reg_opts: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -869,6 +1049,7 @@ impl HcUpMix {
             pre_out_ld: 0,
             pre_inj: std::ptr::null(),
             pre_inj_ld: 0,
+            reg_opts: 0,
         }
     }
 }
@@ -878,6 +1059,7 @@ unsafe extern "C" {
     fn legion_hc_up_mix_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
     fn legion_hc_up_lob_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
     fn legion_hc_up_mix_last_kernel() -> i32;
+    fn legion_hc_up_mix_last_opts() -> i32;
 }
 
 /// The BF16 up-mix kernel the last launch ran, numbered as [`force_kernel`] numbers them (0: none
@@ -888,6 +1070,20 @@ pub fn last_kernel() -> i32 {
     {
         // SAFETY: reads an atomic.
         unsafe { legion_hc_up_mix_last_kernel() }
+    }
+    #[cfg(not(feature = "cuda"))]
+    0
+}
+
+/// The `up_mix_bf16_reg` options ([`REG_ALL`] bits) the last BF16 launch ran with: [`REG_XS`]
+/// dropped where the streams are not 16-byte aligned or two CTAs an SM do not fit with it, 0
+/// after an `up_mix_bf16` launch (or no CUDA build).
+#[doc(hidden)]
+pub fn last_reg_opts() -> i32 {
+    #[cfg(feature = "cuda")]
+    {
+        // SAFETY: reads an atomic.
+        unsafe { legion_hc_up_mix_last_opts() }
     }
     #[cfg(not(feature = "cuda"))]
     0
@@ -986,6 +1182,7 @@ pub(crate) unsafe fn launch_mix(
             pre_out_ld: 0,
             pre_inj: std::ptr::null(),
             pre_inj_ld: 0,
+            reg_opts: reg_opts(),
         };
         if let Some(a) = out16 {
             if !up_bf16 {

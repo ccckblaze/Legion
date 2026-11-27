@@ -43,6 +43,7 @@ fn template(name: &str) -> ChatTemplate {
         "gemma4" => ("<bos>", "<eos>"),
         "nemotron35" => ("<s>", "<|im_end|>"),
         "deepseek41" => ("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"),
+        "inkling2" => ("", "<|content_model_end_sampling|>"),
         other => panic!("unknown template {other}"),
     };
     ChatTemplate::new(&source, bos, eos).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -121,6 +122,13 @@ fn deepseek41_matches_transformers() {
     check("deepseek41");
 }
 
+/// Inkling-2's template: `{% generation %}` blocks, compact `tojson(separators=...)` and
+/// `dictsort(case_sensitive=true)`, the effort as a system turn.
+#[test]
+fn inkling2_matches_transformers() {
+    check("inkling2");
+}
+
 fn render(source: &str) -> Result<String, legion::chat_template::ChatTemplateError> {
     ChatTemplate::new(source, "<s>", "</s>")?.render(None, &[], &[], false, &Map::new())
 }
@@ -158,6 +166,27 @@ fn tojson_matches_python_json_dumps() {
     assert_eq!(
         got,
         "{\"a\": [1, 2.5, null, true], \"b\": \"é\\n\\\"x\\\" <&>\"}|{\"k\": \"\\u00e9\"}|[\n  1,\n  {\n    \"a\": 2,\n    \"z\": 1\n  }\n]"
+    );
+}
+
+/// `separators` with an indent, as `json.dumps([1, {"a": 2}], indent=1, separators=...)` gives.
+#[test]
+fn tojson_separators_with_indent() {
+    let src = r#"{{ [1, {"a": 2}] | tojson(indent=1, separators=[",", ":"]) }}|{{ [1, 2] | tojson(indent=1, separators=[", ", ": "]) }}"#;
+    assert_eq!(
+        render(src).unwrap(),
+        "[\n 1,\n {\n  \"a\":2\n }\n]|[\n 1, \n 2\n]"
+    );
+}
+
+/// `{% generation %}` tags become a plain block; the same text inside raw blocks, comments
+/// and expressions stays literal.
+#[test]
+fn generation_tags_outside_literals_only() {
+    let src = "{% raw %}{% generation %}{% endraw %}|{# {% generation %} #}|{{ '{% endgeneration %}' }}|{%- generation -%} x {%- endgeneration -%}|";
+    assert_eq!(
+        render(src).unwrap(),
+        "{% generation %}||{% endgeneration %}|x|"
     );
 }
 

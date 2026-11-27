@@ -29,6 +29,9 @@ pub struct Switches {
     /// Gated DeltaNet prompt groups' whole-head chunked kernel staged through shared memory
     /// ([`crate::model::core::set_gdn_staged`]).
     pub gdn_staged: Option<bool>,
+    /// That kernel's gated-norm forms copying a chunk's z rows one chunk ahead
+    /// ([`crate::model::core::set_gdn_ahead`]).
+    pub gdn_ahead: Option<bool>,
     /// Gated DeltaNet verify and commit steps' delta rule as Legion's op
     /// ([`crate::model::core::set_gdn`]).
     pub gdn: Option<bool>,
@@ -164,6 +167,18 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// The shared expert's prompt-step W8A8 gate / up GEMM storing its outputs 16 bytes a
+    /// thread through shared memory ([`crate::model::fp8::set_glu_wide_store`]).
+    pub fp8_glu_wide_store: Option<bool>,
+    /// W8A8 FP8 prompt GEMMs' outputs by TMA stores
+    /// ([`crate::model::fp8::set_tma_store`]; on by default).
+    pub fp8_tma_store: Option<bool>,
+    /// The qkv GEMM with the conv in its epilogue's outputs by TMA stores
+    /// ([`crate::model::fp8::set_conv_tma_store`]; on by default).
+    pub fp8_conv_tma_store: Option<bool>,
+    /// The W8A8 FP8 prompt GEMMs' staggered first wave on the wide tile
+    /// ([`crate::model::fp8::set_wide_stagger`]; on by default).
+    pub fp8_wide_stagger: Option<bool>,
     /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
     /// ([`crate::model::wgmma_gemm::set_enabled`]).
     pub hopper_gemm: Option<bool>,
@@ -185,6 +200,21 @@ pub struct Switches {
     /// The routed experts' decode mvs prefetching whole row tiles into L2
     /// ([`crate::model::nvfp4_mm::set_expert_tile_prefetch`]).
     pub nvfp4_expert_tile_prefetch: Option<bool>,
+    /// The routed experts' prompt-step down GEMM prefetching its activation rows into L2
+    /// ([`crate::model::nvfp4_mm::set_down_x_prefetch`]).
+    pub nvfp4_down_x_prefetch: Option<bool>,
+    /// The routed experts' prompt-step down GEMM storing its outputs 16 bytes a thread through
+    /// shared memory ([`crate::model::nvfp4_mm::set_down_wide_store`]).
+    pub nvfp4_down_wide_store: Option<bool>,
+    /// The routed experts' prompt-step down GEMM writing BF16 rows with evict-first stores
+    /// ([`crate::model::nvfp4_mm::set_down_store_evict_first`]).
+    pub nvfp4_down_store_evict_first: Option<bool>,
+    /// The routed experts' prompt-step SwiGLU GEMM storing its outputs 16 bytes a thread through
+    /// shared memory ([`crate::model::nvfp4_mm::set_glu_wide_store`]).
+    pub nvfp4_glu_wide_store: Option<bool>,
+    /// The routed experts' prompt-step SwiGLU GEMM writing its staged rows with evict-first
+    /// stores ([`crate::model::nvfp4_mm::set_glu_store_evict_first`]).
+    pub nvfp4_glu_store_evict_first: Option<bool>,
     /// The most pairs per routed expert on the grouped mv kernel, more on the grouped GEMM
     /// ([`crate::model::nvfp4_mm::set_expert_mv_max`]).
     pub nvfp4_expert_mv_max: Option<i64>,
@@ -371,6 +401,16 @@ pub struct Switches {
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
     /// default).
     pub hc_up_mix_bf16: Option<bool>,
+    /// That op's prompt kernel loading its B fragments with `ldmatrix.x4`
+    /// ([`crate::model::qwen4::set_up_mix_ldmatrix`], on by default, the same bits).
+    pub hc_up_mix_ldmatrix: Option<bool>,
+    /// That kernel staging each tile's mix operands in shared memory during its matmul
+    /// ([`crate::model::qwen4::set_up_mix_stage`], on by default, the same bits).
+    pub hc_up_mix_stage: Option<bool>,
+    /// qwen4exp's `--hc-bf16` down matmul writing the gate's activation as the up-mix's BF16
+    /// input itself ([`crate::model::qwen4::hc_down::set_down_lob`], on by default, the same
+    /// bits).
+    pub hc_down_lob: Option<bool>,
     /// qwen4exp's combine-and-norm writing the streams' norm scales instead of the normed
     /// streams, rebuilt by the up-mix op ([`crate::model::qwen4::set_up_mix_rebuild`]).
     pub hc_xn_rebuild: Option<bool>,
@@ -569,6 +609,7 @@ impl Switches {
         set(self.gdn_scan, core::set_gdn_scan);
         set(self.gdn_mma, core::set_gdn_mma);
         set(self.gdn_staged, core::set_gdn_staged);
+        set(self.gdn_ahead, core::set_gdn_ahead);
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);
@@ -646,6 +687,16 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(
+            self.fp8_glu_wide_store,
+            crate::model::fp8::set_glu_wide_store,
+        );
+        set(self.fp8_tma_store, crate::model::fp8::set_tma_store);
+        set(
+            self.fp8_conv_tma_store,
+            crate::model::fp8::set_conv_tma_store,
+        );
+        set(self.fp8_wide_stagger, crate::model::fp8::set_wide_stagger);
         set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
         set(
             self.hopper_attn,
@@ -667,6 +718,26 @@ impl Switches {
         set(
             self.nvfp4_expert_tile_prefetch,
             crate::model::nvfp4_mm::set_expert_tile_prefetch,
+        );
+        set(
+            self.nvfp4_down_x_prefetch,
+            crate::model::nvfp4_mm::set_down_x_prefetch,
+        );
+        set(
+            self.nvfp4_down_wide_store,
+            crate::model::nvfp4_mm::set_down_wide_store,
+        );
+        set(
+            self.nvfp4_down_store_evict_first,
+            crate::model::nvfp4_mm::set_down_store_evict_first,
+        );
+        set(
+            self.nvfp4_glu_wide_store,
+            crate::model::nvfp4_mm::set_glu_wide_store,
+        );
+        set(
+            self.nvfp4_glu_store_evict_first,
+            crate::model::nvfp4_mm::set_glu_store_evict_first,
         );
         if let Some(n) = self.nvfp4_expert_mv_max {
             crate::model::nvfp4_mm::set_expert_mv_max(n);
@@ -793,6 +864,9 @@ impl Switches {
         set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
+        set(self.hc_up_mix_ldmatrix, qwen4::set_up_mix_ldmatrix);
+        set(self.hc_up_mix_stage, qwen4::set_up_mix_stage);
+        set(self.hc_down_lob, qwen4::hc_down::set_down_lob);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
         set(self.hc_bf16, qwen4::set_hc_bf16);
