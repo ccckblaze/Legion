@@ -487,3 +487,41 @@ Operational follow-ups, in order, none of them in the adopted binary:
    footprint agree afterwards.
 3. Make the count observable at boot, not just in the archive: the scan already knows
    `blocks/bytes` but nothing tells the operator that blobs outnumber entries by 24x.
+
+---
+
+## Wave-M verdict (2026-11-27, runbook §403) — MTP stays off production
+
+Six alternating boots on the 4-card lane, regime sentinel flat (rb-c1 wall 66-72 s), so every arm pair is
+comparable. Against the warm control M0b:
+
+| metric | ctl M0b | MTP k2/G1 | verdict |
+|---|---|---|---|
+| 8K C4 throne agg | 62.7 | 60.4 | neutral |
+| 8K C16 throne agg | 167.6 | 253.2 | **+51%** |
+| 123K C1 tg | 47.4 | 55.2 | **+16.4%** |
+| 123K C4 agg | 116.0 | 104.6 | −9.8% |
+| 262K C4 revive agg | 87.2 | 26.0 | **−70%** |
+| 262K C4 revive tg | 25.5 | 6.9 | **−73%** |
+
+The quality gate is the veto: `det_same` reproduced **true** twice for k2/min-group-1, and **false** for both
+`--spec-k 3` and `--pipeline-min-group 2` - run-to-run nondeterminism inside a boot, which `acc 6/6` does not
+excuse. So the only deterministic MTP shape is exactly the shape that collapses the deep-window revive path,
+and the shapes that survive the revive path fail determinism. Production keeps `ud=0`.
+
+Reopen conditions, in order: (1) locate the spec x min-group / k3 nondeterministic race; (2) fix the
+revive -> lend -> rider collapse the deep rows hit once `1+k` verify rows land on restored state; (3) price
+the one-time tier invalidation when a boot changes the layer count (48 -> 49), which is what rewrote the
+night's waves into two shape families (§401) and is now prevented by the harness fix below.
+
+## Harness root causes fixed (runbook §404)
+
+- `lane19.sh` sourced the production lane env and therefore **shared `conv-tier-prod` with production**.
+  The first 49-layer (MTP) boot overwrites the tier index, which is the mechanism behind §401's
+  S4 -> K2 family flip, reproduced again in Wave-M (3,699 foreign entries left behind).
+  Test lanes now use `conv-tier-lane`.
+- `lane19.sh` stop could kill production through the shared `/tmp/legion-lane-4.pid` - it did, once, for
+  ~2 minutes at 12:0x. Lanes now carry `LEGION_PIDF=/tmp/legion-lane-lane19.pid`.
+- `bin-cap` (adopted binary + cap-counts-states patch) passed on the 2-card lane: 2,048 MiB nominal vs
+  2,057 MiB actual (blocks 367 + states 1,689). The 128 -> 211.7 GiB cap miss is root-caused and closed
+  for the next stable candidate. `tools/convtier_gc.py --apply` remains scheduled, not run.
