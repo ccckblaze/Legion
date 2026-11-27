@@ -17,15 +17,22 @@
 //! holding hundreds of thousands of entries rewrites only the shards its flush touched.
 //!
 //! Blocks are gathered off the engine thread: `queue_blocks` hands the worker address
-//! ranges (pool tensors outlive it), and the pool references the engine took at queue time
-//! are returned through `drain_acks` once each block's file is on disk. A state's bytes
-//! are copied on the engine thread (`bytes`): a saved slot is recycled on the next store.
+//! ranges, and the pool references the engine took at queue time are returned through
+//! `drain_acks` once each block's file is on disk. A state's bytes are copied on the engine
+//! thread (`bytes`): a saved slot is recycled on the next store.
+//!
+//! Because a queued dump reads live pool memory, the writer must be gone before the engine
+//! frees the pools: [`ConvTier::close`] is the only thing that ends it (the thread holds the
+//! `Arc<Inner>` that owns the sender, so the channel can never disconnect by itself), and
+//! `impl Drop for Worker` calls it ahead of the field drops. An unjoined writer gathers out of
+//! a freed arena: a SIGSEGV seconds after every stop and, worse, a blob whose bytes came from
+//! memory already handed to the next tenant, hashed as if it were the block.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -417,6 +424,9 @@ pub struct StateJob {
 enum Job {
     Blocks(Vec<BlockJob>),
     States(Vec<StateJob>),
+    /// Shutdown: land what is already queued, flush the shards, exit. [`ConvTier::close`]
+    /// sends this and joins the writer, so nothing is gathered after the engine frees pools.
+    Quit,
 }
 
 /// The tier, shared between the engine loop (queue, match, ack) and its writer thread.
@@ -442,6 +452,10 @@ struct Inner {
     /// Bytes in the writer queue (materialized or promised): the backpressure gauge
     /// against `pending_max()` (oMLX's bounded pending buffer).
     pending: AtomicU64,
+    /// [`ConvTier::close`]: the engine's pools are going away, so queue nothing else.
+    closed: AtomicBool,
+    /// The writer's handle, taken and joined by [`ConvTier::close`].
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
     stats: ConvStats,
 }
 
@@ -451,8 +465,9 @@ fn now_ms() -> u64 {
 
 impl ConvTier {
     /// Bring the tier up: seed the index from the boot scan and start the writer thread.
-    /// The thread exits when the last `ConvTier` handle drops (`tx` closes), after its
-    /// final manifest flush; `Lm` holds the only handle, so pool tensors outlive it.
+    /// The thread only ends at [`ConvTier::close`], which joins it: dropping every handle
+    /// cannot disconnect the channel, because the thread itself holds the `Arc<Inner>` that
+    /// owns the sender.
     pub fn start(cfg: ConvDiskCfg, scanned: HashMap<String, BlockEntry>, sig: Signature) -> ConvTier {
         let (tx, rx) = mpsc::channel();
         let total: u64 = scanned.values().map(|e| e.bytes).sum();
@@ -489,13 +504,16 @@ impl ConvTier {
             acks: Mutex::new(Vec::new()),
             bytes: Mutex::new(total),
             pending: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            join: Mutex::new(None),
             stats: ConvStats::default(),
         });
         let me = inner.clone();
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("conv-tier".into())
             .spawn(move || writer(me, rx))
             .expect("spawn conv-tier");
+        *inner.join.lock().unwrap() = Some(join);
         ConvTier { inner }
     }
 
@@ -521,6 +539,15 @@ impl ConvTier {
     /// ids of blocks skipped this way are acked immediately: their references were taken
     /// for the queue and nothing else is pending on them).
     pub fn queue_blocks(&self, mut jobs: Vec<BlockJob>) {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            // [`ConvTier::close`] has run: the pools these addresses live in are on their way
+            // out. Hand the references back and dump nothing.
+            let mut acks = self.inner.acks.lock().unwrap();
+            for j in &jobs {
+                acks.push(j.id);
+            }
+            return;
+        }
         {
             let mut chains = self.inner.chains.lock().unwrap();
             jobs.retain(|j| {
@@ -557,6 +584,9 @@ impl ConvTier {
     }
 
     pub fn queue_state(&self, job: StateJob) {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
         {
             let mut chains = self.inner.state_chains.lock().unwrap();
             if chains.contains(&job.chain) {
@@ -580,6 +610,21 @@ impl ConvTier {
     /// The ids whose files are on disk (or dropped): the engine decrefs their blocks.
     pub fn drain_acks(&self) -> Vec<u32> {
         std::mem::take(&mut *self.inner.acks.lock().unwrap())
+    }
+
+    /// End the writer thread and wait for it: what is already queued is gathered and
+    /// flushed first, so every read of pool memory happens while the engine still owns it.
+    /// Call this before the pools drop - `impl Drop for Worker` does, ahead of the field
+    /// drops - and not from the writer itself. Idempotent.
+    pub fn close(&self) {
+        if self.inner.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.inner.tx.send(Job::Quit);
+        if let Some(handle) = self.inner.join.lock().unwrap().take() {
+            // Bounded by the pending cap: the writer only has the queue it holds left.
+            let _ = handle.join();
+        }
     }
 
     /// The entry serving `chain`, if the tier has one whose blob is on disk.
@@ -759,6 +804,7 @@ fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
         };
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
+        let mut quit = false;
         for job in batch {
             match job {
                 Job::Blocks(jobs) => {
@@ -775,7 +821,12 @@ fn writer(inner: Arc<Inner>, rx: mpsc::Receiver<Job>) {
                         inner.pending.fetch_sub(n, Ordering::Relaxed);
                     }
                 }
+                // Nothing is queued behind it: `closed` is set before `Quit` is sent.
+                Job::Quit => quit = true,
             }
+        }
+        if quit {
+            break;
         }
         trim(&inner, &mut dirty);
         if !dirty.is_empty() && last_flush.elapsed() > Duration::from_secs(2) {

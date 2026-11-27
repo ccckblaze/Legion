@@ -7072,6 +7072,18 @@ enum Admission<'t> {
     Failed(Job, String),
 }
 
+impl Drop for Worker {
+    /// The engine thread is leaving. Stop the cold tier's writer and wait for it *here*,
+    /// ahead of the field drops: `conv` would otherwise outlive `exec`, and a dump still in
+    /// its queue gathers KV bytes out of the freed arena (the SIGSEGV `dmesg` shows seconds
+    /// after every stop, and a blob written from memory the next tenant already owns).
+    fn drop(&mut self) {
+        if let Some(conv) = &self.conv {
+            conv.close();
+        }
+    }
+}
+
 impl Worker {
     fn run(mut self, rx: std::sync::mpsc::Receiver<Job>) {
         let tokenizer = self.tokenizer.clone();
