@@ -97,7 +97,11 @@ use crate::tokenizer::Tokenizer;
 pub use pipe::DEFAULT_MIN_GROUP as DEFAULT_PIPELINE_MIN_GROUP;
 /// `--resident-window-starve`: the default wait after which a budget-blocked job enters
 /// anyway (the liveness guard for `--resident-window-budget`, AC922 #418).
-pub const DEFAULT_WINDOW_STARVE_SECS: u64 = 90;
+/// Deep-window prefills run minutes per row (a full-window cold prompt is ~85 s on the
+/// AC922 four-way split), so a short guard is breached inside every fill wave: measured on
+/// the 2-GPU lane, 90 s admitted every blocked row past the cap by the end of the fill
+/// round and the budget did nothing. 600 s spans a full deep-window wave instead.
+pub const DEFAULT_WINDOW_STARVE_SECS: u64 = 600;
 pub use preempt::KvAdmission;
 use preempt::Waiting;
 pub use slo::SloTargets;

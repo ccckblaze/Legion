@@ -667,7 +667,8 @@ pub(super) struct ModelArgs {
     pub resident_window_budget: usize,
     /// With --resident-window-budget: how long a blocked request may wait before it enters
     /// past the budget anyway (liveness; default 90 s). A preempted sequence returning to the
-    /// queue is never budget-blocked.
+    /// queue is never budget-blocked. 600 s spans a full deep-window prefill wave; a shorter
+    /// guard is breached inside the wave and the budget stops meaning anything (measured).
     #[arg(
         long,
         default_value_t = legion::engine::lm::DEFAULT_WINDOW_STARVE_SECS,
