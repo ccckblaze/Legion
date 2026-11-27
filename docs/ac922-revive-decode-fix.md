@@ -449,3 +449,41 @@ Filed for the next iteration, not folded into this one:
   then dropping the writer mid-flight is merely lost work, and shutdown never has to block.
 - `--conv-disk-gib` counts blocks only, so the production tier reached 212 GiB against a 128 GiB
   nominal cap. Patch exists and `--check`s clean; it is not in the adopted binary.
+
+## 400 - Measured blast radius of the two-writer bug, and the tool that counts it
+
+`tools/convtier_gc.py` (dry-run by default) walks the tier's blobs and diffs them against every
+chain named by any `manifest-*.json`. A blob with no manifest entry is unreachable forever, because
+the token list that produced the chain is stored only in the entry - the filename is the chain hash,
+not the tokens, so the engine cannot re-derive what a stray file was for.
+
+Measured on the live production tier, one round after adopting `bin-ctlock`:
+
+```
+tier=/data/cache/conv-tier-prod shards=256 bad_shards=0 indexed_keys=4388
+reachable_files=4436 unreachable_files=107932 unreachable_GiB=201.3
+```
+
+- 111,605 block files + 255 state files, 211.7 GiB total, but only 4,388 chains survive in the
+  index. The boot log agrees with the tool: `conv tier: live 4388 blocks 47 states 5.0 GiB
+  (0 missing, 0 foreign)` - so the loss is in the manifests, not in the blobs.
+- 111,471 of the 111,605 blobs carry an mtime inside the last 24 h, which rules out TTL expiry as
+  the cause. The writes were current; the index that described them was overwritten.
+- **201.3 GiB is the cost of §396 on this machine**, and it is why full-window revive looks bimodal:
+  a conversation whose chain survived comes back at page-cache speed, one whose chain was lost is a
+  2.1M-token cold prefill. The same `262144 x 4` cell measured 18.9 s (chain present) and 652 s
+  (chain absent) within ninety minutes of each other.
+- `devq6` is the prevention proof: on the fixed binary a boot that queued 221 blocks ended with
+  `indexed == blobs == 221`, and the following boot scanned the same numbers. The pre-fix binaries
+  are what produce orphans.
+- Nothing was deleted. With 516 G free there is no urgency, and the orphan set is the only physical
+  evidence of the overwrite, so it stays until a deliberate `--apply` is scheduled.
+
+Operational follow-ups, in order, none of them in the adopted binary:
+
+1. Enforce the cap honestly: `--conv-disk-gib` counts blocks only, so 128 GiB nominal allowed
+   211.7 GiB actual. The patch exists and `--check`s clean.
+2. Reclaim the 201.3 GiB with `tools/convtier_gc.py --apply` once (1) is in, so the cap and the
+   footprint agree afterwards.
+3. Make the count observable at boot, not just in the archive: the scan already knows
+   `blocks/bytes` but nothing tells the operator that blobs outnumber entries by 24x.
