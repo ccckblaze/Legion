@@ -94,6 +94,28 @@ start() {
   [ -n "$LONG_ALONE" ] && FLAGS+=(--long-alone-tokens "$LONG_ALONE")
   [ -n "$SPEC_K" ] && FLAGS+=(--spec-k "$SPEC_K")
   [ "$USE_DRAFTER" = 1 ] && FLAGS+=(--spec "$SPEC_MODE" --spec-draft "$MODEL_DIR/$DRAFTER")
+  # last-wins dedupe over the whole argv: an arm that repeats a base flag (or a lane env that
+  # repeats its own) replaces it, instead of failing the boot on a duplicate argument.
+  TAIL=("${FLAGS[@]}" $EXTRA)
+  ARGS=()
+  for (( __i=0; __i<${#TAIL[@]}; __i++ )); do
+    __w="${TAIL[$__i]}"
+    case "$__w" in
+      --*)
+        __dup=0
+        for (( __j=__i+1; __j<${#TAIL[@]}; __j++ )); do
+          if [ "${TAIL[$__j]}" = "$__w" ]; then __dup=1; break; fi
+        done
+        if [ "$__dup" = 1 ]; then
+          echo "start: $__w superseded by its later twin"
+          __k=$((__i+1))
+          if [ "$__k" -lt ${#TAIL[@]} ] && [ "${TAIL[$__k]#--}" = "${TAIL[$__k]}" ]; then __i=$__k; fi
+          continue
+        fi
+        ;;
+    esac
+    ARGS+=("$__w")
+  done
   # shellcheck disable=SC2086
   setsid nohup env CUDA_VISIBLE_DEVICES=$GPUS "$BIN" serve \
     --model "$MODEL_DIR/$MODEL" \
@@ -104,8 +126,8 @@ start() {
     --cache-type-k q8_0 --cache-type-v q8_0 \
     --kv-cache-tokens "$KV_VRAM" --kv-host-tokens "$KV_HOST" \
     --expert-heat-pass-cap 1 --max-batch-tokens ${LEGION_MAX_BATCH:-4096} \
-    --model-name qwen3.8-flash-next \
-    "${FLAGS[@]}" $EXTRA >> "$LOG" 2>&1 </dev/null &
+    --model-name qwen3.8-flash-next --served-model-name qwen3.8-flash-next-test \
+    "${ARGS[@]}" >> "$LOG" 2>&1 </dev/null &
   echo $! > "$PIDF"
   echo "start: pid $(cat "$PIDF") log $LOG"
   if wait_health; then echo "HEALTH-OK"; else echo "HEALTH-FAIL"; tail -40 "$LOG"; return 1; fi
@@ -115,6 +137,15 @@ start() {
 status() {
   if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
     echo "RUNNING pid $(cat "$PIDF")"; curl -s -m 5 "http://127.0.0.1:$PORT/health"; echo
+    # The admission shape and its traces, so a rate complaint can be read against the boot
+    # that caused it (#418/#419): a queued row, a placement retried, a request refused.
+    LOG=$(ls -t "$LOGD"/legion-"$CARDS"-*.log 2>/dev/null | head -1)
+    if [ -n "$LOG" ]; then
+      B=$(grep -m1 "resident window budget" "$LOG" | cut -c1-120)
+      echo "log $LOG"
+      echo "admission: ${B:-window budget off (rows enter regardless of size)}"
+      echo "since boot: revive=$(grep -c 'conv tier: hydrated' "$LOG") retry=$(grep -c 'retrying once' "$LOG") refused=$(grep -c 'admission refused' "$LOG") http400=$(grep -c ' 400 ' "$LOG")"
+    fi
     nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
   else echo "DOWN"; fi
 }
