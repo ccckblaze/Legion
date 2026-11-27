@@ -7351,6 +7351,9 @@ impl Worker {
                             Admission::Admitted(seq) => Ok(seq),
                             Admission::Wait(job) => Err(Waiting::New(job)),
                             Admission::Failed(job, e) => {
+                                // The reason goes to the client on the stream; without this line
+                                // a 400 in the access log has no cause to read against (AC922).
+                                tracing::warn!("admission refused: {e}");
                                 let _ = job.out.send(TokenEvent::Error(e));
                                 continue;
                             }

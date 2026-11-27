@@ -53,3 +53,25 @@
 - 123K 档预算等价点未测（4×140K=560K 已在塌缩前夜）。
 - `--scheduling-policy priority` 与本预算准入的组合语义需先读 `queue.rs` 合并规则
   （classes_of_two_queues_merge_by_priority 已给出先例）。
+
+## 六、落地状态（2026-11-28，4×V100 卡 0/1/3/4）
+
+- **P1 已上线并实测**（`1631acf` + `b2e7d8e`）：`queue.rs` 的 `Fit{Fits,Blocked,Starved}` 与
+  `pop_fit()` 只过滤候选、不改 policy 排序；准入环按 `Seq::window` 求和加新请求
+  `min(prompt+max_tokens, ctx)` 计窗，超预算排队重试，`--resident-window-starve`（默认 **600 s**：
+  90 s 的兜底在 456 s 的 fill 波内必被穿光，budget 形同虚设）强制进窗保活性，被抢占行永不
+  `Blocked`。默认 `budget=0` = 与旧版逐字节一致。
+- **收益（wb4-c4，`reburst_div 262144 4`）**：聚合 **4.45 → 27.28 rows/s（6.1×）**，每路
+  `tg_med` **1.5 → 15.0**（min 9.1 / max 16.9），逼近 §418 的甜点 31.5。排队可见：
+  `queue_ms` 最长 186 s，无塌缩。
+- **一次碰撞的账**：该轮 `fill_errs=1 / dec_errs=1`。其一在 boot 期（budget 生效前，无责）；
+  其二是 B 段后 `copy_states` 被并发抢占瞬时挤压，走向 `Placement::Failed` → 客户端 400。
+  **`a8009bf`** 把它改成 `Placement::Retry`：放置已完整回滚（表释放、ring/slot 归还、预约退回），
+  作业重新入队、下一步再放置一次；`Job::place_retry` / `Seq::place_retry` 限定只重试一次，
+  确定性失败照样报错。`resume()`（抢占复活）同一形状，瞬时碰撞不再打断在跑的对话。
+- **P2 的填缝需求（尚未定标）**：dev 道（2 卡，budget 131072/196608）里同尺寸深行只有 2 行进窗，
+  其余排队至 **488 s** 才靠 starve 兜底进窗——机制正确，但"小请求能否绕过大请求填空缝"在混排负载
+  下从未实测。`pop_fit` 已具备 `Fits` 跳过能力（跳过 `Blocked` 候选继续扫），外层 while 的 slot
+  条件是唯一的门，所以 bin-pack 填缝是纯调度层改动，验收场景 = 1 条满窗 + N 条小窗。
+- **裁决口径**：收益只在 4 卡以上可测（2 卡 64K 每行本就超供给带宽 §416，且排队行的前缀被洗掉后
+  B 轮重算 pp 81-170 s），dev 道只验机制不死。
