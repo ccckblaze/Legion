@@ -145,6 +145,12 @@ status() {
       echo "log $LOG"
       echo "admission: ${B:-window budget off (rows enter regardless of size)}"
       echo "since boot: revive=$(grep -c 'conv tier: hydrated' "$LOG") retry=$(grep -c 'retrying once' "$LOG") refused=$(grep -c 'admission refused' "$LOG") http400=$(grep -c ' 400 ' "$LOG")"
+      # Live admission pressure: a window budget only means something if a queued row shows up.
+      G=$(curl -s -m 5 -H "Authorization: Bearer ${LEGION_API_KEY:-}" \
+            "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
+          | grep -E '^legion_engine_(running|decoding|prefilling|waiting|waiting_keys|kv_blocks_used) ' \
+          | tr '\n' ' ')
+      [ -n "$G" ] && echo "gauges: $G"
     fi
     nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
   else echo "DOWN"; fi
