@@ -119,9 +119,19 @@ impl From<EngineError> for ApiError {
             EngineError::Overloaded => ErrorKind::Overloaded,
             EngineError::Internal(_) => ErrorKind::Internal,
         };
+        let message = e.to_string();
+        // The access log carries a status only, and the reason travels to the client alone:
+        // without this line a 400/500 has nothing to read against (#419: two refusals in one
+        // acceptance run, and the engine log could not say which path refused them).
+        if matches!(
+            kind,
+            ErrorKind::InvalidRequest | ErrorKind::Internal | ErrorKind::TooLarge
+        ) {
+            tracing::warn!("request refused: {message}");
+        }
         Self {
             kind,
-            message: e.to_string(),
+            message,
             param: None,
         }
     }
