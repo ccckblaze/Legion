@@ -133,7 +133,7 @@ def run(target, C, tag, fit_only=False):
         "tg_min_B": round(tgs[0], 3) if tgs else None,
         "tg_max_B": round(tgs[-1], 3) if tgs else None,
         "agg_B": round(sum(r["ctok"] for r in okB) / wallB, 2) if okB else None,
-        "rows": [{"pt": r["ptok"], "ch": r.get("cached"), "ct": r["ctok"],
+        "rows": [{"pt": r.get("ptok"), "ch": r.get("cached"), "ct": r.get("ctok"), "err": r.get("err"),
                   "tg": round(r["tg"], 2) if r.get("tg") else None,
                   "span": round(r["span"], 1)} for r in outB.values()]}))
 
