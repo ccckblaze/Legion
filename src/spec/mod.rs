@@ -458,6 +458,9 @@ pub struct SpecConfig {
     /// Above `k`, verify steps may take this many drafts' rows while the head still drafts at
     /// most `k`.
     pub mtp_ngram_k: usize,
+    /// Stop a sequence's drafts past this context depth (`--spec-depth-stop`; 0: no depth
+    /// gate). See [`adaptive::depth_gated`](crate::spec::adaptive::depth_gated).
+    pub depth_stop: usize,
 }
 
 impl std::fmt::Debug for SpecConfig {
@@ -470,6 +473,7 @@ impl std::fmt::Debug for SpecConfig {
             .field("gate_cost_model", &self.gate_cost_model)
             .field("gate_cost_model_given", &self.gate_cost_model_given)
             .field("gate_until", &self.gate_until)
+            .field("depth_stop", &self.depth_stop)
             .field("row_cost", &self.row_cost)
             .field("pad_longest", &self.pad_longest)
             .field("max_rows", &self.max_rows)

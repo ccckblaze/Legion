@@ -1,5 +1,25 @@
 use super::*;
 
+/// The depth gate stops drafts only past `--spec-depth-stop`, and `--spec-fixed` (and
+/// `--deterministic`, which sets it) bypass it like the batch gates.
+#[test]
+fn depth_gate_follows_stop_and_fixed() {
+    let off = SpecConfig::default();
+    assert!(!depth_gated(1_000_000, &off), "0: no depth gate");
+    let band = SpecConfig {
+        depth_stop: 65536,
+        ..Default::default()
+    };
+    assert!(!depth_gated(65536, &band), "the boundary still drafts");
+    assert!(depth_gated(65537, &band), "past it, drafts stop");
+    let fixed = SpecConfig {
+        depth_stop: 65536,
+        fixed: true,
+        ..Default::default()
+    };
+    assert!(!depth_gated(1_000_000, &fixed), "--spec-fixed bypasses it");
+}
+
 #[test]
 fn depths() {
     let cfg = SpecConfig::default();

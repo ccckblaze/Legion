@@ -1842,6 +1842,7 @@ impl EngineArgs {
             max_batch: self.adaptive_settings.spec_max_batch,
             gate_cost_model: self.adaptive_settings.spec_gate_cost_model.unwrap_or(true),
             gate_cost_model_given: self.adaptive_settings.spec_gate_cost_model.is_some(),
+            depth_stop: self.adaptive_settings.spec_depth_stop,
             row_cost: self.adaptive_settings.spec_row_cost,
             pad_longest: self.adaptive_settings.spec_pad_longest,
             max_rows: self.adaptive_settings.spec_max_rows,

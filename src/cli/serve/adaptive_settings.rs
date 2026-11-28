@@ -56,6 +56,16 @@ pub(super) struct AdaptiveSettings {
     /// than `--spec mtp`, whose depth follows measured costs).
     #[arg(long, default_value_t = 0.5, value_parser = probability)]
     pub spec_p_floor: f32,
+    /// Stop a sequence's drafts once its context is deeper than this many tokens
+    /// (`--spec-depth-stop`; 0: no depth gate, the default). A verify row pays attention over
+    /// the sequence's full context, and on a host-tier KV cache it streams what it reads:
+    /// drafts that pay off at short contexts can cost more than they save deep, while short
+    /// sequences in the same window keep drafting. On AC922 V100s with the streaming expert
+    /// cache, MTP measured about +5-7% at 1-8K and about -2-3% at 32-131K decode on a 2-GPU
+    /// layer split. Greedy text moves where the gate flips a step from drafting to not, as
+    /// with any depth change; --deterministic is unaffected.
+    #[arg(long, default_value_t = 0, value_name = "TOKENS")]
+    pub spec_depth_stop: usize,
 }
 
 fn probability(value: &str) -> Result<f32, String> {

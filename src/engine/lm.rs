@@ -9043,7 +9043,9 @@ impl Worker {
         let decode_batch = batch;
         if self.spec_k > 0 {
             for seq in decoding.iter_mut() {
-                let cap = if seq.drafter.is_some() {
+                let cap = if crate::spec::adaptive::depth_gated(seq.n_past, &self.spec_config) {
+                    0
+                } else if seq.drafter.is_some() {
                     seq.adaptive_cap(&self.spec_config, decode_batch, self.max_ctx, &mut depths)
                 } else {
                     // Model drafts were selected after the previous target step. Recheck
@@ -9806,9 +9808,13 @@ impl Worker {
                     continue;
                 }
                 let (start, n) = ran[i];
-                let max = match chosen {
+                let max = if crate::spec::adaptive::depth_gated(seq.n_past, &self.spec_config) {
+                    0
+                } else {
+                    match chosen {
                     Some(c) => seq.depth_cap(c, max_ctx, &mut depths),
                     None => seq.adaptive_cap(&self.spec_config, draft_batch, max_ctx, &mut depths),
+                    }
                 };
                 seq.draft = Draft::default();
                 seq.draft_cap = max;
@@ -9853,11 +9859,15 @@ impl Worker {
                     });
                     continue;
                 }
-                let max = match (joined.contains(&i), chosen) {
+                let max = if crate::spec::adaptive::depth_gated(seq.n_past, &self.spec_config) {
+                    0
+                } else {
+                    match (joined.contains(&i), chosen) {
                     (false, _) => 0,
                     (true, Some(c)) => seq.depth_cap(c, max_ctx, &mut depths),
                     (true, None) => {
                         seq.adaptive_cap(&self.spec_config, draft_batch, max_ctx, &mut depths)
+                    }
                     }
                 };
                 seq.draft = Draft::default();

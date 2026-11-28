@@ -34,6 +34,15 @@ pub fn cost_model_ungated_large(max_seqs: usize, cfg: &SpecConfig) -> bool {
     !cfg.gate_cost_model || (cfg.gate_until > 0 && max_seqs > cfg.gate_until)
 }
 
+/// Whether the depth gate stops drafts for a sequence this deep (`--spec-depth-stop`;
+/// 0: no depth gate, and `--spec-fixed` disables it, as with the batch gates). A verify row in
+/// a deep window pays attention over the full context and, with a host-tier cache, streams the
+/// KV it reads: drafts that pay off at short contexts can cost more than they save there,
+/// while short sequences in the same window keep drafting.
+pub fn depth_gated(n_past: usize, cfg: &SpecConfig) -> bool {
+    !cfg.fixed && cfg.depth_stop > 0 && n_past > cfg.depth_stop
+}
+
 /// The deepest draft `batch` drafting sequences may take under `--spec-max-rows` (`max_rows`;
 /// 0: no cap) when the depth policy would allow `k`: every sequence's token and its drafts
 /// within `max_rows` rows, so `max_rows / batch - 1` (0 once one row each fills it).
@@ -170,6 +179,7 @@ impl Default for SpecConfig {
             gate_cost_model: true,
             gate_cost_model_given: false,
             gate_until: 0,
+            depth_stop: 0,
             row_cost: true,
             pad_longest: false,
             max_rows: 0,
