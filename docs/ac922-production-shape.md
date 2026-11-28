@@ -136,6 +136,20 @@ export CMAKE_CUDA_ARCHITECTURES=70
 CARGO_TARGET_DIR=/data/work/legion-ct-target cargo build --release --features cuda
 ```
 
+Two traps this script exists to avoid, both hit again on 11-28:
+
+- **A non-login ssh shell has no toolset.** Plain `ssh host cargo build` picks up RHEL's `cc`
+  (gcc 8.5) and RHEL's module `cargo` (1.97): ggml's `arch/powerpc/quants.c` then dies on
+  `invalid parameter combination for AltiVec intrinsic __builtin_vec_lxvl`, and `ops.cpp`
+  reaches a gcc-8.5 internal compiler error. Source the enable file and set `CC`/`CXX`/
+  `CUDAHOSTCXX` explicitly (as above) - `build.rs` forwards whatever `cc` resolves to.
+- **One target directory is one ggml build tree, whatever source path you build from.** CMake
+  caches `CMAKE_HOME_DIRECTORY` per `legion-<hash>` out dir; building the same commit from a
+  second checkout (a `git worktree`, to "keep the production tree clean") reconfigures that
+  cache onto the other path and marks every ggml object stale. Both trees then fight over one
+  build dir, and the tree you left alone has to rebuild from scratch. Build only from
+  `/data/work/legion-src-ct`; use `git checkout --detach <commit>` there for a candidate.
+
 `legion --version` prints the commit (`legion 0.1.0 (be91f3b, ggml unknown, cuda on)`), taken from
 git metadata by `build.rs` at the start of the build. A docs-only commit changes nothing `build.rs`
 declares as an input, so `cargo build` finishes in under a second and the binary keeps the previous
