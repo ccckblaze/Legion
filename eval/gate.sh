@@ -10,6 +10,13 @@ echo "GATE-START $(date +%H:%M:%S) $NOTE"
 echo "LOG $(basename "$L") bytes=$(wc -c < "$L") warnerr=$(grep -acE ' WARN | ERROR ' "$L")"
 grep -aE 'conv tier: live|VRAM after load|memory plan part="host"' "$L" | sed -e 's/^.*INFO //' | cut -c1-95
 cd /data/work/legion/eval || exit 1
+# The tier's cap is a wall around the directory; a stranded blob is disk the wall cannot see,
+# and /data full fails manifest writes, which strands more. One line, read-only, ~2 s.
+TIER=$(printf '%s' "$LEGION_EXTRA" | sed -n 's/.*--conv-disk \([^ ]*\).*/\1/p')
+if [ -n "$TIER" ]; then
+    echo "DISK $(df -h /data | awk 'NR==2 {print $4 " free (" $5 " used)"}')"
+    timeout 180 python3 ct-sweep.py "$TIER" --quiet 2>&1 | tail -1
+fi
 for i in 1 2 3; do echo -n "DET$i "; timeout 900 python3 -u qualLegion.py det 2>&1 | tail -1; done
 echo -n "IMG "; timeout 300 python3 /data/work/vl-probe.py img 2>&1 | tail -1 | cut -c1-95
 echo "--- undecl(call) ---"; timeout 600 python3 -u undecl_probe.py call 2>&1 | tail -4

@@ -341,3 +341,58 @@ Note on the lane script: `legion-lane.sh 2` reads `lane.env` unless
 `LEGION_LANE_ENV=/data/work/legion/lane-dev.env` is prefixed - without it a "dev" boot
 carries the prod port and tier and dies on the bind (`Address already in use` on :8090,
 logged before "listening"). Always prefix dev lane actions.
+
+## E1: the cap measures the directory (2026-11-28, the orphan leak)
+
+Found while checking capacity, not speed: `/data` at 99% (75 GiB free) with
+`conv-tier-prod` holding **264.6 GiB of blobs against a `--conv-disk-gib 128` cap**, and the
+boot line insisting `conv tier: live 24590 blocks 54 states 34.1 GiB (0 missing, 0 foreign)`.
+Both numbers were true: the line describes what the index attests, the directory holds a lot
+more. Forensics (`eval/ct-sweep.py`):
+
+| tier | attested | on disk | stranded | stranded files older than the boot |
+|---|---|---|---|---|
+| `conv-tier-prod` | 24,691 / 35.1 G | 264.6 G | 158,688 / 229.5 G | all of them |
+| `conv-tier-dev` | 22,654 / 33.9 G | 80.9 G | 26,333 / 47.1 G | all of them |
+| `conv-tier-fresh` | 16,435 / 22.8 G | 22.8 G | 0 | - |
+
+Zero stranded files were created by the running boot, so this is not an active leak: it is what
+a KV geometry change leaves behind. The chain id is a hash over token blocks, so changing
+`block_bytes` (the same lane's history: `block of 1359872 bytes, pool wants 1228800`) renames
+every chain at once - the old set becomes foreign in its entirety.
+
+Mechanism, two halves that only bite together:
+
+1. `scan()` keeps a foreign entry out of the map, by design: "left on the disk for the model
+   that owns it". Hydrate therefore never serves another model's bytes. Good.
+2. `flush()` rewrites a **whole shard** from what this boot indexes. So the first dump that
+   dirties that shard drops the neighbour's rows from the manifest - and `trim()` can only
+   unlink what the index names. The blobs stay, uncounted by `bytes`, unreachable, forever.
+
+`bytes` never exceeded the cap (35 GiB < 128), so the wall never fired and the directory grew
+past it by 7x. The cap's own comment says it should be the opposite: "global across models,
+oMLX #5497: one number bounds the whole directory".
+
+The fix (this commit, our module - upstream has no `conv_tier.rs`):
+
+- `scan()` returns the foreign entries alongside the live map (`Foreign`), and `Scanned.bytes`
+  is the directory: ours + theirs, with `foreign_bytes` broken out for the log line.
+- `ConvTier::start` keeps them in two side maps, disjoint from ours by construction, and seeds
+  `bytes` with both - so `trim` measures the wall the documented way.
+- `flush()` re-emits a shard's foreign rows after ours; a chain this boot now owns is dropped
+  from the foreign maps as it is indexed (`forget_foreign`), so no chain is ever attested twice.
+- `trim()` picks victims from ours **and** theirs on one LRU clock, blocks then states, and
+  unlinks a foreign blob together with its row. A geometry change is now reclaimed by the TTL
+  (`--conv-disk-ttl-min`) or by the cap, whichever comes first, instead of leaking.
+
+Operationally, `eval/ct-sweep.py <tier-dir>` reports stranded blobs and reclaims them with
+`--apply`, age-guarded (`--min-age-min`, default 30) so a dump between the blob and its shard
+flush is never mistaken for litter. `gate.sh` now prints a `DISK` line (free space + the
+sweep's verdict) with the boot gate, because the failure order is cruel: /data full makes
+`fs::write` of a manifest fail, which strands exactly the blobs that would free space.
+
+Cleanup ran live on the production lane at 13:40 CST (158,688 + 26,333 unlinked, /data 75 GiB
+free to 351 GiB, health 200 and the boot's own index untouched - the writer thread never
+referenced those rows). The engine fix lands with the next lane restart: it changes cache
+policy only, no byte on the serving path, so it needs the standard `gate.sh` pass rather than
+a quality run.

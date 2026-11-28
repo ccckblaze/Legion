@@ -141,11 +141,44 @@ pub struct Manifest {
 pub struct Scanned {
     pub blocks: usize,
     pub states: usize,
+    /// The whole directory: this pack's entries plus [`Foreign`]'s. The cap is a wall around
+    /// the directory (oMLX #5497), so this is what [`trim`] measures against.
     pub bytes: u64,
+    /// The part of `bytes` written by another model or an older geometry.
+    pub foreign_bytes: u64,
     pub missing: usize,
     pub foreign: usize,
     /// Format-3 entries trusted once and re-signed with the live pack fingerprint.
     pub migrated: usize,
+}
+
+/// Entries the live signature does not cover: another model's cache, or this pack's before a
+/// KV geometry change (a block-size bump renames every chain, so the old set goes foreign at
+/// once). They are ours to protect, not to forget. `flush()` rewrites a whole shard from what
+/// this boot indexes, so an entry kept out of the map is un-indexed while its blob stays on
+/// the fly - which is how the AC922 production tier reached 264 GiB against a 128 GiB cap.
+/// Carried verbatim back into every shard they belong to, counted toward the cap, and first in
+/// line when [`trim`] needs room.
+#[derive(Default)]
+pub struct Foreign {
+    pub blocks: HashMap<String, BlockEntry>,
+    pub states: HashMap<String, StateEntry>,
+}
+
+impl Foreign {
+    pub fn bytes(&self) -> u64 {
+        let b: u64 = self.blocks.values().map(|e| e.bytes).sum();
+        let s: u64 = self.states.values().map(|e| e.bytes).sum();
+        b + s
+    }
+
+    pub fn count(&self) -> usize {
+        self.blocks.len() + self.states.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.states.is_empty()
+    }
 }
 
 /// What the tier actually gave back, the oMLX `cache/stats.py` counterpart: realized reuse
@@ -273,13 +306,22 @@ fn live_legacy_eq(e: &Signature, live: &Signature) -> bool {
 /// Read every manifest shard and count what is actually on the fly (a killed flusher can
 /// leave an entry without a file: those drop out here rather than failing a request later).
 ///
-/// Entries whose signature does not match this server's model are kept out of the map and
-/// left on the disk for the model that owns them.
-pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, BlockEntry>, Scanned) {
+/// Entries whose signature does not match this server's model stay out of the map the engine
+/// reads from, but they are returned in [`Foreign`] so the writer can keep attesting them:
+/// their model owns the bytes, and this boot must neither un-index them nor spend its cap on
+/// them beyond the directory wall that [`trim`] enforces.
+pub fn scan(
+    cfg: &ConvDiskCfg,
+    live: Option<&Signature>,
+) -> (HashMap<String, BlockEntry>, Foreign, Scanned) {
     let mut blocks: HashMap<String, BlockEntry> = HashMap::new();
     let (mut st_keep, mut bytes, mut missing, mut foreign) = (0usize, 0u64, 0usize, 0usize);
+    let mut foreign_bytes = 0u64;
+    let keep_foreign = live.is_some();
     let mut migrated = 0usize;
     let mut states: HashMap<String, StateEntry> = HashMap::new();
+    let mut fblocks: HashMap<String, BlockEntry> = HashMap::new();
+    let mut fstates: HashMap<String, StateEntry> = HashMap::new();
     let shards = fs_shards(&cfg.dir);
     for path in shards {
         let Ok(raw) = fs::read(&path) else { continue };
@@ -295,6 +337,10 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
             }
             if live.is_some_and(|l| !sig_matches(&e.sig, l, legacy)) {
                 foreign += 1;
+                if keep_foreign && blob_path(&cfg.dir, &e.chain).exists() {
+                    foreign_bytes += e.bytes;
+                    fblocks.entry(e.chain.clone()).or_insert(e);
+                }
                 continue;
             }
             if !blob_path(&cfg.dir, &e.chain).exists() {
@@ -329,13 +375,34 @@ pub fn scan(cfg: &ConvDiskCfg, live: Option<&Signature>) -> (HashMap<String, Blo
                 states.insert(s.chain.clone(), s);
             } else {
                 missing += 1;
+                if keep_foreign
+                    && s.chain.len() >= 2
+                    && s.bytes > 0
+                    && live.is_some_and(|l| !sig_matches(&s.sig, l, legacy))
+                    && state_path(&cfg.dir, &s.chain).exists()
+                {
+                    // Not missing: somebody else's state, present and worth keeping named.
+                    missing -= 1;
+                    foreign += 1;
+                    foreign_bytes += s.bytes;
+                    fstates.entry(s.chain.clone()).or_insert(s);
+                }
             }
         }
     }
     let found = blocks.len();
     (
         blocks,
-        Scanned { blocks: found, states: st_keep, bytes, missing, foreign, migrated },
+        Foreign { blocks: fblocks, states: fstates },
+        Scanned {
+            blocks: found,
+            states: st_keep,
+            bytes: bytes + foreign_bytes,
+            foreign_bytes,
+            missing,
+            foreign,
+            migrated,
+        },
     )
 }
 
@@ -394,14 +461,13 @@ pub fn boot(
             tracing::info!("conv tier: cleared {gone} interrupted pending writes");
         }
     }
-    let st = scan(&cfg, None).1;
+    let st = scan(&cfg, None).2;
     tracing::info!(
-        "conv tier: {} blocks {} states {:.1} GiB on disk ({} missing, {} foreign), restore {}",
+        "conv tier: {} blocks {} states {:.1} GiB on disk ({} missing), restore {}",
         st.blocks,
         st.states,
         st.bytes as f64 / (1u64 << 30) as f64,
         st.missing,
-        st.foreign,
         if cfg.restore { "on" } else { "off" },
     );
     Some((cfg, st))
@@ -467,6 +533,11 @@ struct Inner {
     /// Entries, by chain; the writer thread owns updates, the engine reads for hydrate.
     blocks: Mutex<HashMap<String, BlockEntry>>,
     states: Mutex<HashMap<String, StateEntry>>,
+    /// Another model's entries, carried through [`flush`] so a shard rewrite cannot un-index
+    /// a blob this boot does not own, and measured by [`trim`] so the cap stays a wall around
+    /// the directory rather than around this pack's share of it.
+    foreign_blocks: Mutex<HashMap<String, BlockEntry>>,
+    foreign_states: Mutex<HashMap<String, StateEntry>>,
     /// Blocks whose files are on disk: the engine gives their pool references back.
     acks: Mutex<Vec<u32>>,
     bytes: Mutex<u64>,
@@ -498,10 +569,20 @@ impl ConvTier {
     /// owns the sender.
     /// Returns `None` when another live engine owns the directory (see [`take_writer`]): the
     /// boot runs without the cold tier rather than corrupting the owner's index.
-    pub fn start(cfg: ConvDiskCfg, scanned: HashMap<String, BlockEntry>, sig: Signature) -> Option<ConvTier> {
+    pub fn start(
+        cfg: ConvDiskCfg,
+        scanned: HashMap<String, BlockEntry>,
+        foreign: Foreign,
+        sig: Signature,
+    ) -> Option<ConvTier> {
         let lock = take_writer(&cfg.dir)?;
         let (tx, rx) = mpsc::channel();
         let total: u64 = scanned.values().map(|e| e.bytes).sum();
+        let mut fblocks = foreign.blocks;
+        let mut fstates = foreign.states;
+        // Whatever the live signature does cover is ours, not theirs: an entry in both maps
+        // would be attested twice by `flush` and counted twice against the cap.
+        fblocks.retain(|c, _| !scanned.contains_key(c));
         let mut state_chains = HashSet::new();
         let mut states = HashMap::new();
         // Re-read the state sidecars the boot scan counted (few of them).
@@ -523,6 +604,9 @@ impl ConvTier {
                 }
             }
         }
+        fstates.retain(|c, _| !states.contains_key(c));
+        let fb: u64 = fblocks.values().map(|e| e.bytes).sum();
+        let fs: u64 = fstates.values().map(|e| e.bytes).sum();
         let chains: HashSet<String> = scanned.keys().cloned().collect();
         let inner = Arc::new(Inner {
             cfg,
@@ -532,8 +616,11 @@ impl ConvTier {
             state_chains: Mutex::new(state_chains),
             blocks: Mutex::new(scanned),
             states: Mutex::new(states),
+            foreign_blocks: Mutex::new(fblocks),
+            foreign_states: Mutex::new(fstates),
             acks: Mutex::new(Vec::new()),
-            bytes: Mutex::new(total),
+            // The cap is the directory: this pack's bytes plus what the neighbours left named.
+            bytes: Mutex::new(total + fb + fs),
             pending: AtomicU64::new(0),
             _lock: lock,
             closed: AtomicBool::new(false),
@@ -1001,6 +1088,7 @@ fn dump_block(
             inner.blocks.lock().unwrap().insert(j.chain.clone(), entry);
             *inner.bytes.lock().unwrap() += n;
             dirty.insert(j.chain[..2].to_string());
+            forget_foreign(inner, &j.chain, false);
         }
         // An earlier boot - typically the one `restart` is still draining while this one is
         // already scanning the same directory - owns these bytes. The manifest may not be
@@ -1015,6 +1103,7 @@ fn dump_block(
                 b.insert(j.chain.clone(), e);
                 *inner.bytes.lock().unwrap() += got;
                 dirty.insert(j.chain[..2].to_string());
+                forget_foreign(inner, &j.chain, false);
             }
         }
     }
@@ -1048,6 +1137,7 @@ fn dump_state(inner: &Inner, j: StateJob, dirty: &mut HashSet<String>) {
             inner.states.lock().unwrap().insert(j.chain.clone(), entry);
             *inner.bytes.lock().unwrap() += n;
             dirty.insert(j.chain[..2].to_string());
+            forget_foreign(inner, &j.chain, true);
         }
         // Recurrent states are the case this was written for: the same chain genuinely can
         // carry two different bodies (a sequential cold pass and a concurrent revive put
@@ -1063,6 +1153,7 @@ fn dump_state(inner: &Inner, j: StateJob, dirty: &mut HashSet<String>) {
                 s.insert(j.chain.clone(), e);
                 *inner.bytes.lock().unwrap() += got;
                 dirty.insert(j.chain[..2].to_string());
+                forget_foreign(inner, &j.chain, true);
             }
         }
     }
@@ -1096,64 +1187,97 @@ fn adopt_state(inner: &Inner, j: &StateJob, path: &Path) -> Option<StateEntry> {
     })
 }
 
+/// A chain this boot indexes is no longer a neighbour's. Drop the shadow entry the moment we
+/// own one, so the cap counts those bytes once and `flush` writes a single row for the chain.
+fn forget_foreign(inner: &Inner, chain: &str, state: bool) {
+    if state {
+        if let Some(e) = inner.foreign_states.lock().unwrap().remove(chain) {
+            *inner.bytes.lock().unwrap() -= e.bytes;
+        }
+    } else if let Some(e) = inner.foreign_blocks.lock().unwrap().remove(chain) {
+        *inner.bytes.lock().unwrap() -= e.bytes;
+    }
+}
+
 /// The cap is the hard wall (oMLX #5497): drop least-recently-used entries, blocks first,
 /// until the tier fits again. `--conv-disk-ttl-min` drops aged entries the same way.
+///
+/// A neighbour's entries are candidates too - the wall bounds the directory, not this pack's
+/// share of it - and their blobs are unlinked like ours, which is what stops a geometry change
+/// from leaving hundreds of gigabytes named by nobody.
 fn trim(inner: &Inner, dirty: &mut HashSet<String>) {
     let cap = inner.cfg.cap_bytes();
     let ttl = inner.cfg.ttl_min;
     let age_ms = if ttl > 0 { Some((ttl as u64).saturating_mul(60_000)) } else { None };
-    let over = *inner.bytes.lock().unwrap() > cap;
+    let held_now = *inner.bytes.lock().unwrap();
+    let over = held_now > cap;
     if !over && age_ms.is_none() {
         return;
     }
     let now = now_ms();
-    let mut victims: Vec<String> = Vec::new();
+    let mut victims: Vec<(String, bool)> = Vec::new();
     {
-        let b = inner.blocks.lock().unwrap();
-        let mut v: Vec<(&String, u64)> = b.iter().map(|(k, e)| (k, e.last_used_ms)).collect();
-        v.sort_by_key(|&(_, t)| t);
-        let mut held = *inner.bytes.lock().unwrap();
-        for (k, t) in v {
+        let mut held = held_now;
+        let (b, fb) = (inner.blocks.lock().unwrap(), inner.foreign_blocks.lock().unwrap());
+        let mut v: Vec<(u64, &String, u64, bool)> = b
+            .iter()
+            .map(|(k, e)| (e.last_used_ms, k, e.bytes, false))
+            .chain(fb.iter().map(|(k, e)| (e.last_used_ms, k, e.bytes, true)))
+            .collect();
+        v.sort_by_key(|(t, _, _, _)| *t);
+        for (t, k, eb, f) in v {
             if (!over || held <= cap) && age_ms.map_or(true, |a| now.saturating_sub(t) <= a) {
                 break;
             }
-            if let Some(e) = b.get(k) {
-                held = held.saturating_sub(e.bytes);
-            }
-            victims.push(k.clone());
+            held = held.saturating_sub(eb);
+            victims.push((k.clone(), f));
         }
     }
-    for k in &victims {
-        if let Some(e) = inner.blocks.lock().unwrap().remove(k) {
+    for (k, f) in &victims {
+        let e = if *f {
+            inner.foreign_blocks.lock().unwrap().remove(k)
+        } else {
+            let e = inner.blocks.lock().unwrap().remove(k);
+            inner.chains.lock().unwrap().remove(k);
+            e
+        };
+        if let Some(e) = e {
             *inner.bytes.lock().unwrap() -= e.bytes;
             let _ = fs::remove_file(blob_path(&inner.cfg.dir, &e.chain));
             dirty.insert(k[..2].to_string());
         }
-        inner.chains.lock().unwrap().remove(k);
     }
-    let mut svictims: Vec<String> = Vec::new();
+    let mut svictims: Vec<(String, bool)> = Vec::new();
     {
-        let s = inner.states.lock().unwrap();
-        let mut v: Vec<(&String, u64)> = s.iter().map(|(k, e)| (k, e.last_used_ms)).collect();
-        v.sort_by_key(|&(_, t)| t);
         let mut sheld = *inner.bytes.lock().unwrap();
-        for (k, t) in v {
+        let (s, fst) = (inner.states.lock().unwrap(), inner.foreign_states.lock().unwrap());
+        let mut v: Vec<(u64, &String, u64, bool)> = s
+            .iter()
+            .map(|(k, e)| (e.last_used_ms, k, e.bytes, false))
+            .chain(fst.iter().map(|(k, e)| (e.last_used_ms, k, e.bytes, true)))
+            .collect();
+        v.sort_by_key(|(t, _, _, _)| *t);
+        for (t, k, eb, f) in v {
             if (!over || sheld <= cap) && age_ms.map_or(true, |a| now.saturating_sub(t) <= a) {
                 break;
             }
-            if let Some(e) = s.get(k) {
-                sheld = sheld.saturating_sub(e.bytes);
-            }
-            svictims.push(k.clone());
+            sheld = sheld.saturating_sub(eb);
+            svictims.push((k.clone(), f));
         }
     }
-    for k in &svictims {
-        if let Some(e) = inner.states.lock().unwrap().remove(k) {
+    for (k, f) in &svictims {
+        let e = if *f {
+            inner.foreign_states.lock().unwrap().remove(k)
+        } else {
+            let e = inner.states.lock().unwrap().remove(k);
+            inner.state_chains.lock().unwrap().remove(k);
+            e
+        };
+        if let Some(e) = e {
             *inner.bytes.lock().unwrap() -= e.bytes;
             let _ = fs::remove_file(state_path(&inner.cfg.dir, &e.chain));
             dirty.insert(k[..2].to_string());
         }
-        inner.state_chains.lock().unwrap().remove(k);
     }
 }
 
@@ -1162,24 +1286,46 @@ fn flush(inner: &Inner, dirty: &mut HashSet<String>) {
     let shards = dirty.clone();
     dirty.clear();
     for shard in shards {
+        // A shard is rewritten whole, so whatever this boot indexes is only half of it: the
+        // neighbouring model's entries have to ride along or their blobs end up un-attested
+        // and unreachable (the AC922 orphan leak). Ours wins on a chain collision.
+        let mut blocks: Vec<BlockEntry> = Vec::new();
+        let mut states: Vec<StateEntry> = Vec::new();
+        let mut owned: HashSet<String> = HashSet::new();
+        {
+            let b = inner.blocks.lock().unwrap();
+            for e in b.values().filter(|e| e.chain.starts_with(&shard)) {
+                owned.insert(e.chain.clone());
+                blocks.push(e.clone());
+            }
+        }
+        {
+            let s = inner.states.lock().unwrap();
+            for e in s.values().filter(|e| e.chain.starts_with(&shard)) {
+                owned.insert(e.chain.clone());
+                states.push(e.clone());
+            }
+        }
+        {
+            let fb = inner.foreign_blocks.lock().unwrap();
+            blocks.extend(
+                fb.values()
+                    .filter(|e| e.chain.starts_with(&shard) && !owned.contains(&e.chain))
+                    .cloned(),
+            );
+        }
+        {
+            let fs = inner.foreign_states.lock().unwrap();
+            states.extend(
+                fs.values()
+                    .filter(|e| e.chain.starts_with(&shard) && !owned.contains(&e.chain))
+                    .cloned(),
+            );
+        }
         let m = Manifest {
             format: FORMAT,
-            blocks: inner
-                .blocks
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|e| e.chain.starts_with(&shard))
-                .cloned()
-                .collect(),
-            states: inner
-                .states
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|e| e.chain.starts_with(&shard))
-                .cloned()
-                .collect(),
+            blocks,
+            states,
         };
         let to = inner.cfg.dir.join(shard_name(&shard));
         let tmp = inner.cfg.dir.join(format!(".tmp-{}", shard_name(&shard)));
@@ -1852,7 +1998,8 @@ mod tests {
         for sub in ["blocks", "states", "pending"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let tier = ConvTier::start(cfg, HashMap::new(), sig).expect("free directory");
+        let tier =
+            ConvTier::start(cfg, HashMap::new(), Foreign::default(), sig).expect("free directory");
         let chain = chain_of(&[7u32; 64]);
         let on_disk = state_path(&dir, &chain);
         let first = vec![1u8; 4096];
@@ -1940,10 +2087,120 @@ mod tests {
             states: Vec::new(),
         };
         fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m).unwrap()).unwrap();
-        let (map, st) = scan(&cfg, Some(&sig));
+        // The foreign chain has a blob on the fly too: foreign means another signature, not
+        // a hole, and its bytes must come back named rather than stranded.
+        fs::create_dir_all(dir.join("blocks").join("cd")).unwrap();
+        fs::write(blob_path(&dir, "cd0002"), [9u8; 8]).unwrap();
+        let (map, foreign, st) = scan(&cfg, Some(&sig));
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(chain));
         assert_eq!((st.blocks, st.missing, st.foreign), (1, 1, 1));
+        assert_eq!(foreign.blocks.len(), 1);
+        assert!(foreign.blocks.contains_key("cd0002"));
+        assert_eq!(st.foreign_bytes, 8);
+        // The scan's byte total is the directory, which is what the cap measures.
+        assert_eq!(st.bytes, 16);
+        // Without a live signature (the boot report) nothing is foreign: every named blob that
+        // is really there counts as on disk, which is the point of that line.
+        let (_, f0, st0) = scan(&cfg, None);
+        assert!(f0.is_empty() && st0.foreign == 0);
+        assert_eq!((st0.blocks, st0.missing, st0.bytes), (2, 1, 16));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The AC922 incident: 264 GiB of blobs under a 128 GiB cap, with the boot line swearing
+    /// 34.1 GiB. `flush` rewrites a whole shard from what this boot indexes, so an entry the
+    /// live signature does not cover was dropped from the manifest while its blob stayed on the
+    /// fly - unreachable, invisible to the cap, and unbounded across geometry changes. A
+    /// neighbour's entries therefore ride through the rewrite and count toward the wall, and
+    /// when the wall is reached they are the LRU's first victims.
+    #[test]
+    fn a_foreign_entry_rides_through_flush_and_counts_to_the_cap() {
+        let dir = std::env::temp_dir().join(format!("ct-test-{}", uuid::Uuid::new_v4()));
+        for sub in ["blocks", "states", "pending"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        fs::create_dir_all(dir.join("blocks").join("ab")).unwrap();
+        let live = Signature {
+            model: "test".into(),
+            pack: "p".into(),
+            digest: "d".into(),
+            quant: "q".into(),
+            block_bytes: 8,
+            block_tokens: 64,
+        };
+        let other = Signature { model: "other".into(), ..live.clone() };
+        let ours = BlockEntry {
+            chain: "ab0001".into(),
+            key: "k1".into(),
+            prev: None,
+            tokens: vec![1; 64],
+            bytes: 8,
+            sig: live.clone(),
+            last_used_ms: 40,
+        };
+        let theirs = BlockEntry {
+            chain: "ab0002".into(),
+            key: "k2".into(),
+            prev: None,
+            tokens: vec![2; 64],
+            bytes: 8,
+            sig: other.clone(),
+            last_used_ms: 10,
+        };
+        fs::write(blob_path(&dir, "ab0001"), [1u8; 8]).unwrap();
+        fs::write(blob_path(&dir, "ab0002"), [2u8; 8]).unwrap();
+        let m = Manifest { format: FORMAT, blocks: vec![ours, theirs], states: Vec::new() };
+        fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m).unwrap()).unwrap();
+        // A wall exactly as wide as the two entries: nothing to trim, but a flush must not
+        // lose the neighbour's row.
+        let cfg = ConvDiskCfg {
+            dir: dir.clone(),
+            gib: 16.0 / (1u64 << 30) as f64,
+            ttl_min: 0,
+            restore: true,
+            verify_threads: 1,
+            state_stride: 8,
+            pending_gib: 64.0,
+        };
+        let (blocks, foreign, st) = scan(&cfg, Some(&live));
+        assert_eq!((blocks.len(), foreign.blocks.len(), st.bytes), (1, 1, 16));
+        let mut tier = ConvTier::start(cfg, blocks, foreign, live.clone()).unwrap();
+        let mut dirty = HashSet::new();
+        dirty.insert("ab".to_string());
+        flush(&tier.inner, &mut dirty);
+        let kept: Manifest = serde_json::from_slice(&fs::read(dir.join(shard_name("ab"))).unwrap())
+            .unwrap();
+        assert_eq!(kept.blocks.len(), 2, "a shard rewrite may not un-index a neighbour");
+        assert!(kept.blocks.iter().any(|e| e.chain == "ab0002" && e.sig == other));
+        assert!(dirty.is_empty());
+
+        // Narrow the wall to one entry: the older bytes go, and the older bytes are theirs.
+        // `take_writer`'s flock is one writer per directory, so the first tier goes first.
+        tier.close();
+        drop(tier);
+        let cfg2 = ConvDiskCfg {
+            dir: dir.clone(),
+            gib: 8.0 / (1u64 << 30) as f64,
+            ttl_min: 0,
+            restore: true,
+            verify_threads: 1,
+            state_stride: 8,
+            pending_gib: 64.0,
+        };
+        let (blocks, foreign, _) = scan(&cfg2, Some(&live));
+        let tier = ConvTier::start(cfg2, blocks, foreign, live).unwrap();
+        let mut dirty = HashSet::new();
+        trim(&tier.inner, &mut dirty);
+        assert_eq!(*tier.inner.bytes.lock().unwrap(), 8, "the wall is the directory, not our share");
+        assert!(tier.inner.foreign_blocks.lock().unwrap().is_empty());
+        assert!(!blob_path(&dir, "ab0002").exists(), "a dropped entry takes its blob with it");
+        assert!(blob_path(&dir, "ab0001").exists(), "and leaves ours alone");
+        assert!(dirty.contains("ab"));
+        flush(&tier.inner, &mut dirty);
+        let after: Manifest = serde_json::from_slice(&fs::read(dir.join(shard_name("ab"))).unwrap())
+            .unwrap();
+        assert_eq!(after.blocks.iter().map(|e| e.chain.as_str()).collect::<Vec<_>>(), vec!["ab0001"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2013,7 +2270,7 @@ mod tests {
             states: Vec::new(),
         };
         fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m).unwrap()).unwrap();
-        let (blocks, st) = scan(&cfg, Some(&live));
+        let (blocks, _foreign, st) = scan(&cfg, Some(&live));
         assert_eq!(blocks.len(), 1);
         assert_eq!(st.migrated, 1);
         assert_eq!(st.foreign, 1);
@@ -2031,7 +2288,7 @@ mod tests {
             states: Vec::new(),
         };
         fs::write(dir.join(shard_name("ab")), serde_json::to_vec(&m4).unwrap()).unwrap();
-        let (blocks, st) = scan(&cfg, Some(&live));
+        let (blocks, _foreign, st) = scan(&cfg, Some(&live));
         assert_eq!(blocks.len(), 1);
         assert_eq!(st.migrated, 0);
         assert_eq!(st.foreign, 2);

@@ -6304,19 +6304,21 @@ impl LmEngine {
                     block_bytes: exec.kv_block_bytes() as u64,
                     block_tokens: KV_BLOCK as u32,
                 };
-                let (blocks, st) = conv_tier::scan(&disk, Some(&sig));
+                let (blocks, foreign, st) = conv_tier::scan(&disk, Some(&sig));
                 let restore = disk.restore;
-                let tier = conv_tier::ConvTier::start(disk, blocks, sig);
+                let foreign_count = foreign.count();
+                let tier = conv_tier::ConvTier::start(disk, blocks, foreign, sig);
                 // Said only once the directory is ours: `take_writer` warns and runs the boot
                 // without the cold tier when a second engine is still writing it.
                 if tier.is_some() {
                     tracing::info!(
-                        "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign, {} v3 migrated), restore {}",
+                        "conv tier: live {} blocks {} states {:.1} GiB ({} missing, {} foreign entries {:.1} GiB held to the cap, {} v3 migrated), restore {}",
                         st.blocks,
                         st.states,
                         st.bytes as f64 / (1u64 << 30) as f64,
                         st.missing,
-                        st.foreign,
+                        foreign_count,
+                        st.foreign_bytes as f64 / (1u64 << 30) as f64,
                         st.migrated,
                         if restore { "on" } else { "off" },
                     );
