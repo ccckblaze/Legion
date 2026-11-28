@@ -22,7 +22,7 @@ where they are: the author's shapes in [`run/ac922/`](run/ac922/), our campaign 
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1,3,4 legion serve \
-  --model /data/work/legion-models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --model /data/models/LLM/legion-models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --model-name qwen3.8-flash-next --port 8090 \
   --device cuda --gpus 4 --experts cache --max-seqs 16 \
   --ctx-size 262144 --cache-type-k q8_0 --cache-type-v q8_0 \
@@ -34,8 +34,10 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 legion serve \
   --pipeline-groups 4 --pipeline-min-group 1 \
   --prefix-cache-states 4 --prefix-cache-interval 8192 \
   --long-batch-tokens 16384 --long-pipeline-micro 1024 \
-  --mmproj /data/work/vision-test/mmproj-BF16.gguf \
-  --conv-disk /data/cache/conv-tier-prod --conv-disk-gib 200 \
+  --mmproj /data/models/LLM/vision-test/mmproj-BF16.gguf \
+  --conv-disk /data/cache/conv-tier-prod --conv-disk-gib 128 \
+  --conv-disk-ttl-min 1440 \
+  --resident-window-budget 524288 \
   --undeclared-tool-calls call
 ```
 
@@ -51,11 +53,29 @@ CUDA_VISIBLE_DEVICES=0,1,3,4 legion serve \
 | `--kv-cache-tokens 262144` + `--kv-host-tokens 786432` | The window. 258368 tokens of q8 KV stay resident per card and 786432 tokens (14.06 GiB) sit in the host tier, so four 262144-token sessions are all live at once. |
 | `--pipeline-groups 4 --pipeline-min-group 1` | Decode runs as four groups whose steps are in flight at once, so one GPU computes a group's step while the next GPU computes another's. The minimum of 1 lets groups collapse when fewer sequences are live. |
 | `--prefix-cache-states 4 --prefix-cache-interval 8192` | Recurrent-state checkpoints every 8192 prompt tokens, four of them, so the second request over a shared system prefix does not replay it. |
-| `--conv-disk ... --conv-disk-gib 200` | The cold tier: content-addressed KV blocks and state checkpoints on NVMe, so a restart or an eviction resumes from a disk read instead of a prefill storm. |
+| `--conv-disk ... --conv-disk-gib 128` | The cold tier: content-addressed KV blocks and state checkpoints on NVMe, so a restart or an eviction resumes from a disk read instead of a prefill storm. The cap is what trims (global LRU at the ceiling); at 157 GiB on disk it runs at the cap, which is fine capacity discipline while orphan reclaim is small (6.2 GiB per `tools/convtier_gc.py`, 2026-11-28). Raise it only together with the free-space check. |
+| `--resident-window-budget 524288` | Size-aware admission (AC922 #418): rows whose summed windows pass 2x full ctx queue instead of entering the decode window. Mixed-size traffic under the cap runs near free (1x262K + 3x64K: 4 rows in-window, ~51.5 tok/s aggregate); uniform 4x full ctx caps at ~7 anyway, and without the budget that shape collapses to ~1 tok/s per row. See [ac922-admission-pool-eval.md](ac922-admission-pool-eval.md). |
 | `--mmproj ...` | Image input on the same endpoint. GPU tower on sm_70; the reference-image probe below is what makes this acceptable rather than assumed. |
 | `--undeclared-tool-calls call` | A well-formed call that names a tool the request did not declare goes to the client on the tool channel instead of staying in the reply text. See [serving.md](serving.md#constrained-output-json-and-strict-tool-calls). |
 
-## Binary of record (2026-11-27 10:45 CST)
+## Binary of record (2026-11-28 08:41 CST)
+
+`/data/work/legion/bin-wretry4`, sha256 `caa69af4`, adopted into `lane.env` with a timestamped
+backup beside it. Source is branch `coldtier` at `ac3ca60` (the version stamp reads `a4c6c9e` for
+the `build.rs`-reads-HEAD reason under Building - identify builds by sha). What it adds over the
+previous record:
+
+| addition | commit | evidence |
+|---|---|---|
+| size-aware admission + liveness guard | `1631acf` + `b2e7d8e` | M0/M2/M1 round, counted fixture, empty cold tier: 2x budget 7.13 agg vs 3.91 unadmitted on uniform 4x full ctx; default budget=0 is the old code path |
+| copy-states race -> one re-queued retry | `a8009bf` | protective only, never fired in three boots and four shapes; kept, not claimed as a perf ticket |
+| refusal causes in the log | `a4c6c9e` + `3069b13` | caught the 400 at its source the same minute it shipped (`prompt is 268127 tokens, the context is 262144`) |
+| lane status: admission lines + /metrics gauges | `f527820` + `ac3ca60` | readable under load, read-only |
+
+Quality gate on this exact boot: `det_same=true`, acc 6/6, `revive=3 retry=0 refused=0 http400=0`,
+archive `20261128-084156-c4` (plogarch, secret-scan clean).
+
+## Previous record (2026-11-27 10:45 CST)
 
 `/data/work/legion/bin-ctlock`, sha256 `24f72fdccb49`, adopted into `lane.env` with a dated
 `# ADOPTED` header and a timestamped backup beside it. `legion --version` stamps it `b4a26a4`, one
@@ -161,9 +181,18 @@ vision flags revert to their off defaults. `lane.env` keeps a timestamped backup
 
 ## Known anchors
 
+**Admission anchors (counted fixture `reburst_max 261872 4`, empty cold tier per arm, 2026-11-28).**
+Uniform 4x full ctx aggregate: budget off **3.91** (every row ~1 tok/s, one row's chain lost to a
+209 s cold prefill), budget 3x ctx **4.31** (queued row loses its chain entirely), budget 2x ctx
+**7.13** with rows at 19.5/4.1/17.8/21.6 - the adopted shape. The same 2x budget with mixed sizes
+(1x262K + 3x64K, summed window 458752 <= budget) runs all four rows in-window at ~51.5 aggregate:
+below the cap, concurrency is nearly free. The queued-row chain-retention rate (261824/131072/0
+across the three arms) is the open dev ticket, not the admission itself.
+
 123K at four concurrent sessions: 129.4 tokens/s aggregate (15.8 per stream), reproduced 113.1 on
-a managed boot; 262K at four: 86.2 aggregate. A cold 4x123K prefill storm costs 317.5 s, the same
-sessions resumed from RAM 16.9 s, and the cold tier turns the eviction case into the read path.
+a managed boot; 262K at four: 86.2 aggregate (warm page cache - see the 35x paragraph below). A
+cold 4x123K prefill storm costs 317.5 s, the same sessions resumed from RAM 16.9 s, and the cold
+tier turns the eviction case into the read path.
 Both numbers carry the boot-to-boot caveat written up in the perf doc; read the deltas, not the
 last digit.
 **The same cell has two honest values, 35x apart, and the difference is page cache.** `262144 x 4`
