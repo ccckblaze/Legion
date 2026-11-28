@@ -15,6 +15,9 @@ pub(super) struct NgramStep<'a> {
     /// Sequences drafting for the next step, and whether drafting is off for that many.
     pub batch: usize,
     pub gated: bool,
+    /// `--spec-depth-stop`: n-gram drafts stop past this context depth too, so the fallback
+    /// cannot outlive the head's gate (0: no depth gate).
+    pub depth_stop: usize,
     /// Whether the head takes in the verified positions every step.
     pub take_in: bool,
     /// `--spec-k`: the deepest n-gram draft.
@@ -39,6 +42,9 @@ impl Seq<'_> {
             return mtp_max;
         };
         if step.gated || self.active.constrained() {
+            return mtp_max;
+        }
+        if step.depth_stop > 0 && self.n_past > step.depth_stop {
             return mtp_max;
         }
         let cap = draft_cap(

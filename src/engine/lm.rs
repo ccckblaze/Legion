@@ -9789,6 +9789,7 @@ impl Worker {
                 depth: self.depth.as_ref(),
                 batch: draft_batch,
                 gated: !self.spec_config.fixed && draft_batch >= self.spec_config.max_batch,
+                depth_stop: self.spec_config.depth_stop,
                 take_in: !self.exec.mtp_shares_kv(),
                 ceiling: self.spec_config.ngram_k().min(k),
                 shape: chosen.unwrap_or(self.spec_config.k.min(k)),
