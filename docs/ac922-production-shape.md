@@ -75,6 +75,16 @@ previous record:
 Quality gate on this exact boot: `det_same=true`, acc 6/6, `revive=3 retry=0 refused=0 http400=0`,
 archive `20261128-084156-c4` (plogarch, secret-scan clean).
 
+**Candidate binary (validated 2026-11-28, not adopted).** The full upstream merge (`e01b92a`,
+`/data/work/legion/bin-uc`, sha `a5c72ee1`) ships `40b7764`, which hands a lent slot's VRAM to the
+next mapper: at the 4-GPU deep-window shape (2x261872 co-resident rows) that pool crashes the
+engine (`batch step failed: cudaMemcpy invalid argument -> GET_ROWS failed`, twice, with and
+without MTP). The author ships the kill switch: with `LEGION_DEBUG_LEND_HANDOFF=0` the same
+binary passes the same shape at parity with the record - C1 32.91 vs 33.35, C2 rows 18.39/15.34
+vs 17.86/15.44, agg 30.68 vs 30.88, engine alive, zero error lines. Held as the candidate until
+the pool itself is fixed upstream; adoption then only removes the env line. Reproduction and the
+single-variable table are in the runbook (SS423) and ready to file upstream.
+
 ## Previous record (2026-11-27 10:45 CST)
 
 `/data/work/legion/bin-ctlock`, sha256 `24f72fdccb49`, adopted into `lane.env` with a dated
@@ -145,7 +155,9 @@ grep -acE 'WARN|ERROR' "$L"                                    # expect 0
 grep -aE 'conv tier: live|memory plan part="host"|listening' "$L"
 python3 /data/work/legion/eval/qualLegion.py det       # three runs, six per-prompt shas, identical
 python3 /data/work/vl-probe.py img                   # same amount, same answer sha
-python3 /data/work/legion/eval/undecl_probe.py call  # drifted names leave on the tool channel
+python3 /data/work/legion/eval/undecl_probe.py call  # drifted names leave on the tool channel;
+    # NODRIFT is the normal answer since 11-28: at T=0 the model writes the declared name (v1 and
+    # v2 fixtures both silent), and the coercion path itself is unit-covered in tool_parser/tests.rs.
 bash /data/work/legion/eval/plogarch.sh 4            # archive this boot, then hand back traffic
 ```
 
@@ -188,6 +200,14 @@ Uniform 4x full ctx aggregate: budget off **3.91** (every row ~1 tok/s, one row'
 (1x262K + 3x64K, summed window 458752 <= budget) runs all four rows in-window at ~51.5 aggregate:
 below the cap, concurrency is nearly free. The queued-row chain-retention rate (261824/131072/0
 across the three arms) is the open dev ticket, not the admission itself.
+
+**Chain death is eviction pressure, not queue time (Q round, 2026-11-28, 2-GPU lane).** With the
+same flag at 1x-ctx budget, a full-window row that waits 272.9 s in the queue while another row
+decodes revives at `cached=261824` - the full chain - on both the record binary and the candidate
+(rows 13.36/8.76, agg 17.51 vs 17.60: no merge delta). The 131072/0 deaths above therefore come
+from demote-time dump truncation inside the concurrent four-row wave (the chain on disk only
+reaches the depth the dump covered when the row was evicted), which narrows the ticket to
+full-chain dumps and `--conv-disk-hydrate-budget`, not to the admission order.
 
 123K at four concurrent sessions: 129.4 tokens/s aggregate (15.8 per stream), reproduced 113.1 on
 a managed boot; 262K at four: 86.2 aggregate (warm page cache - see the 35x paragraph below). A
