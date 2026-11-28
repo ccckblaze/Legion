@@ -430,7 +430,12 @@ fn finishes_with_the_norm_match_the_separate_ops() {
                 let half = |t, a: i64, c: i64| {
                     ctx.view_2d(t, [row as i64, c], row * 4, a as usize * row * 4)
                 };
-                let norm = |bf16| Norm { w, eps, bf16 };
+                let norm = |bf16| Norm {
+                    w,
+                    eps,
+                    bf16,
+                    a4: false,
+                };
                 let mut graph = ctx.new_graph(64);
                 let s0 = all_reduce_start(&ctx, id, half(x, 0, n0), n as usize);
                 let s1 = all_reduce_start(&ctx, id, half(x, n0, n1), n as usize);
@@ -474,4 +479,151 @@ fn finishes_with_the_norm_match_the_separate_ops() {
         assert_eq!(pq, q2, "plain codes, round {k}");
         assert_eq!(&results[1][k], r0, "rank 1, round {k}");
     }
+}
+
+/// A whole output's finish with the W4A4 rows of its norm (#1133, `Norm::a4`): on two ranks
+/// through a CPU graph, the sums of the all-reduce plus the residual, and per token the codes,
+/// scales and decode scale of the W4A4 quantization of `mul(rms_norm(y), w)` (ggml's norm, then
+/// `nvfp4_a4::quantize_op`), where `normed_layout` puts them; the node's tokens are its own.
+#[test]
+fn a4_normed_finish_matches_the_separate_ops() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    use crate::model::nvfp4_a4;
+    use crate::tp_net::{Norm, all_reduce};
+    let (row, n) = (128usize, 5i64);
+    let len = row * n as usize;
+    let eps = 1e-6f32;
+    let value = |r: usize, k: usize, i: usize| {
+        let x = ((i * 7 + k * 13 + r * 31) % 97) as f32 - 48.0;
+        if r == 0 {
+            x * 0.37 + if i % 61 == 0 { 300.0 } else { 0.0 }
+        } else {
+            x * 0.011
+        }
+    };
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(20));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let handle = super::super::register(c);
+                let id = handle.id();
+                let mut backend = Backend::cpu().unwrap();
+                let ctx = Context::new(64, 64);
+                let x = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let res = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let w = ctx.new_tensor(types::F32, &[row as i64]).as_input();
+                let norm = Norm {
+                    w,
+                    eps,
+                    bf16: false,
+                    a4: true,
+                };
+                let mut graph = ctx.new_graph(64);
+                let s = all_reduce_start(&ctx, id, ctx.scale(x, 1.0), n as usize);
+                graph.expand(s.node);
+                let f = finish_add_norm(&ctx, s, res, n, 0, None, norm).as_output();
+                graph.expand(f);
+                // SAFETY: a node of `ctx`, not freed.
+                let (nm, width) = norm_of(unsafe { &*f.raw() }).expect("a normed finish");
+                assert!(nm.a4 && !nm.bf16);
+                assert_eq!(width, n as usize);
+                let y = ctx.add(all_reduce(&ctx, id, x), res).as_output();
+                let q = nvfp4_a4::quantize_op(&ctx, ctx.mul(ctx.rms_norm(y, eps), w)).as_output();
+                graph.expand(y);
+                graph.expand(q);
+                ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                    .unwrap();
+                w.set_f32(&(0..row).map(|i| 0.5 + i as f32 * 0.01).collect::<Vec<_>>());
+                let mut out = Vec::new();
+                for k in 0..3 {
+                    x.set_f32(&(0..len).map(|i| value(r, k, i)).collect::<Vec<_>>());
+                    res.set_f32(&(0..len).map(|i| value(1, k + 5, i)).collect::<Vec<_>>());
+                    backend.compute(&graph).unwrap();
+                    out.push([f.bytes(), y.bytes(), q.bytes()]);
+                }
+                assert!(handle.comm().error().is_none());
+                out
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let (k, n) = (row as i64, n as usize);
+    let ([codes, scales, dec], _) = nvfp4_a4::normed_layout(k, n as i64);
+    let (q_ld, s_ld, [q_codes, q_scales, q_dec]) = nvfp4_a4::quant_layout(k, n as i64);
+    let (q_ld, s_ld) = (q_ld as usize, s_ld as usize);
+    for (round, r0) in results[0].iter().enumerate() {
+        let [f, y, q] = r0;
+        let [f1, y1, q1] = &results[1][round];
+        // Rank 1's as rank 0's: the references whole, the finish's node where it writes (its
+        // padding between the parts is not written).
+        assert_eq!((y1, q1), (y, q), "rank 1 references, round {round}");
+        let sums = ..4 * row * n;
+        assert_eq!(&f[sums], &y[..], "sums, round {round}");
+        assert_eq!(&f1[sums], &f[sums], "rank 1 sums, round {round}");
+        for t in 0..n {
+            let part = |b: &[u8], at: usize, len: usize| b[at..at + len].to_vec();
+            let at = |base: usize, ld: usize| base + t * ld;
+            for (what, fa, qa, len) in [
+                ("codes", at(codes, q_ld), at(q_codes, q_ld), q_ld),
+                ("scales", at(scales, s_ld), at(q_scales, s_ld), s_ld),
+                ("decode scale", at(dec, 4), at(q_dec, 4), 4),
+            ] {
+                assert_eq!(
+                    part(f, fa, len),
+                    part(q, qa, len),
+                    "{what}, token {t}, round {round}"
+                );
+                assert_eq!(
+                    part(f1, fa, len),
+                    part(f, fa, len),
+                    "rank 1 {what}, token {t}, round {round}"
+                );
+            }
+        }
+    }
+}
+
+/// [`finish_add_norm`] with [`Norm::a4`] only takes a contiguous F32 weight and rows the CUDA
+/// kernel quantizes whole (#1133): a strided weight, a BF16 one and a 65-wide row are refused
+/// when the graph is built.
+#[test]
+fn a4_normed_finish_rejects_weights_and_rows_it_cannot_read() {
+    use crate::tp_net::Norm;
+    #[derive(Clone, Copy)]
+    enum Weight {
+        F32,
+        Bf16,
+        /// Column 0 of an F32 `[2, row]`: `[row, 1]` with a stride of 8 bytes.
+        Strided,
+    }
+    let build = |row: i64, kind: Weight| {
+        std::panic::catch_unwind(|| {
+            let ctx = Context::new(16, 16);
+            let x = ctx.new_tensor(types::F32, &[row, 3]);
+            let res = ctx.new_tensor(types::F32, &[row, 3]);
+            let w = match kind {
+                Weight::F32 => ctx.new_tensor(types::F32, &[row]),
+                Weight::Bf16 => ctx.new_tensor(types::BF16, &[row]),
+                Weight::Strided => {
+                    let m = ctx.new_tensor(types::F32, &[2, row]);
+                    ctx.transpose(ctx.view_2d(m, [1, row], 8, 0))
+                }
+            };
+            let s = all_reduce_start(&ctx, 0, x, 3);
+            let norm = Norm {
+                w,
+                eps: 1e-6,
+                bf16: false,
+                a4: true,
+            };
+            finish_add_norm(&ctx, s, res, 3, 0, None, norm);
+        })
+        .is_ok()
+    };
+    assert!(build(128, Weight::F32), "a contiguous F32 weight");
+    assert!(!build(65, Weight::F32), "a 65-wide row");
+    assert!(!build(128, Weight::Bf16), "a BF16 weight");
+    assert!(!build(128, Weight::Strided), "a strided weight");
 }
