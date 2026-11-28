@@ -630,3 +630,33 @@ the C=1 and C=2 rows above both land on the correct side), or equivalently as a 
 
 Sequencing: re-run the band sweep on 4 cards first - the crossover moves right as residency grows, and
 the 4-card number is what production ships against.
+
+## Correction: the 262K C=2 row in the table above is not a measurement (runbook 430)
+
+The table's last two rows (`13.56 -> 8.81 tg`, `-30.7% agg`) were single samples taken from different
+boots, and the ruler turns out to be far looser than that at this shape. Repeating the *same* arm
+(same binary, same env, same expert hit rate 0.43 vs 0.42, production idle in both windows) returned
+10.09 instead of 13.56 - and then, inside one boot, three consecutive identical probes gave:
+
+| sample in one boot | decode wall | tg median | agg rows/s |
+|---|---|---|---|
+| SBa (first) | 25.7 s | **9.96** | 19.92 |
+| SBb | 21.7 s | **13.05** | 23.59 |
+| SBc | 22.4 s | **12.72** | 22.87 |
+
+A 31% swing inside a single boot, with no configuration change. So the deep-window aggregate row of
+the table above measures nothing, and the same reasoning voids the `-25%` we briefly attributed to
+upstream `#262` (the older binary reproduced the same ~10). Both are withdrawn.
+
+Mechanism, measured rather than assumed: during the decode window the lane writes steadily at
+**71 MiB/s** (42 GiB cumulative) while reading only 1.1 GiB with 260 GiB of page cache resident - it is
+the cold tier's asynchronous flush competing with expert streaming for host memory bandwidth, and the
+first probe after a boot pays it because that probe's own fill is what is being flushed.
+
+Rule adopted for this box: **deep-window C>=2 verdicts need at least three probes in one boot, the
+first discarded, the median reported**; an effect below ~10% backed only by one cross-boot sample is
+treated as unmeasured. Consequences: the MTP deep-window number and the earlier budget table move to
+"needs paired re-measurement", while the claims that survive are the correctness one (`#262` really
+does end the `cudaMemcpy: invalid argument` failure - zero occurrences with the hand-off pool enabled
+through 32K/131K/262K pairs) and the sign of the C=1 window-band curve, whose four points are monotone
+and match upstream's cost model even though their magnitudes still need paired runs.
