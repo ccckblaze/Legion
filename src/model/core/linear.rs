@@ -117,6 +117,11 @@ pub struct FfnFusion<'a> {
     /// `(x, w, eps)` when the FFN's input is `mul(rms_norm(x, eps), w)`: the norm then rides
     /// in the W4A4 activations' quantization.
     pub norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    /// With `norm`, `(node, at, width)` when a tensor-parallel finish quantized that norm's
+    /// rows already ([`crate::tp_net::Norm::a4`], #1133): the input's tokens are tokens `at..`
+    /// of the finish's `node` of `width` tokens, and the W4A4 SwiGLU reads them from there
+    /// ([`crate::model::nvfp4_a4::swiglu_quantized`]). Only where [`Linear::a4_swiglu_norm`].
+    pub quant: Option<(Tensor<'a>, i64, i64)>,
 }
 
 /// The model's per-tensor matmul policy (see the module docs).
@@ -574,6 +579,43 @@ impl Linear {
         self.swiglu_ffn_fused(ctx, gate, up, down, x, FfnFusion::default())
     }
 
+    /// Whether the SwiGLU FFN of these weights over `n` tokens runs fused
+    /// ([`Self::swiglu_ffn_fused`] does not answer `None`).
+    fn swiglu_fits(
+        &self,
+        gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        up: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        down: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        n: i64,
+    ) -> bool {
+        let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
+            self.w4a16(name, w, s, n) && w.ne()[2] == 1
+        };
+        fits(gate)
+            && fits(up)
+            && fits(down)
+            && gate.1.ne() == up.1.ne()
+            && gate.1.nb() == up.1.nb()
+            && down.1.ne()[0] == gate.1.ne()[1]
+    }
+
+    /// Whether [`Self::swiglu_ffn_fused`] of these weights over `n` tokens, with
+    /// [`FfnFusion::norm`] `(h, nw, _)`, runs the W4A4 SwiGLU with that norm in its
+    /// quantization ([`crate::model::nvfp4_a4::swiglu_norm`]), so that [`FfnFusion::quant`]
+    /// takes its place (#1133).
+    pub fn a4_swiglu_norm(
+        &self,
+        gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        up: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        down: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        n: i64,
+        (h, nw): (Tensor<'_>, Tensor<'_>),
+    ) -> bool {
+        self.swiglu_fits(gate, up, down, n)
+            && self.w4a4(gate.1, n, false)
+            && crate::model::nvfp4_a4::rms_norm_fits(h, nw)
+    }
+
     /// [`Self::swiglu_ffn`] with what [`FfnFusion`] asks fused into the W4A4 kernels (other
     /// kernels: ggml's ops for it, the same bits).
     pub fn swiglu_ffn_fused<'a>(
@@ -586,25 +628,21 @@ impl Linear {
         fusion: FfnFusion<'a>,
     ) -> Option<Tensor<'a>> {
         let n: i64 = x.ne()[1..].iter().product();
-        let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
-            self.w4a16(name, w, s, n) && w.ne()[2] == 1
-        };
         let with_res = |out: Tensor<'a>| match fusion.res {
             Some(r) => ctx.add(out, r),
             None => out,
         };
-        if !(fits(gate)
-            && fits(up)
-            && fits(down)
-            && gate.1.ne() == up.1.ne()
-            && gate.1.nb() == up.1.nb()
-            && down.1.ne()[0] == gate.1.ne()[1])
-        {
+        if !self.swiglu_fits(gate, up, down, n) {
             return None;
         }
         if self.w4a4(gate.1, n, false) {
             use crate::model::nvfp4_a4;
             let act = match fusion.norm {
+                Some((h, nw, _)) if nvfp4_a4::rms_norm_fits(h, nw) && fusion.quant.is_some() => {
+                    let (q, at, width) = fusion.quant.expect("the finish's rows");
+                    let part = (at, n, width);
+                    nvfp4_a4::swiglu_quantized(ctx, gate.1, up.1, q, part, gate.2, up.2)
+                }
                 Some((h, nw, eps)) if nvfp4_a4::rms_norm_fits(h, nw) => {
                     nvfp4_a4::swiglu_norm(ctx, gate.1, up.1, h, nw, eps, gate.2, up.2)
                 }
@@ -634,6 +672,9 @@ impl Linear {
     /// ([`crate::model::nvfp4_a4::geglu`], with `norm` (`(h, w, eps)`, `x` being
     /// `mul(rms_norm(h, eps), w)`) in its activations' quantization when it fits) and the W4A4
     /// down matmul instead: that opt-in moves the outputs anyway.
+    /// First, where the gate and up weights match in shape and all three take the Q4_0 prompt
+    /// op at this batch (no scale, not FP8, [`crate::model::q40_mm::takes_shape`]), it runs
+    /// `q40_geglu_ffn` instead: the same bits as the unfused matmuls.
     pub fn geglu_ffn_fused<'a>(
         &self,
         ctx: &'a Context,
@@ -643,6 +684,9 @@ impl Linear {
         x: Tensor<'a>,
         norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
     ) -> Option<Tensor<'a>> {
+        if let Some(down) = self.q40_geglu_ffn(ctx, gate, up, down, x, norm) {
+            return Some(down);
+        }
         let n: i64 = x.ne()[1..].iter().product();
         let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
             self.w4a16(name, w, s, n) && w.ne()[2] == 1
@@ -674,11 +718,104 @@ impl Linear {
         Some(crate::model::nvfp4_mm::mul_mat(ctx, down.1, act, down.2))
     }
 
+    /// Whether [`Self::mul_mat`] of the weight `name` (`w`, its `scale`) over an `x` of type,
+    /// shape and strides `x` runs the Q4_0 prompt op ([`crate::model::q40_mm`]) and nothing
+    /// after it: no scale, no FP8, a matmul the op takes.
+    fn q40_takes(
+        &self,
+        name: &str,
+        w: Tensor<'_>,
+        scale: Option<Tensor<'_>>,
+        x: (ffi::ggml_type, [i64; 4], [usize; 4]),
+    ) -> bool {
+        scale.is_none() && !self.is_fp8(name, w) && crate::model::q40_mm::takes_shape(w, x)
+    }
+
+    /// [`Self::geglu_ffn_fused`] where the gate, up and down matmuls all run the Q4_0 prompt
+    /// op (Gemma 4 QAT on a GB10): the input quantized once, with `norm` in that quantization
+    /// where it fits ([`crate::model::q40_mm::quantize_norm`]), and the GeGLU written straight
+    /// as the down matmul's quantized input by the gate and up matmuls' own kernel
+    /// ([`crate::model::q40_mm::mul_mat_geglu_q`]; [`crate::model::q40_mm::quantize_geglu`]
+    /// of their outputs where the pair does not fit): the bytes of the op's own quantizations
+    /// of ggml's F32 norm and GeGLU, so the same output, without the F32 tensors. `None`
+    /// elsewhere.
+    fn q40_geglu_ffn<'a>(
+        &self,
+        ctx: &'a Context,
+        gate: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        up: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        down: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        x: Tensor<'a>,
+        norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    ) -> Option<Tensor<'a>> {
+        use crate::model::q40_mm;
+        let xs = (x.ty(), x.ne(), x.nb());
+        let n = x.ne()[1];
+        let hidden = q40_mm::f32_shape([gate.1.ne()[1], n]);
+        if !(gate.1.ne() == up.1.ne()
+            && self.q40_takes(gate.0, gate.1, gate.2, xs)
+            && self.q40_takes(up.0, up.1, up.2, xs)
+            && self.q40_takes(down.0, down.1, down.2, hidden))
+        {
+            return None;
+        }
+        let xq = match norm {
+            Some((h, nw, eps)) if h.ne() == x.ne() && q40_mm::norm_fits(h, nw) => {
+                q40_mm::quantize_norm(ctx, h, nw, eps, false)
+            }
+            _ => q40_mm::quantize(ctx, x),
+        };
+        // Gate and up in one kernel whose epilogue writes the quantized GeGLU (the same bytes).
+        let act = if q40_mm::geglu_pair_fits(gate.1, up.1) {
+            q40_mm::mul_mat_geglu_q(ctx, gate.1, up.1, xq, n)
+        } else {
+            let u = q40_mm::mul_mat_q(ctx, up.1, xq, n);
+            let g = q40_mm::mul_mat_q(ctx, gate.1, xq, n);
+            q40_mm::quantize_geglu(ctx, g, u, false)
+        };
+        Some(q40_mm::mul_mat_q(ctx, down.1, act, n))
+    }
+
+    /// [`Self::mul_mat_multi`] where every weight runs the Q4_0 prompt op and `norm` fits
+    /// [`crate::model::q40_mm::quantize_norm`]: one quantization of the normed input, the norm
+    /// in it (the op's bytes for ggml's F32 norm), read by each matmul. `None` elsewhere.
+    fn q40_multi<'a>(
+        &self,
+        ctx: &'a Context,
+        ws: &[(&str, Tensor<'a>, Option<Tensor<'a>>)],
+        x: Tensor<'a>,
+        norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    ) -> Option<Vec<Tensor<'a>>> {
+        use crate::model::q40_mm;
+        let (h, nw, eps) = norm?;
+        let xs = (x.ty(), x.ne(), x.nb());
+        if ws.is_empty()
+            || h.ne() != x.ne()
+            || !q40_mm::norm_fits(h, nw)
+            || !ws
+                .iter()
+                .all(|&(name, w, s)| self.q40_takes(name, w, s, xs))
+        {
+            return None;
+        }
+        let xq = q40_mm::quantize_norm(ctx, h, nw, eps, false);
+        let n = x.ne()[1];
+        Some(
+            ws.iter()
+                .map(|&(_, w, _)| q40_mm::mul_mat_q(ctx, w, xq, n))
+                .collect(),
+        )
+    }
+
     /// The matmuls of several weights `ws` (`(name, weight, scale)`) over one input `x` (such
     /// as attention's q, k and v projections) as one W4A4 op
     /// ([`crate::model::nvfp4_a4::mul_mat_multi`]: the activations quantized once, with `norm`
     /// (`(h, w, eps)`, `x` being `mul(rms_norm(h, eps), w)`) in that quantization when it fits),
-    /// in batches [`Nvfp4A4`] gives 4-bit activations. `None` (run them one by one) otherwise.
+    /// in batches [`Nvfp4A4`] gives 4-bit activations. First, where `norm` is given and fits
+    /// [`crate::model::q40_mm::norm_fits`] and every weight takes the Q4_0 prompt op at this
+    /// batch (no scale, not FP8, [`crate::model::q40_mm::takes_shape`]), it runs
+    /// `q40_multi` instead: one weight is enough there, the same bits as the unfused
+    /// matmuls. `None` (run them one by one) otherwise.
     pub fn mul_mat_multi<'a>(
         &self,
         ctx: &'a Context,
@@ -687,6 +824,9 @@ impl Linear {
         norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
     ) -> Option<Vec<Tensor<'a>>> {
         use crate::model::nvfp4_a4;
+        if let Some(outs) = self.q40_multi(ctx, ws, x, norm) {
+            return Some(outs);
+        }
         let n: i64 = x.ne()[1..].iter().product();
         if ws.len() < 2
             || ws.len() > nvfp4_a4::MULTI_MAX
