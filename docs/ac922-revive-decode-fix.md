@@ -572,3 +572,61 @@ sign flip? If short bands gain and deep bands lose, MTP becomes an operational c
 (agent lane on, long-context lane off); if it is negative out past 131K the Wave-M veto stands. Note the
 counted fixture ends with an increment-by-ones tail, which inflates draft acceptance - read the gain as
 an upper bound.
+
+## The flip is measured, and the gate that should catch it already exists (runbook 427)
+
+`bin-e1u` (`6ebfe1b`), cards 2/5, one boot per arm, counted fixture, C=1 single stream except the
+last row. `--spec mtp` at its default `k=2` against the same boot shape without it:
+
+| window | M0 (no MTP) | M1 (MTP) | delta |
+|---|---|---|---|
+| 1024 | 31.1 | 33.3 | **+7.1%** |
+| 8192 | 30.7 | 32.3 | **+5.2%** |
+| 32768 | 27.6 | 26.8 | -2.8% |
+| 131072 | 24.3 | 23.8 | -2.4% |
+| 261872, C=2 (tg) | 13.56 | 8.81 | **-35.0%** |
+| 261872, C=2 (agg rows/s) | 24.08 | 16.68 | **-30.7%** |
+
+So MTP is neither dead nor a win: it is positive up to ~8K and negative past ~32K, and the negative
+side compounds with rows in the window - a single 131K row costs -2.4%, two 262K rows cost -35%.
+That is the `1+k` verify rows landing on a deep, restored window, which is Wave-M's reopen condition
+(2) seen from the other side.
+
+The gate for this already exists and is on by default on our hardware class. The boot says so:
+
+```
+MTP drafts stop only from --spec-max-batch to this many decoding sequences on this V100 layer split
+(--spec-gate-cost-model on: at any number above too; off: never) from=8 until=8
+```
+
+`vram::mtp_gate_until_default()` fixes `cfg.spec.gate_until` once at boot (`src/engine/lm.rs:5405`),
+and `cost_model_gated()` (`src/spec/adaptive.rs:26`) tests only `batch`:
+
+```rust
+cfg.gate_cost_model && batch >= cfg.max_batch && (cfg.gate_until == 0 || batch <= cfg.gate_until)
+```
+
+Its two callers (`src/engine/lm.rs:9054`, `src/engine/lm.rs:9706`) sit inside the step loop, where the
+window's sequences and their resident depths are in hand. **The gate therefore weighs the number of
+sequences, while the cost it is meant to model scales with sequence count times resident depth.** Our
+table is the price of that mismatch: the shape that gains +7% at 1K loses -35% at 262K, and one static
+integer cannot separate them.
+
+### Proposed patch (small, and it is the cheapest tg on the board)
+
+Gate on window pressure, not batch width. The engine already accounts the same quantity for admission -
+`--resident-window-budget` sums rows against a token budget (`1631acf`) - so the predicate can reuse it:
+
+```
+cost_model_gated(batch, resident_tokens, cfg) =
+    gate_cost_model && batch >= max_batch && (gate_until == 0 || batch <= gate_until)
+                 && resident_tokens <= spec_gate_window_tokens
+```
+
+with `--spec-gate-window-tokens` defaulting to the measured crossover (order 8-32K per sequence, so
+the C=1 and C=2 rows above both land on the correct side), or equivalently as a fraction of
+`resident-window-budget`. Effect: the short-window/agent lane keeps MTP's +5-7% (our 4-card S1 read
++13.6% on C1) and the deep lane never pays -35%, in one boot, no second binary.
+
+Sequencing: re-run the band sweep on 4 cards first - the crossover moves right as residency grows, and
+the 4-card number is what production ships against.
