@@ -26,6 +26,7 @@
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
+pub(crate) use hc_chain::lo_act_scale;
 pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
@@ -44,11 +45,12 @@ pub use hc_up_mix::bench as hc_up_mix_bench;
 #[cfg(feature = "cuda")]
 pub(crate) use hc_up_mix::launch_mix;
 pub(crate) use hc_up_mix::{
-    is_bf16_mix, lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange,
-    set_lazy_streams, set_mix_cast,
+    MixAudit, audit as mix_audit, is_bf16_mix, lazy_mix_target, mix_cast_reads, mix_cast_set,
+    set_by_exchange as set_mix_by_exchange, set_lazy_streams, set_mix_cast, up_lob,
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
+    set_up_mix_ldmatrix, set_up_mix_stage,
 };
 mod mtp;
 pub(crate) mod mtp_in;
@@ -678,6 +680,10 @@ static PLE_OPS_OFF: AtomicBool = AtomicBool::new(false);
 /// Whether the MTP head said why its prompt take-ins keep ggml's input chain
 /// ([`mtp_in`]; once per process).
 static MTP_IN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the MTP head said why its input op writes F32 for `eh_proj` rather than MMQ's
+/// blocks ([`mtp_in::input_q8`]; once per process).
+static MTP_IN_Q8_OFF: AtomicBool = AtomicBool::new(false);
 
 /// Logs once (per `flag`) that `what` is off for prompt steps, and `why`.
 fn off_once(flag: &AtomicBool, what: &str, why: &str) {
@@ -1667,9 +1673,9 @@ impl Model {
     /// Whether [`Self::ple`]'s chain after its two matmuls is marked to run as Legion's two ops
     /// ([`ple_fused`]: ggml-cuda's bits in two launches instead of about thirty nodes), for
     /// prompt steps on a GPU: one group, a prompt chunk (more than one token, not a verify),
-    /// the weights and the history in GPU memory, no tensors tapped. On with `--ple-ops`, and
-    /// with `--dense-fp8-prompt` (#1183: ~85 ms of ggml's chain per 12,288-token step on a
-    /// GB10). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
+    /// the weights and the history in GPU memory, no tensors tapped. On by default (#1183: ~85
+    /// ms of ggml's chain per 12,288-token step on a GB10; `LEGION_DEBUG_PLE_OPS=0` keeps the
+    /// chain but under `--dense-fp8-prompt`). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
     /// it fuses without the ops; the ops take the chain's nodes after that
     /// ([`ple_fused::rewrite`]). The first prompt step that keeps the chain logs why, once.
     fn ple_ops<'a>(

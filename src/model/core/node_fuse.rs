@@ -25,10 +25,21 @@
 //!   values to BF16 (ggml's `cpy`, which the BF16 projections read) itself, rounded as
 //!   ggml-cuda's copy rounds them, into the cast's memory, and skips its F32 values where only
 //!   the cast reads them (#1183): a copy kernel per mixer gone ([`Graph::mix_cast`]).
-//! - qwen4exp's gated prompt attention (`--dense-fp8-prompt`, on a compute capability 12.x GPU)
-//!   makes its query's head norm and RoPE itself from the projection's rows, as ggml-cuda's
-//!   `rms_norm` and `rope_multi` kernels make them: two kernels per layer gone
-//!   ([`Graph::q_norm_rope`], #1183).
+//! - qwen4exp's prompt attention on a compute capability 12.x GPU (the gated one of
+//!   `--dense-fp8-prompt`, and the plain one without it) makes its query's head norm and RoPE
+//!   itself from the projection's rows, as ggml-cuda's `rms_norm` and `rope_multi` kernels make
+//!   them: two kernels per layer gone ([`Graph::q_norm_rope`], #1183).
+//! - A gated DeltaNet's FP8 qkv GEMM of a prompt step runs the causal conv, SiLU and q / k head
+//!   norm reading its output (`conv_silu`) in its epilogue, with the bits of the two kernels,
+//!   on a compute capability 12.x GPU: the GEMM's F32 output is no longer written and read
+//!   back, and a kernel per layer goes ([`Graph::conv_gemm`], #1183).
+//! - qwen4exp's mixer down matmul of prompt steps with BF16 streams (`--hc-bf16`) writes the
+//!   gate's scale and SiLU rounded to BF16 straight into the part of the `hc_up_lob` node the
+//!   up-mix reads, with the bits of the two nodes it replaces (`--no-hc-down-lob` keeps them):
+//!   the F32 `lo` is no longer written and read back twice ([`Graph::down_lob`], #1183).
+//!
+//! With `RUST_LOG=info,legion::model::core::node_fuse::audit=debug` the first graphs' up-mix
+//! nodes are logged after the rewrite: what each reads and writes and who reads it ([`audit`]).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -44,6 +55,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{ExternalOp, external_params, ffi, make_external};
 
+mod audit;
 pub(crate) mod fold;
 #[cfg(test)]
 mod tests;
@@ -61,7 +73,8 @@ type Node = *mut ffi::ggml_tensor;
 /// read, its term made from a zero: the same value where that row holds +0.0, as the rows of
 /// the experts another rank holds there; otherwise every row is read, as ggml-cuda reads them.
 /// In that form `src[0]` may be BF16 rows (`fold`'s `fuse_tail`, #1183): each value widened to
-/// F32 as ggml's copy to F32 widens it (exactly), the same sum as of that copy.
+/// F32 as ggml's copy to F32 widens it (exactly), the same sum as of that copy. So may it in
+/// the plain form with the weights and the gate (`fold`'s `plain_tail`, #1183).
 /// `params[3]` of a [`MOE_SUM_GATE`] in its fused-sum form that skips the rows of zero router
 /// weights (`1` reads them all).
 pub(crate) const FMA_SKIP: i32 = 2;
@@ -118,6 +131,10 @@ pub(crate) struct Counts {
     pub mix_cast: usize,
     /// Of those, mixes whose F32 values nothing else reads, so not written.
     pub mix_f32_skipped: usize,
+    /// BF16 hyper-connection mixes writing their cast to BF16 themselves, the cast planned as
+    /// their source by the fold's relayout ([`fold`]'s early casts, `--dense-fp8-prompt`,
+    /// #1183). Counted, not rewritten.
+    pub early_cast: usize,
     /// BF16 hyper-connection mixes run by the all-gather reading them (#1176).
     pub gather_mix: usize,
     /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
@@ -126,8 +143,9 @@ pub(crate) struct Counts {
     /// #1183): the prompt attention ops that gate and quantize their output
     /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
     pub fp8_codes: usize,
-    /// Of those, the ones that make their query's head norm and RoPE themselves, ggml's three
-    /// nodes of them turned off ([`Graph::q_norm_rope`], #1183).
+    /// Prompt attention ops (of those, and the plain ones without `--dense-fp8-prompt`) that
+    /// make their query's head norm and RoPE themselves, ggml's three nodes of them turned off
+    /// ([`Graph::q_norm_rope`], #1183).
     pub q_norm_rope: usize,
     /// The same for the gated DeltaNet delta rule ops that norm their output and write the
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
@@ -146,6 +164,15 @@ pub(crate) struct Counts {
     /// qwen4exp's MTP head input as one op instead of ggml's six nodes (prompt take-ins under
     /// `--dense-fp8-prompt`, #1183; [`crate::model::qwen4::mtp_in`]). Counted, not rewritten.
     pub mtp_in: usize,
+    /// Of those, ops writing their output quantized for the `eh_proj` matmul's MMQ
+    /// ([`crate::model::qwen4::mtp_in::input_q8`]). Counted, not rewritten.
+    pub mtp_in_q8: usize,
+    /// Gated DeltaNet convs run by their FP8 qkv GEMM, the GEMM's node turned off
+    /// ([`Graph::conv_gemm`], #1183).
+    pub conv_gemm: usize,
+    /// qwen4exp mixers' down matmuls writing their up-mix's BF16 `lo` themselves, the gate's
+    /// activation and BF16 rounding nodes turned off ([`Graph::down_lob`], #1183).
+    pub down_lob: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -194,6 +221,14 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
+    if audit::enabled() {
+        // SAFETY: the caller's: the rewritten graph's nodes are valid tensors.
+        unsafe {
+            let n = ffi::ggml_graph_n_nodes(graph) as usize;
+            let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+            audit::log(&Graph::new(graph, nodes));
+        }
+    }
     let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes > 0
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
         | (c.ple_ops > 0 && !PLE_LOGGED.swap(true, Ordering::Relaxed))
@@ -207,6 +242,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             remap = c.remap,
             mix_cast = c.mix_cast,
             mix_f32_skipped = c.mix_f32_skipped,
+            early_cast = c.early_cast,
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
@@ -216,6 +252,9 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             norm_rope = c.norm_rope,
             ple_ops = c.ple_ops,
             mtp_in = c.mtp_in,
+            mtp_in_q8 = c.mtp_in_q8,
+            conv_gemm = c.conv_gemm,
+            down_lob = c.down_lob,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -247,6 +286,8 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                         if cuda {
                             g.q_norm_rope(i, &mut c);
                         }
+                    } else if cuda && crate::model::qwen4::qsa_attn::is_prompt_attn(g.nodes[i]) {
+                        g.q_norm_rope(i, &mut c);
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
@@ -262,10 +303,22 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if crate::model::qwen4::mtp_in::is_mtp_in(g.nodes[i]) {
                         c.mtp_in += 1;
+                        c.mtp_in_q8 +=
+                            usize::from(crate::model::qwen4::mtp_in::is_quantized(g.nodes[i]));
+                    }
+                    if crate::model::qwen4::mix_cast_set(g.nodes[i]).is_some() {
+                        c.early_cast += 1;
                     }
                     g.mix_cast(i, &mut c);
                     if cuda {
                         g.gather(i, &mut c);
+                    }
+                    if cuda && super::fused::gemm_allowed(g.nodes[i]) {
+                        g.conv_gemm(i, &mut c);
+                    }
+                    // Last: it may turn the node (an `hc_up_lob`) off.
+                    if crate::model::qwen4::hc_down::down_lob() {
+                        g.down_lob(i, &mut c);
                     }
                 }
                 _ => {}
@@ -370,6 +423,32 @@ unsafe fn overlap(a: Node, b: Node) -> bool {
     // SAFETY: the caller's.
     let ((a0, a1), (b0, b1)) = unsafe { (span(a), span(b)) };
     a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1
+}
+
+/// The bytes node `n` writes: its own ([`span`]) and, for a BF16 mix writing a cast of its
+/// values (an early cast of [`fold`] or [`Graph::mix_cast`], #1183), the cast's, for a down
+/// matmul writing its up-mix's BF16 `lo` ([`Graph::down_lob`]), that `lo` node's.
+///
+/// # Safety
+/// A valid tensor.
+unsafe fn writes(n: Node) -> [(usize, usize); 3] {
+    // SAFETY: the caller's; a mix's cast and a down node's `lo` node are valid tensors.
+    unsafe {
+        let cast = crate::model::qwen4::mix_cast_set(n).map_or((0, 0), |(c, _)| span(c));
+        let lob = crate::model::qwen4::hc_down::lob_of(n).map_or((0, 0), |l| span(l));
+        [span(n), cast, lob]
+    }
+}
+
+/// Whether node `n` writes memory of `x` ([`writes`]).
+///
+/// # Safety
+/// Valid tensors.
+unsafe fn writes_over(n: Node, x: Node) -> bool {
+    // SAFETY: the caller's.
+    let (w, (b0, b1)) = unsafe { (writes(n), span(x)) };
+    w.iter()
+        .any(|&(a0, a1)| a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1)
 }
 
 /// F32 and contiguous.
@@ -518,7 +597,7 @@ impl Graph {
                     if is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                         continue;
                     }
-                    if overlap(n, x) {
+                    if writes_over(n, x) {
                         return false;
                     }
                     for &s in (*n).src.iter() {
@@ -1022,7 +1101,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     continue;
                 }
-                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                if writes_over(n, cast)
+                    || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast))
+                {
                     return;
                 }
             }
@@ -1033,6 +1114,94 @@ impl Graph {
             self.moved.push((at, cast));
             c.mix_cast += 1;
             c.mix_f32_skipped += usize::from(skip_f32);
+        }
+    }
+
+    /// qwen4exp's mixer tail in prompt steps with BF16 streams (`--hc-bf16`): the down matmul
+    /// ([`crate::model::qwen4::hc_down::mul_mat`], F32 `lo`), the gate's scale and SiLU in
+    /// place on it (`hc_lo_act`), then `lo` rounded to BF16 by the `hc_up_lob` node at `at`,
+    /// which only the up-mix reads. Where `lo` and its activation have no other reader, the
+    /// down matmul writes the activation rounded to BF16 straight into the part of that node
+    /// the up-mix reads, with the two nodes' expressions (the same bits), and the two become
+    /// `GGML_OP_NONE` (#1183): `lo` is no longer written as F32 and read back twice (5 KB a
+    /// token a mixer at qwen4exp's rank of 320). That part is written earlier than the
+    /// `hc_up_lob` node did, so only where it shares no memory with what the down matmul reads
+    /// or writes, and no node in between writes or reads it.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn down_lob(&mut self, at: usize, c: &mut Counts) {
+        use crate::model::qwen4::hc_down;
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let lob = self.nodes[at];
+            let Some((act, (l0, l1))) = crate::model::qwen4::up_lob(lob) else {
+                return;
+            };
+            let Some(ai) = self.index.get(&(act as usize)).copied() else {
+                return;
+            };
+            if ai >= at || self.none[ai] {
+                return;
+            }
+            let Some(scale) = crate::model::qwen4::lo_act_scale(act) else {
+                return;
+            };
+            let down = (*act).src[0];
+            let Some(di) = (!down.is_null())
+                .then(|| self.index.get(&(down as usize)).copied())
+                .flatten()
+            else {
+                return;
+            };
+            // The activation runs in place on all of the down matmul's F32 output.
+            if di >= ai
+                || self.none[di]
+                || !hc_down::is_down(down)
+                || span(act) != span(down)
+                || (*act).ne != (*down).ne
+                || !f32_contiguous(down)
+                || !self.only_read_by(down, &[ai])
+                || !self.only_read_by(act, &[at])
+            {
+                return;
+            }
+            let hits = |(a, b): (usize, usize)| a < b && a < l1 && l0 < b;
+            if l0 >= l1
+                || hits(span(down))
+                || (*down).src.iter().any(|&s| !s.is_null() && hits(span(s)))
+            {
+                return;
+            }
+            for k in di + 1..at {
+                let n = self.nodes[k];
+                if k == ai
+                    || self.none[k]
+                    || is_view_op((*n).op)
+                    || (*n).op == ffi::ggml_op_GGML_OP_NONE
+                {
+                    continue;
+                }
+                if writes(n).iter().any(|&w| hits(w))
+                    || (*n).src.iter().any(|&s| !s.is_null() && hits(span(s)))
+                {
+                    return;
+                }
+            }
+            if self
+                .moved
+                .iter()
+                .any(|&(k, t)| k > di && k < at && hits(span(t)))
+            {
+                return;
+            }
+            hc_down::set_lob(down, lob, scale);
+            for i in [ai, at] {
+                (*self.nodes[i]).op = ffi::ggml_op_GGML_OP_NONE;
+                self.none[i] = true;
+            }
+            self.moved.push((di, lob));
+            c.down_lob += 1;
         }
     }
 
@@ -1049,8 +1218,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     return true;
                 }
-                let (a, b) = span(n);
-                a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y)
+                writes(n)
+                    .iter()
+                    .all(|&(a, b)| a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y))
             })
         }
     }
@@ -1114,7 +1284,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     continue;
                 }
-                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                if writes_over(n, cast)
+                    || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast))
+                {
                     return;
                 }
             }
@@ -1127,8 +1299,9 @@ impl Graph {
         }
     }
 
-    /// The query's head norm and RoPE of the gated prompt attention at `at` (qwen4exp under
-    /// `--dense-fp8-prompt`, [`crate::model::qwen4::qsa_attn::gated_codes`]) on CUDA: where its
+    /// The query's head norm and RoPE of the prompt attention at `at` (qwen4exp's, gated under
+    /// `--dense-fp8-prompt`, [`crate::model::qwen4::qsa_attn::gated_codes`], or plain,
+    /// [`crate::model::qwen4::qsa_attn::is_prompt_attn`]) on CUDA: where its
     /// query is ggml's `rms_norm`, `mul` by the weight and `rope_multi` of the projection's
     /// rows, read by nothing else, the attention kernel makes those values itself from the
     /// rows, as ggml-cuda's kernels make them ([`crate::model::qwen4::qsa_attn::fold_q`]), and
@@ -1167,7 +1340,7 @@ impl Graph {
     /// [`Self::q_norm_rope`]'s chain at `at`: the fold and the nodes it turns off, or why not.
     ///
     /// # Safety
-    /// `at` is a node index of a gated prompt attention.
+    /// `at` is a node index of a gated or plain prompt attention.
     unsafe fn match_q_norm_rope(
         &self,
         at: usize,
@@ -1317,10 +1490,115 @@ impl Graph {
             Ok((f, [oi, mi, ri]))
         }
     }
+
+    /// A gated DeltaNet's conv at `at` whose input's GEMM may run it
+    /// ([`super::fused::gemm_allowed`]) on CUDA: where its input is all of the output of a
+    /// dynamic FP8 GEMM ([`crate::model::fp8::conv_gemm`]) that only the conv reads, the GEMM's
+    /// node launches nothing and the conv runs both, the conv in the GEMM's epilogue where its
+    /// kernel takes the shape, else the two kernels ([`super::fused::P_GEMM`], #1183): the
+    /// GEMM's output is no longer written and read back. The GEMM then runs at the conv's
+    /// place, so only where no node in between writes or reads (as another tensor) what the
+    /// GEMM reads.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn conv_gemm(&mut self, at: usize, c: &mut Counts) {
+        // SAFETY: the caller's.
+        unsafe {
+            match self.match_conv_gemm(at) {
+                Ok(mi) => {
+                    crate::ggml::set_external_param(
+                        self.nodes[at],
+                        super::fused::P_GEMM,
+                        super::fused::GEMM_FUSED,
+                    );
+                    (*self.nodes[mi]).op = ffi::ggml_op_GGML_OP_NONE;
+                    self.none[mi] = true;
+                    c.conv_gemm += 1;
+                }
+                Err(why) => {
+                    if !CONV_GEMM_LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            "gated DeltaNet: the conv stays a kernel of its own after the qkv \
+                             GEMM (logged once): {why}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::conv_gemm`]'s GEMM node for the conv at `at`, or why not.
+    ///
+    /// # Safety
+    /// `at` is the index of a conv node.
+    unsafe fn match_conv_gemm(&self, at: usize) -> Result<usize, &'static str> {
+        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
+        unsafe {
+            let conv = self.nodes[at];
+            let (x, w) = ((*conv).src[0], (*conv).src[2]);
+            if x.is_null() || w.is_null() || !(*conv).src[3].is_null() {
+                return Err("the conv prefetches a weight");
+            }
+            let keep = external_params(&*conv)[0];
+            if (*w).ne[0] != 4 || i64::from(keep) != (*w).ne[0] - 1 || (*x).ne[2] != 1 {
+                return Err("not one sequence's conv of 4 taps keeping its state");
+            }
+            let mm8 = root(x);
+            let Some(mi) = self.index.get(&(mm8 as usize)).copied().filter(|&i| i < at) else {
+                return Err("the conv's input is no node before it");
+            };
+            if self.none[mi] || !crate::model::fp8::conv_gemm(mm8) {
+                return Err("the conv's input is not a dynamic FP8 GEMM's output");
+            }
+            let (xt, mt) = (&*x, &*mm8);
+            let tokens = mt.ne[1] * mt.ne[2] * mt.ne[3];
+            if xt.data != mt.data
+                || xt.ne[0] != mt.ne[0]
+                || xt.ne[1] != tokens
+                || xt.nb[0] != 4
+                || xt.nb[1] != mt.nb[1]
+            {
+                return Err("the conv's input is not all of the GEMM's output");
+            }
+            if !self.only_read_by(mm8, &[at]) {
+                return Err("the GEMM's output has other readers");
+            }
+            // What the GEMM reads: its weight, codes and weight scale (a model's weights are
+            // neither the graph's nodes nor its inputs, so nothing in it writes them).
+            let input = ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_INPUT as i32;
+            let ins: Vec<Node> = [mt.src[0], mt.src[1], mt.src[2]]
+                .into_iter()
+                .filter(|&t| {
+                    !t.is_null()
+                        && (self.index.contains_key(&(root(t) as usize))
+                            || (*root(t)).flags & input != 0)
+                })
+                .collect();
+            let reads: Vec<(Node, bool)> = ins.iter().map(|&t| (t, false)).collect();
+            if !self.may_read_at(at, conv, &reads, &[mi]) {
+                return Err("the GEMM's codes' memory is reused before the conv");
+            }
+            for &x in &ins {
+                let from = self.index.get(&(root(x) as usize)).map_or(0, |&i| i + 1);
+                if self
+                    .moved
+                    .iter()
+                    .any(|&(k, t)| k >= from && k < at && overlap(t, x))
+                {
+                    return Err("a rewritten node writes what the GEMM reads");
+                }
+            }
+            Ok(mi)
+        }
+    }
 }
 
 /// Whether [`Graph::q_norm_rope`] said why it left a graph's chain.
 static Q_NORM_ROPE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`Graph::conv_gemm`] said why it left a graph's conv.
+static CONV_GEMM_LOGGED: AtomicBool = AtomicBool::new(false);
 
 unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by the rewrite (see MOE_SUM_GATE), host tensors.
@@ -1445,6 +1723,8 @@ unsafe extern "C" {
     static legion_moe_tail_fma4_kernel: *const c_void;
     static legion_moe_tail_fma_x16_kernel: *const c_void;
     static legion_moe_tail_fma4_x16_kernel: *const c_void;
+    static legion_moe_tail_plain_x16_kernel: *const c_void;
+    static legion_moe_tail_plain4_x16_kernel: *const c_void;
     static legion_ids_remap_kernel: *const c_void;
     fn cudaLaunchKernel(
         func: *const c_void,
@@ -1526,10 +1806,11 @@ unsafe fn launch_sum_gate(
         if fma != 0 && (w.is_none() || gate.is_none()) {
             return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
-        // BF16 experts' rows (`fold`'s `fuse_tail`, #1183): the fused sum's kernel only.
+        // BF16 experts' rows (`fold`'s `fuse_tail` and `plain_tail`, #1183): the tail kernels
+        // only, which take the weights and the gate.
         let x16 = x.type_ == ffi::ggml_type_GGML_TYPE_BF16;
-        if x16 && fma == 0 {
-            return Err("moe_sum_gate: BF16 rows in the fused sum only".into());
+        if x16 && (w.is_none() || gate.is_none()) {
+            return Err("moe_sum_gate: BF16 rows need the weights and the gate".into());
         }
         // Token `t0`'s place in each tensor (the kernels index them by token).
         let g_ld = gate.map_or(0, |(_, g)| g.nb[1] / 4);
@@ -1575,9 +1856,11 @@ unsafe fn launch_sum_gate(
         } else {
             aligned(p.x)
         };
-        let v4 = fma != 0 && e % 4 == 0 && x_aligned && aligned(p.sh) && out_aligned;
+        let v4 = (fma != 0 || x16) && e % 4 == 0 && x_aligned && aligned(p.sh) && out_aligned;
         let (kernel, cols) = match (fma != 0, v4, x16) {
-            (false, _, _) => (legion_moe_sum_gate_kernel, 1),
+            (false, _, false) => (legion_moe_sum_gate_kernel, 1),
+            (false, false, true) => (legion_moe_tail_plain_x16_kernel, 1),
+            (false, true, true) => (legion_moe_tail_plain4_x16_kernel, 4),
             (true, false, false) => (legion_moe_tail_fma_kernel, 1),
             (true, true, false) => (legion_moe_tail_fma4_kernel, 4),
             (true, false, true) => (legion_moe_tail_fma_x16_kernel, 1),

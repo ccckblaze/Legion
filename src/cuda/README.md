@@ -33,6 +33,7 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | `hc_down.cu` | `sm80/hc_down.cuh` (qwen4exp's mixer down GEMM of prompt steps with BF16 streams, the B operand rebuilt from the streams, their norm scales and gamma after ldmatrix, on cp.async and m16n8k16; kernels only, launched from Rust by `src/model/qwen4/hc_down.rs` from the `legion_hc_down_kernels` table, #1183). |
 | `glm5next.cu` | `sm80/mla_gb10.cuh` (GLM's sparse MLA prompt kernel as the GB10 runs it: score warps and value warps a chunk apart on named barriers, swizzled `cp.async` chunk buffers; `mla_tiled_kernel`'s bits, picked on compute capability 12.x by `legion_device::sm12x_device()`, #862, and on Ampere by `legion_device::ampere_device()`, #1212), `sm80/linear_tc_gb10.cuh` (`linear_tc_gb`: linear_tc's F16 prompt GEMM and bits on other tile shapes; F16-row products on compute capability 12.x by `tc_gb_auto`, #862; Ampere's own picks by `tc_gb_auto_ampere`, #1212). |
 | `l2_prefetch.cu` | One kernel, kernels only: an sm_90+ bulk L2 prefetch (`cp.async.bulk.prefetch.L2`) after `griddepcontrol.wait`, a trap on older targets; launched from Rust by `src/model/core/l2_prefetch.rs` from the `legion_l2_prefetch_kernels` table on compute capability 12.x only (#689). |
+| `mma_peak.cu` | Kernels only, a measurement (#1183): register-only `mma.sync` loops per form, each form's body behind its own guard (sm_80 BF16/F16, sm_89 E4M3, `__CUDA_ARCH_FEAT_SM120_ALL` / `SM121_ALL` for `kind::f8f6f4`, `kind::mxf8f6f4` and `kind::mxf4nvf4`), a trap elsewhere; a probe kernel reports the forms the device's code has. Launched from Rust by `src/model/core/mma_peak.rs` (an ignored test prints the peaks). |
 | `sm120/nvfp4_a4.cu` | The whole file (its own translation unit, listed in build.rs). |
 | `sm120/nvfp4_mvq.cu` | The matvec kernels (`cvt.rn.f16x2.e2m1x2`, sm_120a/sm_121a; the weights by `cp.async.bulk` into an mbarrier ring; a trap elsewhere, and `nvfp4_mvq::takes` asks `nvfp4_a4::supported_on` first); its activation quantization is plain SIMT code. |
 | `sm90/cluster_select.cu` | The whole file: decode-sized top-k (`qsa_attn.cu`'s `topk_kernel` bits) and argmax (ggml-cuda's `argmax_f32` bits) on clusters of 8 CTAs a row (`src/model/cluster_select.rs`). |
@@ -47,7 +48,8 @@ picks the schedule, gives the kernels their shared memory and launches them from
 `legion_gdn_mma_kernels` table. `gdn_scan.cu` is plain SIMT code that the Rust side picks on 7.x GPUs only (ggml's bits
 there). `deepseek41.cu` (DeepSeek-V4.1-Flash's own ops, `src/model/deepseek41/ops.rs`) is
 plain SIMT code too, kernels only: Rust launches them with `cudaLaunchKernel` from the
-`legion_ds4_kernels` table. `mtp_in.cu` (qwen4exp's MTP head input of prompt take-ins,
+`legion_ds4_kernels` table. `inkling2.cu` (Inkling-2's own ops, `src/model/inkling2/ops.rs`)
+is the same: plain SIMT kernels, launched from the `legion_ink_kernels` table. `mtp_in.cu` (qwen4exp's MTP head input of prompt take-ins,
 `src/model/qwen4/mtp_in.rs`, #1183) is plain SIMT code and kernels only the same way, from the
 `legion_mtp_in_kernels` table. `vision.cu` (the vision tower, `src/vision/gpu.rs`, #1195) is
 kernels only the same way, from the `legion_vision_kernels` table; its GEMM is WMMA, valid on
@@ -59,7 +61,10 @@ bits. Its bodies are compiled for 7.x targets only (the Rust side takes compute 
 alone) and trap elsewhere. `tu_mmq.cu` is dp4a code built for Turing only (other
 architectures get `NO_DEVICE_CODE`): ggml-cuda's MMQ chain for GPUs without tensor cores, using
 ggml's tile loaders from `mmq.cuh`, launched from the `legion_tu_mmq_kernels` table by
-`src/model/tu_mmq.rs`.
+`src/model/tu_mmq.rs`. `q40_mm.cu` (Q4_0 prompt matmuls on a GB10, `src/model/q40_mm.rs`) is
+kernels only, launched from the `legion_q40_mm_kernels` table, without any ggml-cuda header: its
+quantization is plain SIMT code, its matmul body (cp.async and int8 `mma.sync`) is compiled for
+sm_80+ and traps elsewhere.
 
 `mmq_preq.cu` has no kernel: it is the one piece of C++ host code the owner allowed for #363,
 the glue that runs ggml-cuda's MMQ (`mul_mat_q_case`, which has no C API) on activations that

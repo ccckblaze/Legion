@@ -11,11 +11,13 @@ pub mod fp8_act;
 pub mod fp8_block;
 pub mod gemma4;
 pub mod glm5next;
+pub mod inkling2;
 pub mod moe_ffn;
 pub mod muse;
 pub mod nemotron_h;
 pub mod nvfp4_a4;
 pub mod nvfp4_mm;
+pub mod q40_mm;
 pub mod q8_mmq;
 pub mod qwen35;
 pub mod qwen4;
@@ -27,7 +29,7 @@ use crate::gguf::GgufFile;
 
 /// The GGUF architectures Legion runs, for messages.
 pub const ARCHITECTURES: &str = "qwen35, qwen35moe, qwen4exp, nemotron_h, nemotron_h_moe, gemma4, \
-     glm5-next, deepseek41 or muse-glimmer";
+     glm5-next, deepseek41, inkling2_loop, inkling2 or muse-glimmer";
 
 /// The hyperparameters of a GGUF of architecture `arch` (`general.architecture`), read by the
 /// architecture's module.
@@ -39,6 +41,7 @@ pub(crate) fn parse_hparams(g: &GgufFile, arch: &str) -> Result<Hparams, ModelEr
         "gemma4" => gemma4::parse(g),
         "glm5-next" => glm5next::parse(g),
         deepseek41::ARCH => deepseek41::parse(g),
+        inkling2::ARCH | inkling2::ARCH_OLD => inkling2::parse(g, arch),
         muse::ARCH => muse::parse(g),
         _ => Err(ModelError::Architecture(arch.into())),
     }

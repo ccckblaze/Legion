@@ -107,6 +107,58 @@ pub fn set_expert_tile_prefetch(on: bool) {
     EXPERT_TILE_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DOWN_X_PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) prefetches
+/// its activation rows into L2 ([`DOWN_XPF`], #1183). L2 hints only: the same bits either way.
+/// On by default; `legion serve --no-nvfp4-down-x-prefetch` turns it off for comparisons.
+pub fn set_down_x_prefetch(on: bool) {
+    DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DOWN_WIDE_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) stages its
+/// outputs through shared memory and stores them 16 bytes a thread ([`DOWN_WST_F32`],
+/// [`DOWN_WST_BF16`], #1183). The same values in the same places either way. On by default;
+/// `legion serve --no-nvfp4-down-wide-store` turns it off (and the BF16 rows' streaming
+/// stores with it) for comparisons.
+pub fn set_down_wide_store(on: bool) {
+    DOWN_WIDE_STORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DOWN_EVICT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) writes BF16
+/// rows with streaming (evict-first) stores on top of the staged ones ([`DOWN_WST_BF16`],
+/// #1183). F32 rows never do ([`DOWN_WST_F32`]), and [`set_down_wide_store`] off turns both
+/// off. The same bits either way. On by default; `legion serve
+/// --no-nvfp4-down-store-evict-first` turns it off for comparisons.
+pub fn set_down_store_evict_first(on: bool) {
+    DOWN_EVICT_FIRST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static GLU_WIDE_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' SwiGLU GEMM of prompt steps (its 64- and 128-token tiles, see
+/// [`grouped_glu_wst`]) stages its BF16 outputs through shared memory and stores them 16 bytes
+/// a thread ([`WST_WIDE`], #1183). The same values in the same places either way. On by
+/// default; `legion serve --no-nvfp4-glu-wide-store` turns it off (and
+/// [`set_glu_store_evict_first`]'s streaming stores with it) for comparisons.
+pub fn set_glu_wide_store(on: bool) {
+    GLU_WIDE_STORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static GLU_EVICT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the routed experts' SwiGLU GEMM of prompt steps writes its staged rows with
+/// streaming (evict-first) stores ([`WST_CS`] on top of [`WST_WIDE`], #1183). Off by default:
+/// the down projection reads those rows right after, so they had better stay in L2. The same
+/// bits either way; `legion serve --nvfp4-glu-store-evict-first` turns it on.
+pub fn set_glu_store_evict_first(on: bool) {
+    GLU_EVICT_FIRST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -458,6 +510,26 @@ unsafe fn swiglu_plan(x: &ffi::ggml_tensor, n_used: i64, n_tok: i64, n_expert: i
     }
 }
 
+/// The plan of the pairs the earlier [`mul_mat_id`] node of a [`mul_mat_id_with`] node `dst`
+/// with `plan_of` ([`PLAN_OF_SOURCE`]) left after its result, when that source still is that
+/// node where it runs (an input from another backend is a copy) and made its own plan.
+#[cfg(feature = "cuda")]
+unsafe fn source_plan(dst: &ffi::ggml_tensor, n_used: i64, n_tok: i64, n_expert: i64) -> *mut i32 {
+    // SAFETY: `dst` is a node of `id_node` with `from`: its last source (after the scale).
+    unsafe {
+        let node = dst.src[3 + (dst.op_params[P_SCALE] != 0) as usize];
+        if node.is_null()
+            || !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &NVFP4_MM_ID))
+            || (*node).op_params[P_PLAN] != 0
+        {
+            return std::ptr::null_mut();
+        }
+        let n = &*node;
+        let (out, _) = id_layout((*n.src[0]).ne[1], n_used, n_tok, n_expert, n.nb[0]);
+        (n.data as *mut u8).add(out) as *mut i32
+    }
+}
+
 /// The expert matmul `mul_mat_id(w, x, ids)` of NVFP4 experts `w` (`[k, m, n_expert]`, see
 /// [`supports`]) with activations `x` (`[k, n_x, n_tok]`, `n_x` 1 or `n_used`; F32 rounded to
 /// BF16 here, or BF16) and the router's choices `ids` (I32 `[n_used, n_tok]`), each row times
@@ -480,6 +552,160 @@ pub fn mul_mat_id_act<'a>(
     ids: Tensor<'a>,
     scale: Option<Tensor<'a>>,
     act: Act,
+) -> Tensor<'a> {
+    id_node(ctx, w, x, ids, scale, act, 0, None)
+}
+
+/// Where a [`mul_mat_id_with`] node keeps that its decode mv takes the whole row tile L2
+/// prefetch ([`DOWN_MV_TILE`]) on its own plan too (slots 6 and 7 follow the custom op's
+/// header; no other `mul_mat_id` parameter is there): 1, or a [`mul_mat_id_mv`] variant
+/// ([`tile_param`]).
+const P_TILE: usize = 7;
+
+/// [`P_PLAN`]'s value for a node that reads the plan of an earlier [`mul_mat_id`] node of the
+/// same routing, its last source ([`plan_source`]).
+const PLAN_OF_SOURCE: i32 = 2;
+
+/// The most tokens of a step whose [`mul_mat_id_with`] reads an earlier node's plan: that
+/// node's result stays allocated until this one has run (a few MB at decode batches; a prompt
+/// step's gate and up rows would be hundreds).
+pub const PLAN_SHARE_MAX_TOKENS: i64 = 64;
+
+/// [`mul_mat_id`] with two decode options (#1221 r7), the same sums either way. With `tile`, its
+/// mv at one token per expert tile takes whole row tiles into L2 ([`DOWN_MV_TILE`], as a
+/// SwiGLU's down mv does under [`set_expert_tile_prefetch`]): short rows (Inkling-2's down
+/// projection, k = 1152: 648 bytes) are fetched in long contiguous runs instead of a few stages
+/// of each row at a time. With `plan_of`, the result of an earlier `mul_mat_id` over the same
+/// `ids` (Inkling-2's gate and up rows, before its activation), steps of up to
+/// [`PLAN_SHARE_MAX_TOKENS`] tokens read that node's plan of the pairs instead of making the same
+/// one again (one kernel less), and on CUDA launch the mv as a programmatic dependent of the
+/// kernel ahead, as a SwiGLU's down mv does (its tiles and first weight stages set up while that
+/// kernel ends; see `nvfp4_mvs`): the plan was complete before the earlier node's kernels ran,
+/// and the kernel ahead started after them.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mat_id_with<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: bool,
+    plan_of: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    mul_mat_id_p(ctx, w, x, ids, scale, tile as i32, plan_of)
+}
+
+/// [`mul_mat_id_with`] with its [`P_TILE`] value `tile` ([`mul_mat_id_mv`]'s variants too).
+fn mul_mat_id_p<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: i32,
+    plan_of: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let n_expert = w.ne()[2];
+    // As `id_node` takes them: the routing `plan_source` compares.
+    let ids = if ids.is_contiguous() {
+        ids
+    } else {
+        ctx.cont(ids)
+    };
+    let plan_of = plan_of.filter(|_| ids.ne()[1] <= PLAN_SHARE_MAX_TOKENS);
+    let from = plan_of.and_then(|p| plan_source(ctx, p, ids, n_expert));
+    id_node(ctx, w, x, ids, scale, Act::None, tile, from)
+}
+
+/// [`mul_mat_id_with`] whose mv at one token per expert tile runs the grouped mv variant `mv`
+/// (#1221 r9, Inkling-2's A/B runs of its expert shapes) where `tile` would take
+/// [`DOWN_MV_TILE`]: the same bits (every variant's warp takes the same blocks in the same
+/// order). `mv` must be one the CUDA dispatch compiles for one-token tiles without the SwiGLU
+/// (`mvg<1>`); `None` is `mul_mat_id_with`.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mat_id_mv<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: bool,
+    plan_of: Option<Tensor<'a>>,
+    mv: Option<GroupedMv>,
+) -> Tensor<'a> {
+    let tile = mv.map_or(tile as i32, tile_param);
+    mul_mat_id_p(ctx, w, x, ids, scale, tile, plan_of)
+}
+
+/// [`P_TILE`]'s value for a [`mul_mat_id_mv`] variant (0 and 1 are [`mul_mat_id_with`]'s).
+fn tile_param(g: GroupedMv) -> i32 {
+    assert!(
+        (1..16).contains(&g.rtw)
+            && (1..256).contains(&g.rpt)
+            && (1..256).contains(&g.sb)
+            && (0..16).contains(&g.pft),
+        "nvfp4 mul_mat_id_mv: {g:?}"
+    );
+    2 | g.rtw << 4 | g.rpt << 8 | g.sb << 16 | g.pft << 24
+}
+
+/// The [`mul_mat_id_mv`] variant of a [`P_TILE`] value.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn tile_variant(v: i32) -> Option<GroupedMv> {
+    (v & 0xf == 2).then(|| GroupedMv {
+        rtw: (v >> 4) & 0xf,
+        rpt: (v >> 8) & 0xff,
+        sb: (v >> 16) & 0xff,
+        pft: (v >> 24) & 0xf,
+    })
+}
+
+/// The node of `t` when it is the whole result of a [`mul_mat_id`] (or [`mul_mat_id_with`])
+/// node that makes its own plan of the routing `ids` over `n_expert` experts: the node whose
+/// plan [`mul_mat_id_with`]'s `plan_of` reads.
+fn plan_source<'a>(
+    ctx: &'a Context,
+    t: Tensor<'a>,
+    ids: Tensor<'a>,
+    n_expert: i64,
+) -> Option<Tensor<'a>> {
+    // SAFETY: `t`, `ids` and their sources are valid tensors of the context.
+    unsafe {
+        let v = &*t.raw();
+        let node = v.view_src;
+        if node.is_null() || v.view_offs != 0 {
+            return None;
+        }
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &NVFP4_MM_ID)) {
+            return None;
+        }
+        let n = &*node;
+        if n.op_params[P_PLAN] != 0 || n.op_params[P_SKIP] != 0 {
+            return None;
+        }
+        let (w, theirs, ours) = (&*n.src[0], n.src[2], ids.raw());
+        let copy_of = |a: *mut ffi::ggml_tensor| {
+            (*a).op == ffi::ggml_op_GGML_OP_CONT && !(*a).src[0].is_null()
+        };
+        let same_ids = std::ptr::eq(theirs, ours)
+            || (copy_of(theirs) && copy_of(ours) && (*theirs).src[0] == (*ours).src[0]);
+        let whole = v.ne[..3] == [w.ne[1], (*theirs).ne[0], (*theirs).ne[1]];
+        (same_ids && w.ne[2] == n_expert && whole).then(|| ctx.wrap(node))
+    }
+}
+
+/// The node of [`mul_mat_id_act`] and [`mul_mat_id_with`]: `tile` is [`P_TILE`], `from` is
+/// the node whose plan it reads ([`plan_source`]).
+#[allow(clippy::too_many_arguments)]
+fn id_node<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    act: Act,
+    tile: i32,
+    from: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
     assert!(supports(w), "unsupported NVFP4 experts {:?}", w.ne());
     let [k, m, n_expert, _] = w.ne();
@@ -509,9 +735,15 @@ pub fn mul_mat_id_act<'a>(
     };
     let esize = crate::ggml::row_size(act.out_type(), 1);
     let (out, plan) = id_layout(m, n_used, n_tok, n_expert, esize);
-    let shared = plan_of_swiglu(x, ids, n_expert);
+    let shared = if from.is_some() {
+        PLAN_OF_SOURCE
+    } else {
+        plan_of_swiglu(x, ids, n_expert) as i32
+    };
     let mut args = vec![w, x, ids];
     args.extend(scale);
+    // Last: the node whose plan this one reads (`plan_source`).
+    args.extend(from);
     let node = ctx.external(
         &NVFP4_MM_ID,
         act.out_type(),
@@ -522,7 +754,8 @@ pub fn mul_mat_id_act<'a>(
     unsafe {
         (*node.raw()).op_params[P_SCALE] = scale.is_some() as i32;
         (*node.raw()).op_params[P_ACT] = act.code();
-        (*node.raw()).op_params[P_PLAN] = shared as i32;
+        (*node.raw()).op_params[P_PLAN] = shared;
+        (*node.raw()).op_params[P_TILE] = tile;
     }
     ctx.view_3d(
         node,
@@ -1508,6 +1741,82 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
     }
 }
 
+/// How many token tiles ahead [`DOWN_XPF`] prefetches. A GB10's 48 SMs run about 10 token
+/// tiles at once in [`GEMM_DOWN`]'s two CTAs each (96 CTAs over the 10 row tiles of a 2,560-row
+/// down projection), but a short lead won: GB10, Qwen3.8-Flash-Next, medians of 5 interleaved
+/// rounds of `cuda_down_x_prefetch_bench`, 2 ahead took 5.9% (12,288-token steps) and 7.0%
+/// (8,067) less time than none, 4 ahead 4.4/6.4%, 6 ahead 5.0/5.6%, 10 ahead 3.6/3.8%,
+/// 16 ahead 1.8/0.8%.
+pub const DOWN_XPF_AHEAD: i32 = 2;
+
+/// `legion_nvfp4_mm::xpf` of the down projection's grouped GEMM ([`GEMM_DOWN`], #1183): the
+/// CTAs of row tile 0 prefetch the activation rows of the tile [`DOWN_XPF_AHEAD`] ahead into L2.
+/// The tile's copies read each activation row 128 bytes a step from scattered rows (the pairs of
+/// one expert), with one stage ahead, so without the prefetch every step waits for DRAM. Not
+/// the tiles' own rows (bit 0) as well: in the same runs own rows plus 2 ahead took 3.7-4.8%
+/// less time than none and own plus 10 ahead 1.8-2.4% (the ten row tiles of a token tile each
+/// asking for the same rows as they start). L2 hints only: the same sums.
+pub const DOWN_XPF: i32 = DOWN_XPF_AHEAD << 1;
+
+/// The activation prefetch (`legion_nvfp4_mm::xpf`) of a grouped GEMM's launch, as
+/// [`grouped_gemm_tune`] picks its variant: [`DOWN_XPF`] for the down projection's
+/// [`GEMM_DOWN`] tile (unless [`set_down_x_prefetch`] turned it off), 0 (none) otherwise.
+pub fn grouped_gemm_xpf(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> i32 {
+    let down = !glu && grouped_gemm_tune(k, n_expert, mi, nt, glu) == GEMM_DOWN;
+    if down && DOWN_X_PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
+        DOWN_XPF
+    } else {
+        0
+    }
+}
+
+/// `legion_nvfp4_mm::wst` bit 0 (`EPI_WIDE`): the grouped down tile's outputs staged through
+/// the free stages' shared memory, then stored 16 bytes a thread, a warp writing 512 bytes of
+/// one pair's row at a time (the fragments' own stores: 2 bytes a thread for BF16 rows, 16 bytes
+/// in each of 4 pairs' rows a warp instruction, half sectors). An eighth (BF16) or a quarter
+/// (F32) of the store instructions; the same values in the same places.
+pub const WST_WIDE: i32 = 1;
+/// `legion_nvfp4_mm::wst` bit 1 (`EPI_CS`): the down tile's output stores streaming
+/// (`st.global.cs`, evict-first in L2), so the 0.4-0.6 GB of rows a layer writes at long prompt
+/// steps leave the weights' and the prefetched activations' lines in L2. On by default for BF16
+/// rows only ([`DOWN_WST_BF16`]): on a DGX Spark (GB10) it took the staged BF16 rows' down GEMM
+/// from 1.096x to 1.124x the old one at 12,288 tokens (1.038x to 1.050x at 8,067), but F32
+/// rows' from 1.007x to 1.003x and 0.967x.
+pub const WST_CS: i32 = 2;
+
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for BF16 rows
+/// (`--nvfp4-expert-rows-bf16`): staged and streaming, [`WST_WIDE`] | [`WST_CS`].
+pub const DOWN_WST_BF16: i32 = WST_WIDE | WST_CS;
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for F32 rows: staged,
+/// [`WST_WIDE`] (streaming stores lose there).
+pub const DOWN_WST_F32: i32 = WST_WIDE;
+
+/// The epilogue (`legion_nvfp4_mm::wst`) of a grouped GEMM's launch writing BF16 (`bf16_rows`)
+/// or F32 rows, as [`grouped_gemm_tune`] picks its variant: for the down projection's
+/// [`GEMM_DOWN`] tile [`DOWN_WST_BF16`] or [`DOWN_WST_F32`] (without [`WST_CS`] when
+/// [`set_down_store_evict_first`] turned it off, 0 when [`set_down_wide_store`] did), 0 (the
+/// fragments' own stores) otherwise.
+pub fn grouped_gemm_wst(
+    k: i64,
+    n_expert: i64,
+    mi: i32,
+    nt: i32,
+    glu: bool,
+    bf16_rows: bool,
+) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let down = !glu && grouped_gemm_tune(k, n_expert, mi, nt, glu) == GEMM_DOWN;
+    if !down || !DOWN_WIDE_STORE.load(Relaxed) {
+        0
+    } else if !bf16_rows {
+        DOWN_WST_F32
+    } else if DOWN_EVICT_FIRST.load(Relaxed) {
+        DOWN_WST_BF16
+    } else {
+        DOWN_WST_BF16 & !WST_CS
+    }
+}
+
 /// Four stages, one CTA per SM: the grouped SwiGLU GEMM's tile of 64 tokens at up to
 /// [`MV_MAX_N`] pairs per expert (the GEMM there only under [`set_expert_mv_max`]).
 pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
@@ -1529,6 +1838,29 @@ pub fn glu_gemm_tile(k: i64, n_expert: i64, per: i64) -> (i32, GemmTune) {
     }
     let nt = tokens_tile(per, 16).max(4);
     (nt, grouped_gemm_tune(k, n_expert, 2, nt, true))
+}
+
+/// The SwiGLU GEMM's epilogue at prompt steps (#1183) when [`set_glu_wide_store`] is on:
+/// [`WST_WIDE`]. GB10, Qwen3.8-Flash-Next: its 128-token tile writes 157 MB of BF16 rows a
+/// layer at 12,288-token steps, from the fragments 2 bytes a thread (512 store instructions and
+/// 2,048 half-sector writes a tile); staged, 64 instructions of whole 512-byte runs.
+pub const GLU_WST: i32 = WST_WIDE;
+
+/// The epilogue (`legion_nvfp4_mm::wst`) of a grouped SwiGLU GEMM launch at `8 * nt` tokens a
+/// tile in `tune`: [`GLU_WST`] (plus [`WST_CS`] under [`set_glu_store_evict_first`]) for the
+/// 64- and 128-token tiles of the default kernel and the 64-token tile of [`GEMM_GLU_SHORT`]
+/// (unless [`set_glu_wide_store`] turned it off), 0 (the fragments' own stores) otherwise.
+pub fn grouped_glu_wst(nt: i32, tune: GemmTune) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tile = (nt == 16 && tune == GEMM_DEFAULT)
+        || (nt == 8 && (tune == GEMM_DEFAULT || tune == GEMM_GLU_SHORT));
+    if !tile || !GLU_WIDE_STORE.load(Relaxed) {
+        0
+    } else if GLU_EVICT_FIRST.load(Relaxed) {
+        GLU_WST | WST_CS
+    } else {
+        GLU_WST
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1566,6 +1898,8 @@ mod cuda {
         sel_lo: i32,
         sel_hi: i32,
         unread_skips: i32,
+        xpf: i32,
+        wst: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1671,6 +2005,19 @@ mod cuda {
             _ => rows,
         };
         p.tiles_m = ((p.m + rows - 1) / rows) as i32;
+        p.xpf = forced_xpf().unwrap_or(match kernel {
+            Kernel::Gemm { mi, nt } if !p.plan.is_null() => {
+                grouped_gemm_xpf(p.k, p.n_expert as i64, mi, nt, false)
+            }
+            _ => 0,
+        });
+        p.wst = forced_wst().unwrap_or(match kernel {
+            Kernel::Gemm { mi, nt } if !p.plan.is_null() => {
+                let bf16_rows = p.act == Act::Bf16.code() || p.act == Act::ReluSqr.code();
+                grouped_gemm_wst(p.k, p.n_expert as i64, mi, nt, false, bf16_rows)
+            }
+            _ => 0,
+        });
         // SAFETY: parameters checked by the callers; the node's stream.
         let code = unsafe {
             match kernel {
@@ -1704,6 +2051,26 @@ mod cuda {
 
     fn forced_pf() -> i32 {
         FORCED_PF.load(Ordering::Relaxed) as i32
+    }
+
+    /// [`super::force_gemm_xpf`]'s activation prefetch plus one (0: none forced).
+    pub(super) static FORCED_XPF: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn forced_xpf() -> Option<i32> {
+        match FORCED_XPF.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v as i32 - 1),
+        }
+    }
+
+    /// [`super::force_gemm_wst`]'s epilogue plus one (0: none forced).
+    pub(super) static FORCED_WST: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn forced_wst() -> Option<i32> {
+        match FORCED_WST.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v as i32 - 1),
+        }
     }
 
     /// [`super::force_gemm_l1`]'s copies plus one (0: none forced).
@@ -1781,6 +2148,8 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            xpf: 0,
+            wst: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1830,6 +2199,8 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            xpf: forced_xpf().unwrap_or(0),
+            wst: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -1862,12 +2233,14 @@ mod cuda {
         let (n_used, n_tok) = (ids.ne[0], ids.ne[1]);
         let x_ld = (x.nb[1] / x.nb[0]) as i64;
         check(k, x_ld, x.data as *const u16)?;
-        // The down matmul of a SwiGLU FFN reads the gate and up op's plan (the same routing).
-        let shared = if dst.op_params[P_PLAN] != 0 {
+        // The down matmul of a SwiGLU FFN reads the gate and up op's plan (the same routing);
+        // a `mul_mat_id_with` with `plan_of` the earlier node's (its last source).
+        let shared = match dst.op_params[P_PLAN] {
+            0 => std::ptr::null_mut(),
+            // SAFETY: a node made by `id_node` with a source of `plan_source`.
+            PLAN_OF_SOURCE => unsafe { source_plan(dst, n_used, n_tok, n_expert) },
             // SAFETY: `x` is a valid tensor; see `swiglu_plan`.
-            unsafe { swiglu_plan(x, n_used, n_tok, n_expert) }
-        } else {
-            std::ptr::null_mut()
+            _ => unsafe { swiglu_plan(x, n_used, n_tok, n_expert) },
         };
         let plan = if shared.is_null() {
             let (out, _) = id_layout(m, n_used, n_tok, n_expert, dst.nb[0]);
@@ -1897,9 +2270,12 @@ mod cuda {
         let pairs = n_used * n_tok;
         // On the plan of a SwiGLU with a row map, a spare tile for the padding pairs that plan
         // may skip (see `swiglu_id`); so for ids that may be -1 ([`skips`]).
-        // SAFETY: a shared plan's `x` is a view of a `swiglu_id_full` node (`swiglu_plan`).
-        let spare =
-            skipping(dst) || (!shared.is_null() && unsafe { swiglu_rows(&*x.view_src) }.is_some());
+        // SAFETY: a SwiGLU's shared plan's `x` is a view of a `swiglu_id_full` node
+        // (`swiglu_plan`). An earlier mul_mat_id's plan (`source_plan`) has no row map.
+        let spare = skipping(dst)
+            || (!shared.is_null()
+                && dst.op_params[P_PLAN] != PLAN_OF_SOURCE
+                && unsafe { swiglu_rows(&*x.view_src) }.is_some());
         // A split (--nvfp4-expert-mv-split): the mv kernel for the experts of up to `cut` pairs
         // first (the kernel ahead stays the SwiGLU mv, see `pdl` below), then the GEMM.
         let (kernel, split) = match forced()
@@ -1928,13 +2304,16 @@ mod cuda {
             },
             (kernel, _) => kernel,
         };
-        // The SwiGLU's down mv at one token per tile (or a forced tile): whole row tiles
-        // prefetched (the same bits as the plain grouped mv).
-        let tile_prefetch = !shared.is_null()
+        // The SwiGLU's down mv at one token per tile (or a forced tile), and a
+        // `mul_mat_id_with`'s: whole row tiles prefetched (the same bits as the plain grouped
+        // mv).
+        let tile_prefetch = (!shared.is_null() || dst.op_params[P_TILE] != 0)
             && EXPERT_TILE_PREFETCH.load(Ordering::Relaxed)
             && matches!(kernel, Kernel::Mv { nt, rtw: 1, kw: 8, rpt }
                 if rpt == GROUPED_MV_RPT && (nt == 1 || forced_nt.is_some()));
-        let grouped = forced_grouped().or(tile_prefetch.then_some(DOWN_MV_TILE));
+        // A `mul_mat_id_mv` node's own variant in place of DOWN_MV_TILE (Inkling-2's A/B runs).
+        let tile_mv = super::tile_variant(dst.op_params[P_TILE]).unwrap_or(DOWN_MV_TILE);
+        let grouped = forced_grouped().or(tile_prefetch.then_some(tile_mv));
         let (_, cols) = kernel.tile();
         let mut p = Params {
             w: w.data as *const u8,
@@ -1969,6 +2348,8 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
             unread_skips: unread(dst) as i32,
+            xpf: 0,
+            wst: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -2156,6 +2537,8 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.unwrap_or(ALL.1),
             unread_skips: unread(dst) as i32,
+            xpf: forced_xpf().unwrap_or(0),
+            wst: 0,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -2163,7 +2546,7 @@ mod cuda {
             let mv_tiles = p.tiles_n;
             p.tiles_n = split_tiles(pairs, 8 * g_nt as i64, n_expert, cut, true);
             (p.sel_lo, p.sel_hi) = (cut, ALL.1);
-            glu_gemm(&p, g_nt, tune_at(g_nt), stream)?;
+            glu_gemm(&mut p, g_nt, tune_at(g_nt), stream)?;
             p.tiles_n = mv_tiles;
             (p.sel_lo, p.sel_hi) = (ALL.0, cut);
         }
@@ -2185,7 +2568,7 @@ mod cuda {
         if let Some(t) = forced_tiles().filter(|_| split.is_none()) {
             p.tiles_n = p.tiles_n.min(t);
         }
-        glu_gemm(&p, nt, tune_at(nt), stream)
+        glu_gemm(&mut p, nt, tune_at(nt), stream)
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
@@ -2197,7 +2580,13 @@ mod cuda {
         *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NVFP4_PF32").is_some_and(|v| v == "1"))
     }
 
-    fn glu_gemm(p: &Params, nt: i32, tune: GemmTune, stream: *mut c_void) -> Result<(), String> {
+    fn glu_gemm(
+        p: &mut Params,
+        nt: i32,
+        tune: GemmTune,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        p.wst = forced_wst().unwrap_or_else(|| grouped_glu_wst(nt, tune));
         let diag = match FORCED_DIAG.load(Ordering::Relaxed) as i32 {
             0 if forced_pf() != 0 => forced_pf(),
             0 if pf32() && matches!((nt, tune.code()), (16, 31) | (8, 31) | (8, 41)) => 2048,
@@ -2260,6 +2649,37 @@ pub fn force_gemm_pf(pf: i32) {
     cuda::FORCED_PF.store(bit as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "cuda"))]
     let _ = bit;
+}
+
+/// Launches every NVFP4 GEMM (`nvfp4_gemm`: dense, grouped and the grouped SwiGLU's) from now
+/// on with the activation prefetch `xpf` (`legion_nvfp4_mm::xpf`: bit 0 each tile's own rows,
+/// `xpf >> 1` tiles ahead for the grouped ones; 0 none; see [`DOWN_XPF`]); `None`: the
+/// defaults ([`grouped_gemm_xpf`]). For tests and benches (#1183); the same bits either way.
+#[doc(hidden)]
+pub fn force_gemm_xpf(xpf: Option<i32>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_XPF.store(
+        xpf.map_or(0, |v| v.max(0) as u64 + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = xpf;
+}
+
+/// Launches every grouped GEMM from now on with the epilogue `wst` (`legion_nvfp4_mm::wst`:
+/// [`WST_WIDE`] and / or [`WST_CS`]; 0 the fragments' own stores), which the down projection's
+/// tile ([`GEMM_DOWN`]) and the SwiGLU GEMM's 64- and 128-token tiles take ([`WST_CS`] alone:
+/// the SwiGLU's own stores) and the others ignore; `None`: the defaults ([`grouped_gemm_wst`],
+/// [`grouped_glu_wst`]). For tests and benches (#1183); the same bits either way.
+#[doc(hidden)]
+pub fn force_gemm_wst(wst: Option<i32>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_WST.store(
+        wst.map_or(0, |v| v.max(0) as u64 + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = wst;
 }
 
 /// `nvfp4_gemm`'s `DIAG_CAW`: the weight copies through L1 (`cp.async.ca`).

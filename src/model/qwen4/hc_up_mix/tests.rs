@@ -766,3 +766,277 @@ fn cpu_mix_cast_is_ggmls_cast() {
         assert!(built_f32 == fused_f32, "keep_f32 {keep_f32}: F32 moved");
     }
 }
+
+/// The BF16 up-mix rebuilding `xn`, its F32 values read by another node as well as by ggml's
+/// cast to BF16 (through a reshape with `view`), its inputs freed after it, on the CPU: as
+/// built, or (`early`) with the cast made the mix's before the graph is planned again
+/// ([`EARLY_CAST_RELAYOUT`](crate::model::core::node_fuse::fold::EARLY_CAST_RELAYOUT)) and
+/// the node fusion run. The cast's bytes, the other reader's and what the fusion did.
+fn early_cast_case(early: bool, view: bool) -> (Vec<u8>, Vec<u8>, Counts) {
+    use crate::model::core::node_fuse::fold::EARLY_CAST_RELAYOUT;
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    let (e, rank, n, hc) = (128i64, 64i64, 9i64, 4i64);
+    let k = hc * e;
+    let ctx = Context::new(64, 64);
+    let input = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input();
+    let up = input(types::BF16, &[rank, k]);
+    let lo = input(types::F32, &[rank, n]);
+    let res = input(types::F32, &[e, hc, n]);
+    let sc = input(types::F32, &[hc, n]);
+    let g = input(types::F32, &[k]);
+    // The mix's inputs made in the graph, so they are freed once it has read them.
+    let lo2 = ctx.scale(lo, 1.5);
+    let res2 = ctx.scale(res, 0.5);
+    let mixed = up_mix_rebuilt(&ctx, up, lo2, res2, sc, g, hc, 0.25);
+    // The mix is F32 `[e, n]` (the block input); the view is all of it as one row.
+    assert_eq!(mixed.ne(), [e, n, 1, 1]);
+    let src = if view {
+        ctx.reshape_2d(mixed, e * n, 1)
+    } else {
+        mixed
+    };
+    let cast = ctx.cast(src, types::BF16);
+    // Readers after both, so the cast lives past the mix's inputs.
+    let other = ctx.scale(mixed, 2.0).as_output();
+    let read = ctx.scale(ctx.cast(cast, types::F32), 1.0).as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(other);
+    graph.expand(read);
+    let allocator = ComputeAllocator::new(cpu.buffer_type());
+    let allocator = if early {
+        allocator.with_relayout(EARLY_CAST_RELAYOUT)
+    } else {
+        allocator
+    };
+    ctx.alloc_graph(&graph, allocator).unwrap();
+    // SAFETY: an allocated graph that has not run.
+    let c = if early {
+        unsafe { rewrite_graph(graph.raw(), false) }
+    } else {
+        Counts::default()
+    };
+    up.set_bytes(&bf16_matrix(rank as usize, k as usize, 81));
+    lo.set_f32(&noise((rank * n) as usize, 82));
+    res.set_f32(&noise((k * n) as usize, 83));
+    sc.set_f32(
+        &noise((hc * n) as usize, 84)
+            .iter()
+            .map(|v| v.abs() + 0.5)
+            .collect::<Vec<_>>(),
+    );
+    g.set_f32(&noise(k as usize, 85));
+    cpu.compute(&graph).unwrap();
+    (read.bytes(), other.bytes(), c)
+}
+
+/// The early cast (#1183) is ggml's cast bit for bit, the F32 values' other reader unmoved, and
+/// the node fusion counts it (it fuses nothing more there).
+#[test]
+fn cpu_early_cast_is_ggmls_cast() {
+    for view in [false, true] {
+        let (built, built_f32, _) = early_cast_case(false, view);
+        let (early, early_f32, c) = early_cast_case(true, view);
+        assert_eq!(c.early_cast, 1, "view {view}: the cast made early");
+        assert_eq!(c.mix_cast, 0, "view {view}: nothing fused after");
+        assert!(built.iter().any(|&b| b != 0), "nothing mixed");
+        assert!(built == early, "view {view}: the cast moved");
+        assert!(built_f32 == early_f32, "view {view}: F32 moved");
+    }
+}
+
+/// `legion hc-up-mix-bench`'s variants read and write `up_mix_bf16_reg`'s options by name.
+#[test]
+fn bench_variants_parse() {
+    use bench::Variant;
+    let v = |s: &str| Variant::parse(s).unwrap();
+    assert_eq!(v("2"), Variant::new(2, None));
+    assert_eq!(v("1002:none"), Variant::new(1002, Some(0)));
+    assert_eq!(v("2:ld+xs"), Variant::new(2, Some(REG_LD | REG_XS)));
+    assert_eq!(v("2:15"), Variant::new(2, Some(REG_ALL)));
+    assert_eq!(v("2:pd2+cross"), Variant::new(2, Some(REG_PD2 | REG_CROSS)));
+    for s in ["2:foo", "x", "2:16", "2:-1", "2:ld+"] {
+        assert!(Variant::parse(s).is_err(), "{s}");
+    }
+    for s in ["2", "1002:none", "2:pd2+xs+ld+cross", "2:ld"] {
+        assert_eq!(v(s).to_string(), s);
+    }
+    // What ran: the kernel, and the options where some were forced.
+    assert!(v("2:ld").ran_as(2, REG_LD));
+    assert!(!v("2:ld+xs").ran_as(2, REG_LD), "XS dropped");
+    assert!(!v("2:ld").ran_as(1, 0), "fell back to up_mix_bf16");
+    assert!(v("2").ran_as(2, REG_PD2));
+    assert!(v("0").ran_as(1, 0) && v("1").ran_as(1, 0));
+    // The default picking up_mix_bf16_reg still runs the options asked for; picking
+    // up_mix_bf16 has none to run.
+    assert!(v("0:ld+xs").ran_as(2, REG_LD | REG_XS));
+    assert!(!v("0:ld+xs").ran_as(2, REG_LD), "XS dropped");
+    assert!(
+        !v("0:ld+xs").ran_as(1002, REG_LD),
+        "XS dropped, lo through L2"
+    );
+    assert!(v("0:ld+xs").ran_as(1, 0));
+}
+
+/// The options' switch tests change the same configured options: one at a time.
+static REG_OPTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The configured options with `set(false)`, then with `set(true)`.
+fn reg_opts_off_on(set: fn(bool)) -> (i32, i32) {
+    let _lock = REG_OPTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set(false);
+    let off = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    set(true);
+    let on = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    (off, on)
+}
+
+/// `--no-hc-up-mix-ldmatrix` takes ldmatrix out of the default options and nothing else.
+#[test]
+fn ldmatrix_switch_is_the_ld_bit() {
+    assert_eq!(DEFAULT_REG_OPTS, REG_LD | REG_XS);
+    let (off, on) = reg_opts_off_on(set_up_mix_ldmatrix);
+    assert_eq!(off, DEFAULT_REG_OPTS & !REG_LD);
+    assert_eq!(on, DEFAULT_REG_OPTS);
+}
+
+/// `--no-hc-up-mix-stage` takes the shared-memory staging out of the default options and
+/// nothing else.
+#[test]
+fn stage_switch_is_the_xs_bit() {
+    assert_eq!(
+        DEFAULT_REG_OPTS & (REG_PD2 | REG_CROSS),
+        0,
+        "the prefetch options stay off"
+    );
+    let (off, on) = reg_opts_off_on(set_up_mix_stage);
+    assert_eq!(off, DEFAULT_REG_OPTS & !REG_XS);
+    assert_eq!(on, DEFAULT_REG_OPTS);
+}
+
+/// Qwen3.8-Flash-Next's mixer at the token counts of the docs command's steps (#1183): 12,288
+/// (a full prompt step), 8,067 (a tail with a part tile and a part run), 129 and 1.
+fn flash_next_mixer(tokens: Vec<i64>) -> bench::Config {
+    bench::Config {
+        e: 2560,
+        rank: 320,
+        tokens,
+        ..bench::Config::default()
+    }
+}
+
+/// Every `up_mix_bf16_reg` option alone and together, with `lo` through L1 (kernel 2 on a GB10)
+/// and L2 only (1002), the default and `up_mix_bf16`: the same bits as the kernel without
+/// options in every mode, the docs command's forms (F32 streams with and without lazy streams,
+/// BF16 streams, `xn`) included. Each check must have run the options it forced.
+#[test]
+#[ignore = "needs an sm_80+ GPU"]
+fn cuda_up_mix_reg_options_are_the_same_bits() {
+    use bench::Variant;
+    let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let all = [
+        0,
+        REG_PD2,
+        REG_XS,
+        REG_LD,
+        REG_CROSS,
+        REG_XS | REG_LD,
+        REG_ALL,
+    ];
+    let mut cfg = flash_next_mixer(vec![12288, 8067, 129, 1]);
+    cfg.copies = 1;
+    cfg.reference = Variant::new(2, Some(0));
+    cfg.variants = [2, 1002]
+        .iter()
+        .flat_map(|&k| all.iter().map(move |&o| Variant::new(k, Some(o))))
+        .chain([
+            Variant::new(0, Some(DEFAULT_REG_OPTS)),
+            Variant::new(1, Some(0)),
+        ])
+        .collect();
+    let checks = bench::check(&mut gpu, &cfg).unwrap();
+    assert_eq!(checks.len(), 4 * bench::MODES.len() * cfg.variants.len());
+    for c in &checks {
+        eprintln!(
+            "{:>6} {:<5} {:>14} ran {}:{} differing {} of {}",
+            c.tokens,
+            c.mode,
+            c.variant.to_string(),
+            c.ran,
+            c.ran_opts,
+            c.differing,
+            c.values
+        );
+    }
+    for c in &checks {
+        let what = format!("{} tokens {} {}", c.tokens, c.mode, c.variant);
+        assert!(
+            c.variant.ran_as(c.ran, c.ran_opts),
+            "{what}: ran {}:{}",
+            c.ran,
+            c.ran_opts
+        );
+        assert_eq!(
+            c.differing, 0,
+            "{what}: {} of {} values",
+            c.differing, c.values
+        );
+    }
+}
+
+/// The microbench (#1183): every option against the kernel without them, call by call, which
+/// runs first alternating per round; median, min and speedup per mode and token count (with
+/// `--nocapture`). Fails only when a variant did not run as forced.
+#[test]
+#[ignore = "needs an sm_80+ GPU; a timing run"]
+fn cuda_up_mix_reg_options_microbench() {
+    use bench::Variant;
+    let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let base = Variant::new(2, Some(0));
+    let mut cfg = flash_next_mixer(vec![12288, 8067]);
+    cfg.copies = 8;
+    cfg.rounds = 15;
+    cfg.variants = [
+        0,
+        REG_LD,
+        REG_PD2,
+        REG_XS,
+        REG_CROSS,
+        REG_LD | REG_XS,
+        REG_LD | REG_PD2,
+        REG_ALL,
+    ]
+    .map(|o| Variant::new(2, Some(o)))
+    .to_vec();
+    let rows = bench::ab(&mut gpu, &cfg, &["s16", "f32", "pre", "bf16"], base).unwrap();
+    println!(
+        "{:>6} {:<5} {:>14} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "tokens",
+        "mode",
+        "variant",
+        "base med",
+        "var med",
+        "base min",
+        "var min",
+        "speedup",
+        "min sp"
+    );
+    for r in &rows {
+        println!(
+            "{:>6} {:<5} {:>14} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.3} {:>7.3}",
+            r.tokens,
+            r.mode,
+            r.variant.to_string(),
+            r.median[0] * 1e6,
+            r.median[1] * 1e6,
+            r.min[0] * 1e6,
+            r.min[1] * 1e6,
+            r.speedup(),
+            r.speedup_min()
+        );
+    }
+    for r in &rows {
+        assert!(r.base.ran_as(r.ran[0].0, r.ran[0].1), "{r:?}");
+        assert!(r.variant.ran_as(r.ran[1].0, r.ran[1].1), "{r:?}");
+    }
+}

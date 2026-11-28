@@ -1007,13 +1007,117 @@ pub fn linear_set_takes(ws: &[Tensor<'_>], n: i64) -> bool {
             .all(|w| w.ty() == types::Q8_0 && w.ne()[2] == 1 && w.ne()[0] % 32 == 0)
 }
 
+/// Whether [`linear_set`] takes these BF16 weights over `n` tokens with plain epilogues the way
+/// a [`linear`] each would run (#1221 r7): one token, BF16 matrices without a scale, rows
+/// 16-byte aligned, on the GB10 kernels with their BF16 GEMV ([`set_gb10_gemv`],
+/// [`bf16_gemv`]), whose linear_mv_bf16 the set sums each row with; or 2-8 tokens with
+/// [`bf16_gemv`] 2+ (#1221 r9), summed as linear_mv_bf16x sums them (the same bits as
+/// linear_mv_bf16). The caller checks there is no weight scale.
+pub fn linear_set_bf16_takes(ws: &[Tensor<'_>], n: i64) -> bool {
+    (n == 1 || ((2..=8).contains(&n) && bf16_gemv() >= 2))
+        && GB10_LINEAR.load(Ordering::Relaxed)
+        && GB10_GEMV.load(Ordering::Relaxed)
+        && bf16_gemv() >= 1
+        && ws.iter().all(|w| bf16_set_matrix(*w))
+}
+
+/// [`linear_set_bf16_takes`]'s matrices: BF16, one of them, `k` a multiple of 32, rows 16-byte
+/// aligned.
+fn bf16_set_matrix(w: Tensor<'_>) -> bool {
+    w.ty() == types::BF16 && w.ne()[2] == 1 && w.ne()[0] % 32 == 0 && w.nb()[1] % 16 == 0
+}
+
 /// Up to [`SET_MAX`] products `w @ x` (Q8_0 `w`, F32 `x` of `n` tokens, see
-/// [`linear_set_takes`]) in one node, each then through its epilogue: the bits of [`linear`]
-/// (scale 1, no weight scale) and then [`sigmoid`] or [`kda_gate`] on its output, in one launch
-/// on CUDA (#606). Returns F32 `[m, n]` per product.
+/// [`linear_set_takes`]; or BF16 `w` with plain epilogues, [`linear_set_bf16_takes`]) in one
+/// node, each then through its epilogue: the bits of
+/// [`linear`] (scale 1, no weight scale) and then [`sigmoid`] or [`kda_gate`] on its output, in
+/// one launch on CUDA (#606). Returns F32 `[m, n]` per product.
 pub fn linear_set<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+) -> Vec<Tensor<'a>> {
+    linear_set_with(ctx, set, small_mv_param())
+}
+
+/// [`linear_set`] with [`small_mv`]'s default bits, whatever `LEGION_DEBUG_GLM_SMALL_MV` says:
+/// for other models' sets (Inkling-2, #1221), which GLM's A/B knob must not reach.
+pub fn linear_set_default<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+) -> Vec<Tensor<'a>> {
+    linear_set_with(ctx, set, small_mv_default())
+}
+
+/// [`small_mv`]'s default bits on this GPU, whatever `LEGION_DEBUG_GLM_SMALL_MV` says.
+fn small_mv_default() -> i32 {
+    if GB10_GEMV.load(Ordering::Relaxed) {
+        SMALL_MV_DEFAULT as i32
+    } else {
+        0
+    }
+}
+
+/// How [`linear_set_deep`] lays Q8_0 rows over a warp (#1221 r10): `rows` 1 or 2 rows a warp,
+/// `loads` 2 or 4 of a lane's blocks of each row loaded before it sums any of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepQ8 {
+    pub rows: u8,
+    pub loads: u8,
+}
+
+/// [`linear_set`] of Q8_0 weights with plain epilogues on CUDA's linear_set_q8d (#1221 r10,
+/// Inkling-2's attention and head): more of a lane's loads in flight ([`DeepQ8`]), each row
+/// summed as linear_mv_q8 sums it, the same bits. One product alone is a set too.
+pub fn linear_set_deep<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+    deep: DeepQ8,
+) -> Vec<Tensor<'a>> {
+    assert!(
+        set.iter()
+            .all(|s| s.0.ty() == types::Q8_0 && matches!(s.2, SetEpi::Plain)),
+        "glm_linear_set: deep, Q8_0 and plain"
+    );
+    assert!(
+        matches!(deep.rows, 1 | 2) && matches!(deep.loads, 2 | 4),
+        "glm_linear_set: 1-2 rows a warp, 2 or 4 loads"
+    );
+    let bits = LS_DEEP
+        | if deep.rows == 2 { LS_DEEP_ROWS2 } else { 0 }
+        | if deep.loads == 4 { LS_DEEP_LOADS4 } else { 0 }
+        | if set.iter().all(|s| leaf_data(s.0)) {
+            LS_DEEP_EARLY
+        } else {
+            0
+        };
+    linear_set_with(ctx, set, small_mv_default() | bits)
+}
+
+/// The CUDA node's params[6] bits of [`linear_set_deep`] (above [`small_mv`]'s bits): on, two
+/// rows a warp, four loads a lane, and the matrices read before the wait for the kernel ahead.
+const LS_DEEP: i32 = 1 << 16;
+const LS_DEEP_ROWS2: i32 = 1 << 17;
+const LS_DEEP_LOADS4: i32 = 1 << 18;
+const LS_DEEP_EARLY: i32 = 1 << 19;
+
+/// Whether `t` is a leaf's data (the leaf or a view of one): a model weight in
+/// [`linear_set_deep`]'s graphs (Inkling-2's attention and head), which no kernel writes, so its
+/// kernel loads it before it waits for the kernel ahead. A computed matrix waits.
+fn leaf_data(t: Tensor<'_>) -> bool {
+    // SAFETY: a tensor of a live context, whose view source is null or a live tensor.
+    unsafe {
+        let r = &*t.raw();
+        let leaf = |r: &ffi::ggml_tensor| r.op == ffi::ggml_op_GGML_OP_NONE;
+        leaf(r)
+            && (r.view_src.is_null() || (leaf(&*r.view_src) && (*r.view_src).view_src.is_null()))
+    }
+}
+
+/// [`linear_set`] with `small` as the node's [`small_mv`] bits.
+fn linear_set_with<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+    small: i32,
 ) -> Vec<Tensor<'a>> {
     assert!(
         (1..=SET_MAX).contains(&set.len()),
@@ -1021,12 +1125,13 @@ pub fn linear_set<'a>(
     );
     let n: i64 = set[0].1.ne()[1..].iter().product();
     let ws: Vec<_> = set.iter().map(|s| s.0).collect();
+    let bf16 = (1..=8).contains(&n) && ws.iter().all(|w| bf16_set_matrix(*w));
     assert!(
-        linear_set_takes(&ws, n),
-        "glm_linear_set: Q8_0, up to 8 tokens"
+        linear_set_takes(&ws, n) || (bf16 && set.iter().all(|s| matches!(s.2, SetEpi::Plain))),
+        "glm_linear_set: Q8_0 or BF16 (plain), up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
+    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");
@@ -1962,7 +2067,8 @@ unsafe fn cpu_wf16(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
-unsafe fn cpu_rms_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+/// [`rms_norm`]'s CPU reference, which Inkling-2's `ink_rms` shares (the same math).
+pub(crate) unsafe fn cpu_rms_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let x = &*dst.src[0];
         let w = (!dst.src[1].is_null()).then(|| all_f32(&*dst.src[1]));

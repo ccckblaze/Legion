@@ -394,6 +394,30 @@ fn a8_dynamic<'a>(
     wscale: Option<Tensor<'a>>,
     res: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
+    let m = a8_dynamic_check(w, xq, x_ne, wscale);
+    let [_, n1, n2, n3] = x_ne;
+    let mut args = vec![w, xq];
+    args.extend(wscale);
+    let mut res_at = 0;
+    if let Some(r) = res {
+        assert!(
+            r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3],
+            "an FP8 matmul residual is contiguous F32 of the output's shape"
+        );
+        res_at = args.len() as i32;
+        args.push(r);
+    }
+    ctx.external_with(&FP8_MM8, types::F32, [m, n1, n2, n3], &args, &[1, res_at])
+}
+
+/// Checks [`a8_dynamic`]'s inputs (`xq` the packed activations of an `x` of shape `x_ne`);
+/// the weight's rows `m`.
+fn a8_dynamic_check(
+    w: Tensor<'_>,
+    xq: Tensor<'_>,
+    x_ne: [i64; 4],
+    wscale: Option<Tensor<'_>>,
+) -> i64 {
     assert_eq!(w.ty(), types::I8);
     assert_eq!(xq.ty(), types::I8);
     let [k, m, _, _] = w.ne();
@@ -413,18 +437,7 @@ fn a8_dynamic<'a>(
             "an FP8 weight scale is F32, one value or one per row ({m})"
         );
     }
-    let mut args = vec![w, xq];
-    args.extend(wscale);
-    let mut res_at = 0;
-    if let Some(r) = res {
-        assert!(
-            r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3],
-            "an FP8 matmul residual is contiguous F32 of the output's shape"
-        );
-        res_at = args.len() as i32;
-        args.push(r);
-    }
-    ctx.external_with(&FP8_MM8, types::F32, [m, n1, n2, n3], &args, &[1, res_at])
+    m
 }
 
 /// The [`Context::shared_node`] key of an activation's [`quantize_dynamic`] (or of the op that
@@ -455,6 +468,69 @@ pub fn mul_mat_dynamic_add<'a>(
 ) -> Tensor<'a> {
     let xq = ctx.shared_node(x, DYNAMIC_KEY, || quantize_dynamic(ctx, x));
     mul_mat_a8_dynamic_add(ctx, w, xq, x.ne(), wscale, res)
+}
+
+/// The [`FP8_MM8`] parameters of a node made by [`mul_mat_a8_dynamic_cols`] (#1133): the
+/// token of its packed activations that its column 0 reads, and how many tokens they hold
+/// (0, as in every other node: the node's own columns).
+const P_X_FIRST: usize = 4;
+const P_X_TOKENS: usize = 5;
+
+/// The first token and the tokens of the packed activations an [`FP8_MM8`] node of `cols`
+/// columns reads ([`P_X_FIRST`], [`P_X_TOKENS`]): `(0, cols)` but for a node of
+/// [`mul_mat_a8_dynamic_cols`].
+fn x_tokens(dst: &ffi::ggml_tensor, cols: i64) -> (i64, i64) {
+    let p = crate::ggml::external_params(dst);
+    match p[P_X_TOKENS] {
+        0 => (0, cols),
+        n => (p[P_X_FIRST] as i64, n as i64),
+    }
+}
+
+/// [`mul_mat_dynamic`] of tokens `first..first + count` of `x` (F32 `[k, n]`) only: F32 `[m,
+/// count]`, from `x`'s packed activations for all its tokens (the op the model gave `x`, see
+/// [`crate::model::fp8_act`], or one [`quantize_dynamic`] of the whole of `x`, shared with
+/// its other matmuls) read in place from token `first` on (#1133: a step's projection per
+/// half of its tokens). Column `j` has the bits of the whole matmul's column `first + j`: each
+/// is its own token's codes and scale times the weight, summed in one k order whatever the
+/// other columns (the GEMMs' tiles all give the same bits; [`launch_cols`] runs column ranges
+/// of a node the same way).
+pub fn mul_mat_dynamic_cols<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    wscale: Option<Tensor<'a>>,
+    (first, count): (i64, i64),
+) -> Tensor<'a> {
+    let [k, n, n2, n3] = x.ne();
+    assert_eq!([n2, n3], [1, 1], "mul_mat_dynamic_cols: a 2-D x");
+    let xq = ctx.shared_node(x, DYNAMIC_KEY, || quantize_dynamic(ctx, x));
+    mul_mat_a8_dynamic_cols(ctx, w, xq, [k, n], (first, count), wscale)
+}
+
+/// [`mul_mat_a8_dynamic`] of tokens `first..first + count` of the packed activations `xq` of
+/// an `x` of `x_ne` (`[k, n]`): F32 `[m, count]` ([`mul_mat_dynamic_cols`]).
+pub fn mul_mat_a8_dynamic_cols<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    xq: Tensor<'a>,
+    x_ne: [i64; 2],
+    (first, count): (i64, i64),
+    wscale: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let [k, n] = x_ne;
+    assert!(
+        first >= 0 && count > 0 && first <= n && count <= n - first && n <= i32::MAX as i64,
+        "mul_mat_a8_dynamic_cols: {count} tokens from {first} of {n}"
+    );
+    let m = a8_dynamic_check(w, xq, [k, n, 1, 1], wscale);
+    let mut args = vec![w, xq];
+    args.extend(wscale);
+    let mut params = [0; P_X_TOKENS + 1];
+    params[0] = 1;
+    params[P_X_FIRST] = first as i32;
+    params[P_X_TOKENS] = n as i32;
+    ctx.external_with(&FP8_MM8, types::F32, [m, count, 1, 1], &args, &params)
 }
 
 /// Whether the current GPU multiplies E4M3 on tensor cores (sm_89+), where the W8A8 GEMMs run.
@@ -539,14 +615,17 @@ unsafe fn cpu_fp8_mm8(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (w, x) = (&*dst.src[0], &*dst.src[1]);
         let (k, m) = (w.ne[0] as usize, w.ne[1] as usize);
         let n = (dst.ne[1] * dst.ne[2] * dst.ne[3]) as usize;
+        // A node of some tokens of larger packed activations ([`mul_mat_a8_dynamic_cols`]).
+        let (x0, xn) = x_tokens(dst, n as i64);
+        let (x0, xn) = (x0 as usize, xn as usize);
         let lut: [f32; 256] = std::array::from_fn(|b| e4m3_to_f32(b as u8));
         let wb = std::slice::from_raw_parts(w.data as *const u8, k * m);
-        let xb = std::slice::from_raw_parts(x.data as *const u8, k * n);
+        let xb = std::slice::from_raw_parts((x.data as *const u8).add(x0 * k), k * n);
         // Static: one input scale times the per-tensor weight scale for every element.
         // Dynamic: the token's scale times the row's weight scale.
         let (static_scale, token_scales) = if dynamic {
-            let (codes, _) = dynamic_layout(k as i64, n as i64);
-            let s = (x.data as *const u8).add(codes) as *const f32;
+            let (codes, _) = dynamic_layout(k as i64, xn as i64);
+            let s = ((x.data as *const u8).add(codes) as *const f32).add(x0);
             let ts: Vec<f32> = (0..n).map(|t| s.add(t).read_unaligned()).collect();
             (0.0, ts)
         } else {
@@ -711,14 +790,41 @@ unsafe fn cuda_fp8_mm(
     launch(stream)
 }
 
-/// A TMA-fed W8A8 GEMM epilogue forced by [`force_gemm_variant`]; 0 is none.
-#[cfg(feature = "cuda")]
-static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Whether the TMA-fed W8A8 prefill GEMMs store their outputs by TMA ([`set_tma_store`]).
+static TMA_STORE: AtomicBool = AtomicBool::new(true);
+/// Whether the qkv GEMM with the conv in its epilogue does ([`set_conv_tma_store`]).
+static CONV_TMA_STORE: AtomicBool = AtomicBool::new(true);
 
-/// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant`
-/// (`legion_fp8_mm8`'s `variant`: 1 the plain epilogue, 2 and 3 the streaming one with one or
-/// two token tiles at a time, 0x100 the pick without the streaming route), or the default
-/// choice for 0: for `legion fp8-gemm-bench`.
+/// Whether the TMA-fed W8A8 prefill GEMMs on the 256 x 128 tile without a residual (and the
+/// gated DeltaNet's qkv GEMM with the conv in its epilogue) write their F32 outputs by TMA stores
+/// from shared memory (#1183: whole 128-byte lines, a 64 x 16 piece a store, instead of 4 bytes
+/// a lane from the MMA fragments) from now on, where [`default_gemm_variant`] picks them (rows of
+/// more than 1,024 bytes; `legion serve --no-fp8-tma-store` turns them off). On by default: the
+/// same values at the same places, so the same bits.
+pub fn set_tma_store(on: bool) {
+    TMA_STORE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the gated DeltaNet's qkv GEMM with the conv in its epilogue writes its outputs by
+/// TMA stores ([`set_tma_store`], which turns both off) from now on
+/// (`legion serve --no-fp8-conv-tma-store` turns this one off). On by default: the same bits.
+pub fn set_conv_tma_store(on: bool) {
+    CONV_TMA_STORE.store(on, Ordering::Relaxed);
+}
+
+/// A TMA-fed W8A8 GEMM epilogue forced by [`force_gemm_variant`]; `i32::MIN` is none.
+#[cfg(feature = "cuda")]
+static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant` exactly
+/// (`legion_fp8_mm8`'s `variant`: 0 the pick without the TMA stores, 1 the plain epilogue, 2 and
+/// 3 the streaming one with one or two token tiles at a time, 0x100 the pick without the
+/// streaming route, 0x400 ([`VARIANT_WIDE`]) the staged 16-byte stores of the cp.async tiles
+/// without a residual, 0x800 the TMA stores of the wide tile, 0x1000 those of the conv
+/// epilogue, 0x2000 the wide tile's staggered first wave), until [`unforce_gemm_variant`]: for
+/// `legion fp8-gemm-bench` and the tests. A node [`mark_wide_store`] marked adds
+/// [`VARIANT_WIDE`] on top while [`set_glu_wide_store`] is on.
 #[doc(hidden)]
 pub fn force_gemm_variant(variant: i32) {
     #[cfg(feature = "cuda")]
@@ -727,20 +833,84 @@ pub fn force_gemm_variant(variant: i32) {
     let _ = variant;
 }
 
-/// The TMA-fed W8A8 GEMM's epilogue variant: a forced one, else 0x100 under
-/// `LEGION_DEBUG_FP8_STREAM_EPI=0` (no GEMM takes #1133 r25's streaming epilogue), else 0
-/// (the default: the routed GEMMs take it).
+/// The default choice of epilogue again ([`force_gemm_variant`]).
+#[doc(hidden)]
+pub fn unforce_gemm_variant() {
+    #[cfg(feature = "cuda")]
+    FORCED_GEMM_VARIANT.store(i32::MIN, Ordering::Relaxed);
+}
+
+/// Whether the wide tile's first wave starts staggered ([`set_wide_stagger`]).
+static WIDE_STAGGER: AtomicBool = AtomicBool::new(true);
+
+/// Whether the TMA-fed W8A8 prefill GEMMs on the 256 x 128 tile (one CTA an SM) start their
+/// first wave staggered over about one tile's time, as the 4-warp tile does, so the SMs'
+/// epilogues do not all write at once, from now on ([`default_gemm_variant`]; not on the TP
+/// send buffer's GEMMs; `legion serve --no-fp8-wide-stagger` turns it off). On by default: only
+/// the start times change, so the same bits.
+pub fn set_wide_stagger(on: bool) {
+    WIDE_STAGGER.store(on, Ordering::Relaxed);
+}
+
+/// The default epilogue variant of a TMA-fed W8A8 GEMM over rows of `k` bytes (#1183, GB10,
+/// Qwen3.8-Flash-Next's shapes at 12,288 and 8,067 tokens against the fragments' stores): the
+/// staggered first wave (with `stagger`) everywhere, with the TMA stores (with `tma`) above
+/// k 1,024 (k 2,560: 1.00-1.05x, k 6,144: 1.03-1.05x; the TMA store at k 640: 0.78-0.94x); the
+/// conv epilogue's TMA stores with `tma` and `conv` (1.015x); `env` (bit 0x100 or 0) on top. No
+/// stagger where the outputs go to the TP send buffer (`staged`: not measured).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn default_gemm_variant(
+    k: i64,
+    env: i32,
+    (tma, conv, stagger, staged): (bool, bool, bool, bool),
+) -> i32 {
+    let stagger = (stagger && !staged) as i32 * VARIANT_WIDE_STAGGER;
+    let store = (tma && k > 1024) as i32 * VARIANT_TMA_STORE;
+    env | stagger | store | ((tma && conv) as i32 * VARIANT_CONV_TMA_STORE)
+}
+
+/// The TMA-fed W8A8 GEMM's epilogue variant for rows of `k` bytes: a forced one, else
+/// [`default_gemm_variant`] with 0x100 under `LEGION_DEBUG_FP8_STREAM_EPI=0` (no GEMM takes
+/// #1133 r25's streaming epilogue) and the switches ([`set_tma_store`], [`set_conv_tma_store`],
+/// [`set_wide_stagger`]).
 #[cfg(feature = "cuda")]
-fn gemm_variant() -> i32 {
+fn gemm_variant(k: i64, staged: bool) -> i32 {
     static ENV: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     match FORCED_GEMM_VARIANT.load(Ordering::Relaxed) {
-        0 => *ENV.get_or_init(|| {
-            let off = std::env::var_os("LEGION_DEBUG_FP8_STREAM_EPI").is_some_and(|v| v == "0");
-            if off { 0x100 } else { 0 }
-        }),
+        i32::MIN => {
+            let env = *ENV.get_or_init(|| {
+                let off = std::env::var_os("LEGION_DEBUG_FP8_STREAM_EPI").is_some_and(|v| v == "0");
+                if off { 0x100 } else { 0 }
+            });
+            let on = |s: &AtomicBool| s.load(Ordering::Relaxed);
+            default_gemm_variant(
+                k,
+                env,
+                (
+                    on(&TMA_STORE),
+                    on(&CONV_TMA_STORE),
+                    on(&WIDE_STAGGER),
+                    staged,
+                ),
+            )
+        }
         v => v,
     }
 }
+
+/// `legion_fp8_mm8`'s variant bits of the TMA stores and the wide tile's staggered first wave
+/// (`GEMM8_TMA_STORE`, `GEMM8_CONV_TMA_STORE`, `GEMM8_WIDE_STAGGER` in
+/// `src/cuda/sm90/fp8_gemm8_tma.cuh`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_TMA_STORE: i32 = 0x800;
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_CONV_TMA_STORE: i32 = 0x1000;
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_WIDE_STAGGER: i32 = 0x2000;
+
+/// Serializes the CUDA tests that force epilogue variants ([`force_gemm_variant`] is global).
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) static VARIANT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
 #[repr(C)]
@@ -846,6 +1016,55 @@ unsafe fn cuda_fp8_quant_dyn(
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const P_BY_EXCHANGE: usize = 2;
 
+/// The parameter of an [`FP8_MM8`] node without a residual that [`mark_wide_store`] sets: its
+/// GEMM's cp.async large-batch tiles store the F32 outputs 16 bytes a thread through shared
+/// memory ([`VARIANT_WIDE`]) while [`set_glu_wide_store`] is on.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const P_WIDE_STORE: usize = 3;
+
+static GLU_WIDE_STORE: AtomicBool = AtomicBool::new(true);
+
+/// Whether the W8A8 GEMMs [`mark_wide_store`] marked (the shared expert's gate / up of a
+/// `--dense-fp8-prompt` prompt step, #1183) stage their F32 outputs through shared memory and
+/// store them 16 bytes a thread with plain stores (`gemm8_epilogue_staged`) instead of 4 bytes a
+/// thread from the MMA fragments: a quarter of the store instructions. Only on the cp.async
+/// tiles (`fp8_gemm8`): on a GB10, the gate / up at 8,067 tokens (the 128-row tile) 1.18x;
+/// the TMA-fed 256-row tile (12,288 tokens) was 0.99x with it and keeps its own epilogue. The
+/// same values in the same places either way. On by default; `legion serve
+/// --no-fp8-glu-wide-store` turns it off for comparisons. Read at each launch.
+pub fn set_glu_wide_store(on: bool) {
+    GLU_WIDE_STORE.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`set_glu_wide_store`] is on.
+pub fn glu_wide_store() -> bool {
+    GLU_WIDE_STORE.load(Ordering::Relaxed)
+}
+
+/// Marks the [`FP8_MM8`] node that `t` (the node or a view of it: a member of a joined run) is
+/// the output of for the staged 16-byte stores ([`P_WIDE_STORE`], [`set_glu_wide_store`]):
+/// `true` if it is one without a residual, else `false` (nothing marked: e.g. BF16 weights, a
+/// ggml matmul). For outputs the next op reads right away (#1183: the shared expert's gate and
+/// up, read by its SwiGLU's FP8 codes); the same bits either way.
+pub(crate) fn mark_wide_store(t: Tensor<'_>) -> bool {
+    // SAFETY: a live tensor of the graph being built; its view source is null or valid, and
+    // an external op node made by `external_with` has room for P_WIDE_STORE.
+    unsafe {
+        let raw = t.raw();
+        let node = if (*raw).view_src.is_null() {
+            raw
+        } else {
+            (*raw).view_src
+        };
+        let is_mm8 = crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &FP8_MM8));
+        if !is_mm8 || crate::ggml::external_params(&*node)[1] != 0 {
+            return false;
+        }
+        crate::ggml::set_external_param(node, P_WIDE_STORE, 1);
+    }
+    true
+}
+
 /// Whether `t` is an [`FP8_MM8`] node without a residual ([`mul_mat_a8`],
 /// [`mul_mat_a8_dynamic`]): its F32 output `[m, n, ..]` is all it writes, column by column.
 ///
@@ -904,6 +1123,24 @@ pub(crate) unsafe fn launch_cols(
 #[cfg(feature = "cuda")]
 const VARIANT_STAGED: i32 = 0x200;
 
+/// `legion_fp8_mm8`'s variant bit for a node [`mark_wide_store`] marked, while
+/// [`set_glu_wide_store`] is on (`GEMM8_WIDE` in sm90/fp8_gemm8_tma.cuh, #1183): the cp.async
+/// large-batch tiles' staged 16-byte plain stores into device memory (the TMA-fed tile ignores
+/// it). `legion fp8-gemm-bench --variants` takes it (1024) too.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const VARIANT_WIDE: i32 = 0x400;
+
+/// The variant bits of the [`FP8_MM8`] node with parameters `params`: [`VARIANT_WIDE`] when
+/// [`mark_wide_store`] marked it (no residual) and [`set_glu_wide_store`] is on, else 0.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn node_variant(params: &[i32]) -> i32 {
+    if params[1] == 0 && params[P_WIDE_STORE] != 0 && glu_wide_store() {
+        VARIANT_WIDE
+    } else {
+        0
+    }
+}
+
 /// The GEMM of the [`FP8_MM8`] node `dst`: all of it (`cols` `None`, into its own output), or
 /// the columns and output [`launch_cols`] says.
 ///
@@ -916,60 +1153,8 @@ unsafe fn mm8_cols(
     out: Option<(u64, bool)>,
     stream: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
-    let [mode, res_at, ..] = crate::ggml::external_params(dst);
-    let dynamic = mode == 1;
-    let all = dst.ne[1] * dst.ne[2] * dst.ne[3];
-    let (c0, n) = match cols {
-        None => (0, all),
-        Some((a, c)) if res_at == 0 && (a + c) as i64 <= all => (a as i64, c as i64),
-        Some(_) => return Err("fp8_mm8: columns past the node's, or with a residual".into()),
-    };
-    // SAFETY: a node made by `mul_mat_a8` (src: w, xq, the input scale, the weight's
-    // per-tensor scale or nothing) or `mul_mat_a8_dynamic` (src: w, the packed codes and token
-    // scales, the weight's scale or nothing, then the residual at `res_at` or nothing), device
-    // tensors; columns `c0..c0 + n` within its tokens (k code bytes each, one scale each when
-    // dynamic).
-    let p = unsafe {
-        let (w, x) = (&*dst.src[0], &*dst.src[1]);
-        let (k, m) = (w.ne[0], w.ne[1]);
-        let (scale, ws) = if dynamic {
-            let (codes, _) = dynamic_layout(k, all);
-            let s = (x.data as *const u8).add(codes) as *const f32;
-            (s.add(c0 as usize), 2)
-        } else {
-            ((*dst.src[2]).data as *const f32, 3)
-        };
-        let has_ws = ws != res_at as usize && !dst.src[ws].is_null();
-        LaunchParams8 {
-            w: w.data as *const u8,
-            x: (x.data as *const u8).add((c0 * k) as usize),
-            scale,
-            dst: match out {
-                Some((o, _)) => o as *mut f32,
-                None => (dst.data as *mut f32).add((c0 * m) as usize),
-            },
-            k,
-            m,
-            n,
-            wscale: if has_ws {
-                (*dst.src[ws]).data as *const f32
-            } else {
-                std::ptr::null()
-            },
-            scale_stride: dynamic as i64,
-            wscale_stride: if dynamic && has_ws {
-                wscale_stride(dst, ws)
-            } else {
-                0
-            },
-            res: if res_at != 0 {
-                (*dst.src[res_at as usize]).data as *const f32
-            } else {
-                std::ptr::null()
-            },
-            variant: gemm_variant() | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED),
-        }
-    };
+    // SAFETY: the caller's.
+    let p = unsafe { mm8_params(dst, cols, out)? };
     // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
     // the device, the binary and the shape allow; the default GEMM otherwise.
     if p.n > 64 && crate::model::wgmma_gemm::enabled() {
@@ -1002,6 +1187,170 @@ unsafe fn mm8_cols(
         1 => Err(format!("unsupported W8A8 matmul shape: k = {}", p.k)),
         e => Err(format!("CUDA launch failed ({e})")),
     }
+}
+
+/// Whether `t` is an [`FP8_MM8`] node of [`mul_mat_a8_dynamic`] without a residual that runs
+/// itself (no exchange took it, [`P_BY_EXCHANGE`]): the GEMM [`launch_with_conv`] takes.
+///
+/// # Safety
+/// `t` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn conv_gemm(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        let p = crate::ggml::external_params(&*t);
+        sendable(t)
+            && p[0] == 1
+            && p[P_BY_EXCHANGE] == 0
+            && p[P_X_TOKENS] == 0
+            && !(*t).src[1].is_null()
+    }
+}
+
+/// Runs the GEMM of the [`FP8_MM8`] node `dst` ([`conv_gemm`]) with the gated DeltaNet conv
+/// `conv` (a `legion_conv_silu` reading the GEMM's output) in its epilogue (#1183): the conv's
+/// outputs and next state with the bits of the GEMM and then the conv, without writing the
+/// GEMM's output. `Ok(false)`: not run (another GEMM, a shape or device the fused kernel does not
+/// take); the caller runs the two ([`launch_alone`] and the conv).
+///
+/// # Safety
+/// `dst` is such a node of an allocated graph (its op may be turned off), its sources holding
+/// their values; `conv` a valid `legion_conv_silu` whose memory is the stream's device's.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_with_conv(
+    dst: &ffi::ggml_tensor,
+    conv: *const std::os::raw::c_void,
+    stream: *mut std::os::raw::c_void,
+) -> Result<bool, String> {
+    unsafe extern "C" {
+        fn legion_fp8_mm8_conv_launch(
+            p: *const LaunchParams8,
+            cv: *const std::os::raw::c_void,
+            any_waves: i32,
+            stream: *mut std::os::raw::c_void,
+        ) -> i32;
+    }
+    // SAFETY: the caller's.
+    let p = unsafe { mm8_params(dst, None, None)? };
+    // `--hopper-gemm` runs its own GEMM (mm8_cols): not this one's sums.
+    if !p.res.is_null() || (p.n > 64 && crate::model::wgmma_gemm::enabled()) {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    let any_waves = i32::from(conv_test::ANY_WAVES.load(Ordering::Relaxed));
+    #[cfg(not(test))]
+    let any_waves = 0;
+    // SAFETY: the node's device tensors and the caller's conv.
+    match unsafe { legion_fp8_mm8_conv_launch(&p, conv, any_waves, stream) } {
+        0 => {
+            #[cfg(test)]
+            conv_test::LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        1 => Ok(false),
+        e => Err(format!("fp8_mm8 + conv_silu: CUDA launch failed ({e})")),
+    }
+}
+
+/// Test hooks of [`launch_with_conv`].
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) mod conv_test {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// The fused kernel also where the GEMM's tiles make too few waves for its wide tile (it
+    /// then takes the 128-row tile: the same sums), so small steps test it too.
+    pub(crate) static ANY_WAVES: AtomicBool = AtomicBool::new(false);
+    /// The fused kernel's launches.
+    pub(crate) static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// The whole GEMM of the [`FP8_MM8`] node `dst` into its output, as the node runs it (where
+/// [`launch_with_conv`] did not take it).
+///
+/// # Safety
+/// As [`launch_with_conv`]'s `dst`.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_alone(
+    dst: &ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe { mm8_cols(dst, None, None, stream) }
+}
+
+/// [`mm8_cols`]'s launch parameters.
+///
+/// # Safety
+/// As [`launch_cols`].
+#[cfg(feature = "cuda")]
+unsafe fn mm8_params(
+    dst: &ffi::ggml_tensor,
+    cols: Option<(usize, usize)>,
+    out: Option<(u64, bool)>,
+) -> Result<LaunchParams8, String> {
+    let [mode, res_at, ..] = crate::ggml::external_params(dst);
+    let dynamic = mode == 1;
+    let all = dst.ne[1] * dst.ne[2] * dst.ne[3];
+    let (c0, n) = match cols {
+        None => (0, all),
+        Some((a, c)) if res_at == 0 && (a + c) as i64 <= all => (a as i64, c as i64),
+        Some(_) => return Err("fp8_mm8: columns past the node's, or with a residual".into()),
+    };
+    // A node of some tokens of larger packed activations ([`mul_mat_a8_dynamic_cols`]): its
+    // column 0 is their token `x0` of `xn`.
+    let (x0, xn) = x_tokens(dst, all);
+    // SAFETY: a node made by `mul_mat_a8` (src: w, xq, the input scale, the weight's
+    // per-tensor scale or nothing) or `mul_mat_a8_dynamic` (src: w, the packed codes and token
+    // scales, the weight's scale or nothing, then the residual at `res_at` or nothing), device
+    // tensors; columns `c0..c0 + n` within its tokens (k code bytes each, one scale each when
+    // dynamic).
+    let p = unsafe {
+        let (w, x) = (&*dst.src[0], &*dst.src[1]);
+        let (k, m) = (w.ne[0], w.ne[1]);
+        let (scale, ws) = if dynamic {
+            let (codes, _) = dynamic_layout(k, xn);
+            let s = (x.data as *const u8).add(codes) as *const f32;
+            (s.add((x0 + c0) as usize), 2)
+        } else {
+            ((*dst.src[2]).data as *const f32, 3)
+        };
+        let has_ws = ws != res_at as usize && !dst.src[ws].is_null();
+        LaunchParams8 {
+            w: w.data as *const u8,
+            x: (x.data as *const u8).add(((x0 + c0) * k) as usize),
+            scale,
+            dst: match out {
+                Some((o, _)) => o as *mut f32,
+                None => (dst.data as *mut f32).add((c0 * m) as usize),
+            },
+            k,
+            m,
+            n,
+            wscale: if has_ws {
+                (*dst.src[ws]).data as *const f32
+            } else {
+                std::ptr::null()
+            },
+            scale_stride: dynamic as i64,
+            wscale_stride: if dynamic && has_ws {
+                wscale_stride(dst, ws)
+            } else {
+                0
+            },
+            res: if res_at != 0 {
+                (*dst.src[res_at as usize]).data as *const f32
+            } else {
+                std::ptr::null()
+            },
+            variant: {
+                let staged = out.is_some_and(|o| o.1);
+                gemm_variant(k, staged)
+                    | (staged as i32 * VARIANT_STAGED)
+                    | node_variant(&crate::ggml::external_params(dst))
+            },
+        }
+    };
+    Ok(p)
 }
 
 #[cfg(test)]

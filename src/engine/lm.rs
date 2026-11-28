@@ -1134,7 +1134,7 @@ fn largest_image(cfg: &LmConfig, bidirectional: bool) -> usize {
         return 0;
     }
     let tower = match &cfg.mmproj {
-        Some(path) => GgufFile::open(path).ok(),
+        Some(path) => vision::open_mmproj(path).ok(),
         None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
         None => crate::hf::open_vision(&cfg.model_path).ok().flatten(),
     };
@@ -1168,8 +1168,9 @@ pub enum DeviceChoice {
 pub struct LmConfig {
     pub model_path: std::path::PathBuf,
     /// `--mmproj`: a vision tower for the model (Qwen3.5 / Qwen3.6, #146; Qwen3.8-Flash-Next,
-    /// #1195); requests may then carry images. Without it, an HF checkpoint's own tower
-    /// (`model.visual.*`) is loaded unless [`Self::no_mmproj`].
+    /// #1195; Gemma 4 and Nemotron 3.5 Bolt, #1217 / #1220), an mmproj GGUF or an HF
+    /// checkpoint directory whose tower is taken; requests may then carry images. Without it,
+    /// an HF checkpoint's own tower (`model.visual.*`) is loaded unless [`Self::no_mmproj`].
     pub mmproj: Option<std::path::PathBuf>,
     /// `--no-mmproj`: text only, an HF checkpoint's vision tower is not loaded.
     pub no_mmproj: bool,
@@ -4444,6 +4445,11 @@ impl LmEngine {
             gemma4_compact_global_kv(&mut model, cfg.cache_types);
         }
         let glm = crate::model::glm5next::params(&model.hp).is_some();
+        // Inkling-2's decode steps capture the GLM and DeepSeek ops of its graph (#1221);
+        // every other model's captures stay as they were.
+        crate::model::core::stage_ops::set_inkling_shared(
+            crate::model::inkling2::params(&model.hp).is_some(),
+        );
         let short_gate =
             short_gate_on(glm || crate::model::deepseek41::params(&model.hp).is_some());
         let route_gated = route_gated
@@ -6559,6 +6565,14 @@ impl LmEngine {
                 let mut kwargs = req.template_kwargs.clone();
                 if let Some(on) = req.response_format.as_ref().map(|_| false).or(req.thinking) {
                     kwargs.insert("enable_thinking".into(), Value::Bool(on));
+                }
+                // Inkling-2's template reads `reasoning_effort` itself (the client's kwarg
+                // wins); others never see it.
+                let effort = kwargs.remove(super::EFFORT_KWARG);
+                if self.chat_format.framed()
+                    && let Some(effort) = effort
+                {
+                    kwargs.entry("reasoning_effort").or_insert(effort);
                 }
                 // Qwen templates only accept a system message first. Later ones (Claude Code
                 // sends system turns mid-conversation) become user turns at their position,
@@ -10367,10 +10381,15 @@ impl<'t> Active<'t> {
             reasoning: job
                 .reasoning
                 .map(|inside| chat_format.reasoning_parser(inside)),
-            tools: (job.grammar.is_none() && !job.tools.is_empty())
+            tools: (job.grammar.is_none() && (!job.tools.is_empty() || chat_format.framed()))
                 .then(|| chat_format.tool_parser(&job.tools, call_undeclared)),
             stop: StopMatcher::new(job.stop.clone()),
             logprobs: job.sampling.logprobs,
+            // The markup only goes where a parser takes it out again.
+            shown: match job.grammar {
+                None => chat_format.shown().to_vec(),
+                Some(_) => Vec::new(),
+            },
             out: job.out.clone(),
         };
         let (text, live) = outbox.text(tokenizer, id, spec);
