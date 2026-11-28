@@ -525,3 +525,50 @@ night's waves into two shape families (§401) and is now prevented by the harnes
 - `bin-cap` (adopted binary + cap-counts-states patch) passed on the 2-card lane: 2,048 MiB nominal vs
   2,057 MiB actual (blocks 367 + states 1,689). The 128 -> 211.7 GiB cap miss is root-caused and closed
   for the next stable candidate. `tools/convtier_gc.py --apply` remains scheduled, not run.
+
+## The 83 -> 55 "short-window regression" was a cross-caliber artifact (runbook 426)
+
+A short-window single-stream median was reported as having fallen from 83 to 55 tok/s between the
+11-27 and 11-28 production boots, which would have been the largest decode regression on the box.
+It is not a regression. Recomputing the `<1K` band per boot, across six engine revisions:
+
+| boot (CST) | cards | n | `<1K` median | version |
+|---|---|---|---|---|
+| 11-27 22:15 | 4 | 18 | 52.9 | `92730e0` |
+| 11-27 23:10 | 4 | 18 | 53.2 | `92730e0` |
+| 11-27 23:41 | 4 | 48 | 54.5 | `92730e0` |
+| 11-28 08:41 | 4 | 18 | 52.6 | `a4c6c9e` |
+| 11-28 11:32 | 4 | 59 | **54.2** | `a4c6c9e` + resident window budget |
+
+52.6-54.5 over eight boots, and the current boot sits in the middle of that range. `92730e0..a4c6c9e`
+is eight commits, four of them docs; the four code changes are the queue-based `--resident-window-budget`,
+the conv-tier byte accounting, the starve guard default, and one re-queue on a lost `copy_states` race -
+none of them touches the decode inner loop, and a single short row never reaches a row budget.
+
+The 83 came from a different caliber: it is an MTP-on number (the upstream 79-101 headline is
+`--spec mtp`; our reproduction on this box was 89.6), production runs `ud=0`. Same machine, same
+fixture, draft on versus draft off. Rule added: **a regression claim must first match the spec state
+and the card count of both samples**, otherwise a cross-boot comparison manufactures a defect. The
+per-boot archived `legion starting version` line is what made this a five-minute close.
+
+## MTP's veto mechanism is already removed upstream, so the ticket is re-priced by window band
+
+Reopen condition (3) above - the one-time tier invalidation when a boot moves 48 layers to 49 - is
+exactly what upstream `5ebb354` fixed, and it is an ancestor of our HEAD. The MTP head's layer is no
+longer a tier layer: its experts load whole into the pinned host arena (~1.7 GiB for the Q4_K_M head,
+2.79 GB for the Q8_0 file we hold), the tier's heat/prefill/drop/refill only touch the model's own
+layers, and the memory plan reports `mtp_head_experts_mib`. Without `--spec mtp` nothing changes.
+
+Upstream's own measurement, though, gives the cost model: on a 4090 with a bounded host tier,
+`--spec mtp --spec-k 1` is *slower* - chats 40-42 against 47-51 tok/s, 8K prefill 1,931 against 2,097,
+32K 2,012 against 2,949 - because "a verify step costs twice a one-token step when the experts come
+from RAM and disk". Our box is that regime: the VRAM expert cache is small and experts stream from host
+RAM. That is the same shape as our S1 arm (C1 +13.6%, C2 -24%), so MTP is not a defect and not a global
+win: it is a **window-band sign flip**, and since the head layer is a boot-time geometry it cannot be
+gated per request.
+
+Open question, priced by a two-boot band sweep on the new binary (`wb_m.sh`, cards 2/5): where does the
+sign flip? If short bands gain and deep bands lose, MTP becomes an operational choice per boot role
+(agent lane on, long-context lane off); if it is negative out past 131K the Wave-M veto stands. Note the
+counted fixture ends with an increment-by-ones tail, which inflates draft acceptance - read the gain as
+an upper bound.
