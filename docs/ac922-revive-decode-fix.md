@@ -660,3 +660,36 @@ treated as unmeasured. Consequences: the MTP deep-window number and the earlier 
 does end the `cudaMemcpy: invalid argument` failure - zero occurrences with the hand-off pool enabled
 through 32K/131K/262K pairs) and the sign of the C=1 window-band curve, whose four points are monotone
 and match upstream's cost model even though their magnitudes still need paired runs.
+
+## 12. Parked proposal (2026-11-28): cold-tier TurboQuant, V-only
+
+Target is not 4x full-window concurrency. It is headroom on the shipped 2x
+shape: deep-window tg (+2-4%), the §430 ruler jitter (flush traffic -24%),
+revive wall time (~-25%) and parking depth (host-tier 5.2 -> 3.9 GiB/flow).
+
+Shape: `tier-tq` branch on coldtier@dd1e160. Host-tier V blocks and the
+conv-tier V payload become `TqBlock<4>` (primitives already in
+`src/model/core/paged/tq.rs`); one ingest kernel decodes tq4 -> q8_0 into the
+staging ring outside the attention loop, one egress kernel encodes on the GPU
+before the copy back. K stays q8_0, attention code never sees tq,
+`--cache-type-k/v` unchanged, MTP draft rings excluded.
+`--kv-host-codec off|v-tq4` (default off = shipped bitwise). K+V (`kv-tq4`)
+is a P4 option with its own quality case, not merged here.
+
+Quality doors (one notch lighter than the K+V form because selection is
+untouched): tq_parity (deterministic round trip, shuffled pages), det x3
+(this is NOT a bitwise claim on deep windows), KL/PPL vs the q8 fleet,
+NIAH across depths, acc-drift sentinel in qualgate. The 1K-token ruler may
+not vouch for quantization tickets.
+
+Acceptance: dev 2-GPU paired (3 probes/boot, drop first) off vs v-tq4 at
+2x262K C2 - pass is median +2% with no wider swings; 8x131K revive median
+<= 0.8x; then one grey rollout window on the fleet lane (user-approved
+restart) with bootfacts in `lane.sh status`. 4x-full-window behavior is an
+observation only - it does not reprice the concurrency tier.
+
+Estimate 4-5 days (P0 audit+prototype 1d, P1 kernels+tests 2d, P2
+acceptance 1d, P3 conv-tier parity 1d). Rollback = drop the flag, old
+conv-tier files stay readable. Do not conflate with the retired ⑨ ticket:
+that quantized the hot path (PP -20%, decode -4.2%); this changes the cold
+tier's storage format only.
